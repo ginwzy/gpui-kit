@@ -1,5 +1,6 @@
 use crate::{
-    ActiveTheme as _, Collapsible, Icon, IconName, Placement, Sizable as _, StyledExt,
+    ActiveTheme as _, Collapsible, FocusableExt, Icon, IconName, Placement, Sizable as _,
+    StyledExt, ThemeStyled as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     menu::{ContextMenuExt, PopupMenu},
@@ -8,9 +9,9 @@ use crate::{
     v_flex,
 };
 use gpui::{
-    AnyElement, App, ClickEvent, ElementId, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled,
-    Window, div, percentage, prelude::FluentBuilder,
+    AnyElement, App, ClickEvent, ElementId, InteractiveElement as _, IntoElement, MouseButton,
+    ParentElement as _, Role, SharedString, StatefulInteractiveElement as _, StyleRefinement,
+    Styled, Window, div, percentage, prelude::FluentBuilder,
 };
 use gpui_base::TestSupportExt as _;
 use std::rc::Rc;
@@ -106,6 +107,9 @@ pub struct SidebarMenuItem {
     suffix: Option<Rc<dyn Fn(&mut Window, &mut App) -> AnyElement + 'static>>,
     disabled: bool,
     context_menu: Option<Rc<dyn Fn(PopupMenu, &mut Window, &mut App) -> PopupMenu + 'static>>,
+    focus_ring_enabled: bool,
+    tab_index: isize,
+    tab_stop: bool,
 }
 
 impl SidebarMenuItem {
@@ -126,6 +130,9 @@ impl SidebarMenuItem {
             suffix: None,
             disabled: false,
             context_menu: None,
+            focus_ring_enabled: true,
+            tab_index: 0,
+            tab_stop: true,
         }
     }
 
@@ -213,6 +220,23 @@ impl SidebarMenuItem {
         self
     }
 
+    /// Set the tab index of the menu item, used to order it in keyboard focus traversal.
+    ///
+    /// Default is `0`.
+    pub fn tab_index(mut self, tab_index: isize) -> Self {
+        self.tab_index = tab_index;
+        self
+    }
+
+    /// Set whether the menu item is a tab stop, so the Tab key can reach it.
+    ///
+    /// Default is `true`. A focused item activates on Enter or Space, the same
+    /// as a [`Button`].
+    pub fn tab_stop(mut self, tab_stop: bool) -> Self {
+        self.tab_stop = tab_stop;
+        self
+    }
+
     fn is_submenu(&self) -> bool {
         self.children.len() > 0
     }
@@ -232,6 +256,17 @@ impl SidebarMenuItem {
 }
 
 impl FluentBuilder for SidebarMenuItem {}
+
+impl FocusableExt for SidebarMenuItem {
+    fn focus_ring(mut self, enabled: bool) -> Self {
+        self.focus_ring_enabled = enabled;
+        self
+    }
+
+    fn is_focus_ring_enabled(&self) -> bool {
+        self.focus_ring_enabled
+    }
+}
 
 impl Collapsible for SidebarMenuItem {
     fn is_collapsed(&self) -> bool {
@@ -270,6 +305,16 @@ impl SidebarItem for SidebarMenuItem {
         let is_open = open_state
             .as_ref()
             .map_or(false, |s| !is_collapsed && *s.read(cx));
+        // The row owns keyboard focus the way `Button` does: a keyed handle that
+        // survives re-renders, Enter and Space delivered as a keyboard click.
+        let focus_handle = window
+            .use_keyed_state((id.clone(), "focus"), cx, |_, cx| cx.focus_handle())
+            .read(cx)
+            .clone();
+        let is_focused = focus_handle.is_focused(window);
+        let show_focus_ring = is_focused && self.focus_ring_enabled;
+        let tab_index = self.tab_index;
+        let tab_stop = self.tab_stop;
 
         div()
             .id(id.clone())
@@ -279,13 +324,22 @@ impl SidebarItem for SidebarMenuItem {
                 h_flex()
                     .size_full()
                     .id("item")
-                    .overflow_x_hidden()
                     .flex_shrink_0()
                     .p_2()
                     .gap_x_2()
                     .rounded(cx.theme().radius)
                     .text_sm()
                     .refine_style(&self.style)
+                    .role(Role::Button)
+                    .aria_label(self.label.clone())
+                    .when(!is_disabled, |this| {
+                        this.track_focus(&focus_handle.tab_index(tab_index).tab_stop(tab_stop))
+                            .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                // Keep the focus ring for keyboard navigation, as
+                                // `Button` does: a pointer press does not focus.
+                                window.prevent_default();
+                            })
+                    })
                     .when(is_hoverable, |this| {
                         this.hover(|this| {
                             this.bg(cx.theme().sidebar_accent.opacity(0.8))
@@ -351,6 +405,7 @@ impl SidebarItem for SidebarMenuItem {
                     .when(is_disabled, |this| {
                         this.text_color(cx.theme().muted_foreground)
                     })
+                    .when(show_focus_ring, |this| this.focus_ring_style(window, cx))
                     .when(!is_disabled, |this| {
                         this.on_click({
                             let open_state = open_state.clone();
@@ -421,7 +476,94 @@ impl Styled for SidebarMenuItem {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use gpui::{
+        Context, KeyDownEvent, KeyUpEvent, Keystroke, Render, TestAppContext, VisualTestContext,
+    };
+
     use super::*;
+    use crate::sidebar::{Sidebar, SidebarGroup};
+
+    /// Which items a keyboard user can reach, and which one Enter activates.
+    struct MenuHarness {
+        clicks: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl Render for MenuHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let item = |label: &'static str| {
+                let clicks = self.clicks.clone();
+                SidebarMenuItem::new(label).on_click(move |_, _, _| clicks.borrow_mut().push(label))
+            };
+
+            Sidebar::new("sidebar").child(
+                SidebarGroup::new("Workspace").child(
+                    SidebarMenu::new()
+                        .child(item("Inbox"))
+                        .child(item("Archive").disable(true))
+                        .child(item("Drafts").tab_stop(false))
+                        .child(item("Sent")),
+                ),
+            )
+        }
+    }
+
+    fn harness(
+        cx: &mut TestAppContext,
+    ) -> (&mut VisualTestContext, Rc<RefCell<Vec<&'static str>>>) {
+        cx.update(crate::init);
+        let clicks = Rc::new(RefCell::new(Vec::new()));
+        let (_, cx) = cx.add_window_view({
+            let clicks = clicks.clone();
+            move |_, _| MenuHarness { clicks }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        (cx, clicks)
+    }
+
+    fn activate_key(cx: &mut VisualTestContext, key: &str) {
+        let keystroke = Keystroke::parse(key).unwrap();
+        cx.simulate_event(KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(KeyUpEvent { keystroke });
+    }
+
+    fn focus_next_and_activate(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| window.focus_next(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        activate_key(cx, "enter");
+    }
+
+    /// Tab walks the enabled tab stops in order and Enter activates the focused
+    /// item; a disabled item and a `tab_stop(false)` item are skipped.
+    #[gpui::test]
+    fn tab_reaches_each_enabled_item_and_enter_activates_it(cx: &mut TestAppContext) {
+        let (cx, clicks) = harness(cx);
+        cx.update(|window, cx| assert!(window.focused(cx).is_none()));
+
+        focus_next_and_activate(cx);
+        focus_next_and_activate(cx);
+        // Tab wraps: the third stop is the first item again.
+        focus_next_and_activate(cx);
+
+        assert_eq!(*clicks.borrow(), ["Inbox", "Sent", "Inbox"]);
+    }
+
+    /// Space activates a focused item the same way Enter does.
+    #[gpui::test]
+    fn space_activates_the_focused_item(cx: &mut TestAppContext) {
+        let (cx, clicks) = harness(cx);
+        cx.update(|window, cx| window.focus_next(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        activate_key(cx, "space");
+
+        assert_eq!(*clicks.borrow(), ["Inbox"]);
+    }
 
     #[test]
     fn collapsed_icon_item_uses_label_as_tooltip() {

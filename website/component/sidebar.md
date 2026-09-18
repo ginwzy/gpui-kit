@@ -231,6 +231,29 @@ SidebarMenu::new()
     )
 ```
 
+### Keyboard Access
+
+Every enabled `SidebarMenuItem` is a tab stop: Tab reaches it, a focus ring
+marks it, and Enter or Space fires its `on_click`, the same as a `Button`.
+A pointer press does not move focus, so the ring only appears during keyboard
+navigation. Disabled items are skipped.
+
+Turn an item's ring off with `focus_ring(false)` when a container clips it
+and draws its own; take an item out of the Tab order with `tab_stop(false)`;
+reorder with `tab_index`:
+
+```rust
+use gpui_kit::component::FocusableExt as _;
+
+SidebarMenuItem::new("Trash")
+    .icon(IconName::Trash)
+    .tab_stop(false)
+
+SidebarMenuItem::new("Inbox")
+    .icon(IconName::Inbox)
+    .focus_ring(false)
+```
+
 ### Custom Width and Styling
 
 ```rust

@@ -146,6 +146,27 @@ SidebarMenuItem::new("Project Files")
     })
 ```
 
+### 键盘可达
+
+每个未禁用的 `SidebarMenuItem` 都是一个 tab stop：Tab 能走到它，聚焦时画焦点环，
+Enter 或 Space 触发 `on_click`，与 `Button` 一致。指针按下不会移动焦点，所以焦点环只在
+键盘导航时出现。禁用的项会被跳过。
+
+容器会裁掉焦点环并自己画时，用 `focus_ring(false)` 关掉；`tab_stop(false)` 把某一项从
+Tab 顺序里拿掉；`tab_index` 调整顺序：
+
+```rust
+use gpui_kit::component::FocusableExt as _;
+
+SidebarMenuItem::new("Trash")
+    .icon(IconName::Trash)
+    .tab_stop(false)
+
+SidebarMenuItem::new("Inbox")
+    .icon(IconName::Inbox)
+    .focus_ring(false)
+```
+
 ### 自定义宽度与样式
 
 ```rust
