@@ -162,7 +162,7 @@ fn main() {
 }
 ```
 
-`gpui_kit::open_window` re-exports `gpui_base::open_window` and always mounts a Base `Root`. Component initialization registers the styled window facilities. Base-only examples use `gpui_base::init` and `gpui_base::open_window` without a Kit dependency.
+`gpui_kit::open_window` is the application window entry point and always mounts a Base `Root`. Component initialization registers styled window facilities; Cargo features do not select a different root type.
 
 ### Icons
 

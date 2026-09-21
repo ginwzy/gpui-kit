@@ -682,7 +682,7 @@ pub fn run(app: Application, component: impl Into<String>) {
             window_bounds: Some(WindowBounds::centered(size(px(840.), px(640.)), cx)),
             ..WindowOptions::default()
         };
-        gpui_base::open_window(options, cx, move |window, cx| {
+        cx.open_window(options, move |window, cx| {
             cx.new(|cx| BaseShowcase::new(component, window, cx))
         })
         .expect("failed to open gpui-base example window");
@@ -700,7 +700,7 @@ pub fn run_embedded(app: Application, component: impl Into<String>) -> gpui::App
                 include_bytes!("../../../story-web/fonts/Inter-Regular.ttf").as_slice(),
             )])
             .expect("failed to load gpui-base example font");
-        gpui_base::open_window(WindowOptions::default(), cx, move |window, cx| {
+        cx.open_window(WindowOptions::default(), move |window, cx| {
             cx.new(|cx| BaseShowcase::new(component, window, cx))
         })
         .expect("failed to open gpui-base example window");

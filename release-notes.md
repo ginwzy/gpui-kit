@@ -39,7 +39,7 @@ variables and the corresponding `.children(...)` calls as well.
 the application-facing APIs. Keep a `Root` as the window's root view, or use the
 new window helper below.
 
-#### Added: `gpui_base::Root` and `gpui_base::open_window`
+#### Added: `gpui_base::Root` and `gpui_kit::open_window`
 
 ```rust
 pub fn open_window<V: Render>(
@@ -51,8 +51,7 @@ pub fn open_window<V: Render>(
 
 Opens a window and returns both the window handle and the content entity. The
 helper always wraps content in `gpui_base::Root`, independent of Cargo features.
-`gpui_kit::open_window` directly re-exports this function, and `component::Root`
-re-exports the Base type.
+The helper is defined only in Kit. `component::Root` re-exports the Base type.
 
 Base owns the root, content, overlay hosting, keyboard traversal and selection
 copying. Explicit `gpui_component::init` registers a per-window extension for
@@ -77,7 +76,7 @@ Root from this helper's builder. In an async context, call the helper inside
 Kit examples and the native/web story galleries use this helper for standard window
 startup. The borderless-root example keeps the lower-level constructor to
 configure `Root::bordered(false)`. Base examples continue using `gpui_base::init`
-and `gpui_base::open_window`, without a dependency on Kit. The FPS example
+and GPUI's window API directly, without a dependency on Kit. The FPS example
 disables Kit's default features. The previously standalone color-mixing source
 is now a workspace
 package, runnable with `cargo run -p color_mix_oklab`.
@@ -85,3 +84,6 @@ package, runnable with `cargo run -p color_mix_oklab`.
 Quit and close-window actions, keyboard shortcuts and confirmation flows remain
 application-owned. Kit initialization does not install default quit or close
 bindings.
+
+`Root::clear_text_selection` and `WindowExt::clear_text_selection` are removed.
+Use `gpui_base::TextSelection::clear(window, cx)` directly.

@@ -481,7 +481,7 @@ impl Render for WindowState {
 }
 
 const ROOT_MISSING: &str =
-    "component window state is missing; call gpui_component::init before gpui_base::open_window";
+    "component window state is missing; call gpui_component::init before gpui_kit::open_window";
 
 /// Window-level layers, always mounted once after the application content.
 /// Child view caching does not affect their ownership or rendering.

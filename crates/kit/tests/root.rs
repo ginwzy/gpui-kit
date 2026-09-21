@@ -1,6 +1,7 @@
 //! `Root` owns the window's overlay layers: a view that never mentions them
 //! still gets its dialogs, including when its content is cached.
 
+mod common;
 use gpui_kit::component::{Root, WindowExt as _, notification::Notification};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
@@ -25,9 +26,9 @@ fn open_and_notify(window: &mut Window, cx: &mut App) {
 #[gpui_kit::test]
 fn a_root_renders_the_layers_a_plain_view_leaves_out(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
+    let (handle, _) = common::open_window(cx, Some(size(px(800.), px(600.))), |_window, cx| {
         let view = cx.new(|_| PlainView);
-        Root::new(view, window, cx)
+        view
     });
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -76,9 +77,9 @@ fn automatic_notifications_are_positioned_inside_the_window(cx: &mut TestAppCont
         gpui_kit::init(cx);
         cx.set_reduce_motion(true);
     });
-    let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
+    let (handle, _) = common::open_window(cx, Some(size(px(800.), px(600.))), |_window, cx| {
         let view = cx.new(|_| PlainView);
-        Root::new(view, window, cx)
+        view
     });
     cx.update_window(handle.into(), |_, window, cx| {
         window.push_notification(Notification::new().message("Saved").autohide(false), cx);
@@ -138,12 +139,12 @@ fn cached_content_does_not_duplicate_automatic_layers(cx: &mut TestAppContext) {
         cx.set_reduce_motion(true);
     });
     let renders = std::rc::Rc::new(std::cell::Cell::new(0));
-    let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
+    let (handle, _) = common::open_window(cx, Some(size(px(800.), px(600.))), |_window, cx| {
         let content = cx.new(|_| CachedContent {
             renders: renders.clone(),
         });
         let view = cx.new(|_| CachedContentHost { content });
-        Root::new(view, window, cx)
+        view
     });
     cx.update_window(handle.into(), |_, window, cx| {
         window.open_sheet(cx, |sheet, _, _| sheet.title("Sheet"));

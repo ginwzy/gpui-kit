@@ -145,12 +145,11 @@ fn main() {
             }
         })
         .detach();
-        gpui_base::open_window(
+        cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(900.), px(650.)), cx)),
                 ..Default::default()
             },
-            cx,
             |_, cx| {
                 cx.new(|_| Example {
                     list: ListState::new(120, ListAlignment::Top, px(200.)).measure_all(),

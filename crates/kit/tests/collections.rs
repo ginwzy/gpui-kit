@@ -1,3 +1,4 @@
+mod common;
 use gpui_kit::component::{
     list::ListItem,
     table::{Column, DataTable, TableDelegate, TableSelection, TableState},
@@ -23,15 +24,17 @@ impl Render for Files {
 #[gpui_kit::test]
 fn tree_pointer_and_keyboard_expand_collapse_and_select_nodes(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(480.), px(320.)), |window, cx| {
-        let tree = cx.new(|cx| {
-            TreeState::new(cx).items(vec![
-                TreeItem::new("src", "src").child(TreeItem::new("main", "main.rs")),
-                TreeItem::new("tests", "tests"),
-            ])
-        });
-        tree.update(cx, |tree, cx| tree.focus(window, cx));
-        Files { tree }
+    let (handle, _) = common::open_window(cx, Some(size(px(480.), px(320.))), |window, cx| {
+        cx.new(|cx| {
+            let tree = cx.new(|cx| {
+                TreeState::new(cx).items(vec![
+                    TreeItem::new("src", "src").child(TreeItem::new("main", "main.rs")),
+                    TreeItem::new("tests", "tests"),
+                ])
+            });
+            tree.update(cx, |tree, cx| tree.focus(window, cx));
+            Files { tree }
+        })
     });
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -88,11 +91,14 @@ impl Render for Records {
 #[gpui_kit::test]
 fn table_selection_getters_follow_the_active_mode(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(640.), px(320.)), |window, cx| Records {
-        table: cx.new(|cx| TableState::new(Rows, window, cx).cell_selectable(true)),
-    });
-    cx.update_window(handle.into(), |root, _, cx| {
-        let table = root.downcast::<Records>().unwrap().read(cx).table.clone();
+    let (handle, handle_content) =
+        common::open_window(cx, Some(size(px(640.), px(320.))), |window, cx| {
+            cx.new(|cx| Records {
+                table: cx.new(|cx| TableState::new(Rows, window, cx).cell_selectable(true)),
+            })
+        });
+    cx.update_window(handle.into(), |_root, _, cx| {
+        let table = handle_content.clone().read(cx).table.clone();
         table.update(cx, |table, cx| {
             let selection = |table: &TableState<Rows>| {
                 (
@@ -160,11 +166,14 @@ fn table_selection_getters_follow_the_active_mode(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn table_retains_navigation_positions_when_selection_mode_changes(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(640.), px(320.)), |window, cx| Records {
-        table: cx.new(|cx| TableState::new(Rows, window, cx)),
-    });
-    cx.update_window(handle.into(), |root, window, cx| {
-        let table = root.downcast::<Records>().unwrap().read(cx).table.clone();
+    let (handle, handle_content) =
+        common::open_window(cx, Some(size(px(640.), px(320.))), |window, cx| {
+            cx.new(|cx| Records {
+                table: cx.new(|cx| TableState::new(Rows, window, cx)),
+            })
+        });
+    cx.update_window(handle.into(), |_, window, cx| {
+        let table = handle_content.clone().read(cx).table.clone();
         table.focus_handle(cx).focus(window, cx);
         table.update(cx, |table, cx| {
             table.set_selected_row(5, cx);
@@ -184,8 +193,10 @@ fn table_retains_navigation_positions_when_selection_mode_changes(cx: &mut TestA
 #[gpui_kit::test]
 fn table_selects_rows_and_keyboard_scrolls_virtualized_content(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(640.), px(320.)), |window, cx| Records {
-        table: cx.new(|cx| TableState::new(Rows, window, cx).row_selectable(true)),
+    let (handle, _) = common::open_window(cx, Some(size(px(640.), px(320.))), |window, cx| {
+        cx.new(|cx| Records {
+            table: cx.new(|cx| TableState::new(Rows, window, cx).row_selectable(true)),
+        })
     });
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -216,12 +227,15 @@ fn table_selects_rows_and_keyboard_scrolls_virtualized_content(cx: &mut TestAppC
 #[gpui_kit::test]
 fn table_keyboard_leaves_rows_unselected_when_rows_are_not_selectable(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(640.), px(320.)), |window, cx| Records {
-        table: cx.new(|cx| TableState::new(Rows, window, cx).row_selectable(false)),
-    });
+    let (handle, handle_content) =
+        common::open_window(cx, Some(size(px(640.), px(320.))), |window, cx| {
+            cx.new(|cx| Records {
+                table: cx.new(|cx| TableState::new(Rows, window, cx).row_selectable(false)),
+            })
+        });
     let table = cx
-        .update_window(handle.into(), |root, _, cx| {
-            root.downcast::<Records>().unwrap().read(cx).table.clone()
+        .update_window(handle.into(), |_root, _, cx| {
+            handle_content.clone().read(cx).table.clone()
         })
         .unwrap();
     cx.update_window(handle.into(), |_, window, cx| {

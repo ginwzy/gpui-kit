@@ -6,7 +6,7 @@ order: 2
 
 # Getting Started
 
-`gpui_base::open_window(options, cx, build)` creates a Base `Root` and returns the window handle and content entity. Base owns window structure and overlay hosting without depending on Component. Initialize Component explicitly before opening windows when styled overlays are needed.
+Applications use `gpui_kit::open_window(options, cx, build)`, which creates a Base `Root` and returns the window handle and content entity. Base owns window structure and overlay hosting without depending on Component. Initialize Component explicitly before opening windows when styled overlays are needed.
 
 ## Install
 

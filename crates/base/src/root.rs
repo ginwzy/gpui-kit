@@ -2,9 +2,9 @@
 use crate::input::Copy;
 use crate::{StyledExt, TextSelectionLayer};
 use gpui::{
-    AnyElement, AnyView, AnyWindowHandle, App, AppContext, ClipboardItem, Context, Div, Entity,
-    Global, InteractiveElement, IntoElement, KeyBinding, ParentElement, Pixels, Render, Stateful,
-    StyleRefinement, Styled, Window, WindowOptions, actions, div, px,
+    AnyElement, AnyView, App, AppContext, ClipboardItem, Context, Div, Entity, Global,
+    InteractiveElement, IntoElement, KeyBinding, ParentElement, Pixels, Render, Stateful,
+    StyleRefinement, Styled, Window, actions, div, px,
 };
 use std::{any::TypeId, rc::Rc};
 
@@ -73,7 +73,6 @@ pub struct Root {
     extensions: Vec<Extension>,
     bordered: bool,
     window_shadow_size: Pixels,
-    window_id: gpui::WindowId,
 }
 
 impl Root {
@@ -131,19 +130,12 @@ impl Root {
                 .map(|(_, build)| build(window, cx))
                 .collect(),
             bordered: true,
-            window_id: window.window_handle().window_id(),
             window_shadow_size: if cfg!(target_os = "linux") {
                 px(20.)
             } else {
                 px(0.)
             },
         }
-    }
-
-    /// Clears this window's text selection synchronously.
-    #[deprecated(note = "use gpui_base::TextSelection::clear instead")]
-    pub fn clear_text_selection(&mut self, cx: &mut Context<Self>) {
-        crate::TextSelection::clear_for_window(self.window_id, cx);
     }
 
     /// The original application content entity.
@@ -181,7 +173,7 @@ impl Root {
         window
             .root::<Self>()
             .flatten()
-            .expect("window must be opened with gpui_base::open_window")
+            .expect("window must have a Base Root")
             .read(cx)
     }
     pub fn update<R>(
@@ -192,7 +184,7 @@ impl Root {
         let root = window
             .root::<Self>()
             .flatten()
-            .expect("window must be opened with gpui_base::open_window");
+            .expect("window must have a Base Root");
         root.update(cx, |root, cx| f(root, window, cx))
     }
     fn on_action_tab(&mut self, _: &Tab, window: &mut Window, cx: &mut Context<Self>) {
@@ -314,45 +306,6 @@ impl Render for Root {
     }
 }
 
-/// Open a window with a Base Root and return the window and application content.
-/// Applications own quit/close actions and confirmation flows.
-/// Initialize Base and any presentation extensions before calling this function.
-/// The builder returns application content, not another Root.
-///
-/// In an async context, call this inside `cx.update`. To configure window chrome
-/// or instance styling, use GPUI's `cx.open_window` with [`Root::new`] directly.
-///
-/// ```no_run
-/// use gpui::{App, AppContext, Context, IntoElement, Render, Window, WindowOptions, div};
-/// struct Content;
-/// impl Render for Content {
-///     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement { div() }
-/// }
-/// fn open(cx: &mut App) -> anyhow::Result<()> {
-///     gpui_base::init(cx);
-///     let (_window, _content) = gpui_base::open_window(
-///         WindowOptions::default(), cx, |_, cx| cx.new(|_| Content),
-///     )?;
-///     Ok(())
-/// }
-/// ```
-pub fn open_window<V: Render>(
-    options: WindowOptions,
-    cx: &mut App,
-    build: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
-) -> anyhow::Result<(AnyWindowHandle, Entity<V>)> {
-    let mut built = None;
-    let window = cx.open_window(options, |window, cx| {
-        let view = build(window, cx);
-        built = Some(view.clone());
-        cx.new(|cx| Root::new(view, window, cx))
-    })?;
-    Ok((
-        window.into(),
-        built.expect("open_window ran its build closure"),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,20 +329,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn open_window_always_owns_content_in_a_base_root(cx: &mut TestAppContext) {
-        cx.update(crate::init);
-        let (window, content) = cx
-            .update(|cx| open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| Content)))
-            .unwrap();
-        let root = window.downcast::<Root>().expect("Base owns the root");
-        root.read_with(cx, |root, _| {
-            assert_eq!(root.view().entity_id(), content.entity_id());
-            assert!(root.extensions.is_empty());
-        })
-        .unwrap();
-    }
-
-    #[gpui::test]
     fn extension_registration_is_idempotent_and_state_is_per_window(cx: &mut TestAppContext) {
         cx.update(|cx| {
             crate::init(cx);
@@ -398,17 +337,14 @@ mod tests {
         });
         let mut ids = Vec::new();
         for _ in 0..2 {
-            let (window, _) = cx
-                .update(|cx| open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| Content)))
-                .unwrap();
-            let id = window
-                .downcast::<Root>()
-                .unwrap()
-                .read_with(cx, |root, _| {
-                    assert_eq!(root.extensions.len(), 1);
-                    root.extension::<Layer>().unwrap().entity_id()
-                })
-                .unwrap();
+            let (root, _) = cx.add_window_view(|window, cx| {
+                let content = cx.new(|_| Content);
+                Root::new(content, window, cx)
+            });
+            let id = root.read_with(cx, |root, _| {
+                assert_eq!(root.extensions.len(), 1);
+                root.extension::<Layer>().unwrap().entity_id()
+            });
             ids.push(id);
         }
         assert_ne!(ids[0], ids[1]);

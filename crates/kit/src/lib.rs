@@ -134,8 +134,29 @@ pub use ::gpui_component as component;
 
 #[cfg(feature = "assets")]
 pub use ::gpui_kit_assets as assets;
-/// Window startup always uses the Base Root, independently of Cargo features.
-pub use gpui_base::open_window;
+
+/// Open a window with a Base Root and return the window and application content.
+/// Applications own quit/close actions and confirmation flows.
+/// Call [`init`] before opening application windows.
+/// The builder returns application content, not another Root.
+///
+/// In an async context, call this inside `cx.update`.
+pub fn open_window<V: Render>(
+    options: WindowOptions,
+    cx: &mut App,
+    build: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
+) -> Result<(AnyWindowHandle, Entity<V>)> {
+    let mut built = None;
+    let window = cx.open_window(options, |window, cx| {
+        let view = build(window, cx);
+        built = Some(view.clone());
+        cx.new(|cx| base::Root::new(view, window, cx))
+    })?;
+    Ok((
+        window.into(),
+        built.expect("open_window ran its build closure"),
+    ))
+}
 
 // Mobile applications provide their platform with `Application::with_platform`.
 #[cfg(not(any(target_os = "ios", target_os = "android")))]

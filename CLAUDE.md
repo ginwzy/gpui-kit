@@ -140,14 +140,15 @@ fn main() {
 }
 ```
 
-Base-only examples call `gpui_base::init` and `gpui_base::open_window` directly;
-they must not depend on Kit or Component just to create a window.
+Base-only fixtures use GPUI directly and must not depend on Kit or Component.
+Applications and Kit tests use `gpui_kit::open_window` as their window entry point.
 
 ### Root View System
 
 `gpui_base::Root` is the top-level view for every window created by
-`gpui_base::open_window`. Kit re-exports this helper, and `component::Root`
-re-exports the Base type. Cargo features do not select a different root type.
+`gpui_kit::open_window`. The helper belongs only to Kit; Base supplies the Root
+implementation. `component::Root` re-exports the Base type. Cargo features do not
+select a different root type.
 
 Base owns content and overlay hosting, keyboard navigation (Tab/Shift-Tab),
 and selection copying. Explicit Component initialization registers per-window
@@ -157,8 +158,9 @@ touch selection, themes and window chrome. Initialize before creating windows.
 The helper returns the window handle and application content entity. Its builder
 must return content, not another Root. Overlay layers mount automatically; do not
 call the removed `Root::render_*_layer` methods. In async contexts call the helper
-inside `cx.update`. Custom Root configuration still uses GPUI's lower-level
-window constructor and `Root::new` explicitly.
+inside `cx.update`. Tests should use the same helper and retain its returned
+content entity when they need to inspect or update application state. Avoid
+constructing `Root` directly in application and test startup code.
 
 Quit/close actions, keyboard shortcuts and confirmation flows belong to the application.
 

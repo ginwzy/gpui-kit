@@ -694,12 +694,11 @@ pub fn run() {
             }
         })
         .detach();
-        gpui_base::open_window(
+        cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::centered(gpui::size(px(820.), px(620.)), cx)),
                 ..Default::default()
             },
-            cx,
             |_, cx| cx.new(|_| MotionExample::new()),
         )
         .expect("failed to open motion example");
@@ -716,7 +715,7 @@ pub fn run_embedded(app: Application) -> ApplicationHandle {
                 include_bytes!("../../../story-web/fonts/Inter-Regular.ttf").as_slice(),
             )])
             .expect("failed to load motion example font");
-        gpui_base::open_window(WindowOptions::default(), cx, |_, cx| {
+        cx.open_window(WindowOptions::default(), |_, cx| {
             cx.new(|_| MotionExample::new())
         })
         .expect("failed to open motion example");

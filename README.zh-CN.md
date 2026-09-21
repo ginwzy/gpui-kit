@@ -140,7 +140,7 @@ fn main() {
 }
 ```
 
-`gpui_kit::open_window` 重导出 `gpui_base::open_window`，始终挂载 Base `Root`。Component 初始化时注册窗口展示与浮层扩展。仅使用 Base 的示例直接调用 `gpui_base::init` 和 `gpui_base::open_window`，无需依赖 Kit。
+`gpui_kit::open_window` 是应用的窗口启动入口，始终挂载 Base `Root`。Component 初始化时注册窗口展示与浮层扩展；Cargo feature 不会选择不同的根类型。
 
 ### 图标
 

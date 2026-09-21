@@ -1,3 +1,4 @@
+mod common;
 use gpui_kit::component::{
     Root, WindowExt,
     button::Button,
@@ -84,12 +85,12 @@ impl Render for Workspace {
 #[gpui_kit::test]
 async fn dialog_validates_scoped_input_saves_and_dismisses_notification(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(800.), px(700.)), |window, cx| {
+    let (handle, _) = common::open_window(cx, Some(size(px(800.), px(700.))), |window, cx| {
         let view = cx.new(|cx| Workspace {
             saved: cx.new(|cx| InputState::new(window, cx)),
             draft: cx.new(|cx| InputState::new(window, cx)),
         });
-        Root::new(view, window, cx)
+        view
     });
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -147,12 +148,12 @@ async fn dialog_validates_scoped_input_saves_and_dismisses_notification(cx: &mut
 #[gpui_kit::test]
 async fn escape_dismisses_dialog_and_sheet_and_restores_focus(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(800.), px(700.)), |window, cx| {
+    let (handle, _) = common::open_window(cx, Some(size(px(800.), px(700.))), |window, cx| {
         let view = cx.new(|cx| Workspace {
             saved: cx.new(|cx| InputState::new(window, cx)),
             draft: cx.new(|cx| InputState::new(window, cx)),
         });
-        Root::new(view, window, cx)
+        view
     });
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -207,12 +208,12 @@ async fn escape_dismisses_dialog_and_sheet_and_restores_focus(cx: &mut TestAppCo
 #[gpui_kit::test]
 async fn notification_auto_dismisses_after_its_timer(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(800.), px(700.)), |window, cx| {
+    let (handle, _) = common::open_window(cx, Some(size(px(800.), px(700.))), |window, cx| {
         let view = cx.new(|cx| Workspace {
             saved: cx.new(|cx| InputState::new(window, cx)),
             draft: cx.new(|cx| InputState::new(window, cx)),
         });
-        Root::new(view, window, cx)
+        view
     });
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -288,11 +289,11 @@ async fn open_dialog_and_steal_focus(
     open: &'static str,
 ) -> gpui_kit::AnyWindowHandle {
     cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(800.), px(700.)), |window, cx| {
+    let (handle, _) = common::open_window(cx, Some(size(px(800.), px(700.))), |window, cx| {
         let view = cx.new(|cx| Stealer {
             outside: cx.new(|cx| InputState::new(window, cx)),
         });
-        Root::new(view, window, cx)
+        view
     });
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);

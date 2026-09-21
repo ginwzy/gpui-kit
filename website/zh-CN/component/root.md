@@ -6,7 +6,7 @@ example: false
 
 # Root View
 
-[Root] 是由 Base 提供的统一窗口根视图。`gpui_base::open_window` 始终创建这个类型；`gpui_kit::open_window` 直接重导出同一函数，`component::Root` 也重导出 Base 类型。
+[Root] 是由 Base 提供的统一窗口根视图。应用统一通过 `gpui_kit::open_window` 创建窗口，它始终使用这个类型。Base 不提供额外的窗口创建函数；`component::Root` 重导出 Base 类型。
 
 Base 负责内容与浮层承载、键盘焦点遍历和文本选择复制。显式调用 `gpui_component::init` 会注册窗口展示扩展，提供对话框、抽屉、通知、tooltip、菜单、触屏选择、主题与窗口边框。必须在创建窗口前初始化。仅使用 Base 的应用调用 `gpui_base::init`，无需依赖 Component 或 Kit。Cargo feature 合并不会改变窗口根类型。
 
