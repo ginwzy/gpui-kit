@@ -1,7 +1,7 @@
 [package]
 name = "gpui-kit-recipes"
-version = "0.0.0"
-edition = "2024"
+description = "Tested consumer recipes published verbatim in the documentation."
+version = "0.6.5"
 publish = false
 
 # Deliberately isolated: workspace feature unification must not make these pass.
