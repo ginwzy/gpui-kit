@@ -1,7 +1,7 @@
 use super::auto_close::AutoClosedPairs;
 use crate::input::change::Change;
 
-use super::cursor::CursorSelection;
+use crate::editing::CursorSelection;
 
 const MAX_UNDO_TRANSACTIONS: usize = 1000;
 const MAX_CHANGES_PER_TRANSACTION: usize = 1000;

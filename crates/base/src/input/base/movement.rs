@@ -2,10 +2,10 @@ use crate::input::InputModeKind;
 use gpui::{Context, Pixels, Point, Window};
 use sum_tree::Bias;
 
+use crate::editing::CursorSelection;
 use crate::input::{
     InputBaseState, MoveDown, MoveEnd, MoveHome, MoveLeft, MovePageDown, MovePageUp, MoveRight,
     MoveToEnd, MoveToNextWord, MoveToPreviousWord, MoveToStart, MoveUp, RopeExt as _,
-    cursor::CursorSelection,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]

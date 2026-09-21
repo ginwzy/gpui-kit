@@ -1,7 +1,8 @@
+use crate::editing::CursorSelection;
 use crate::input::InputModeKind;
 use crate::input::{
-    Indent, IndentInline, InputBaseState, Outdent, OutdentInline, RopeExt, cursor::CursorSelection,
-    element::TextElement, layout::LastLayout, mode::LayoutMode,
+    Indent, IndentInline, InputBaseState, Outdent, OutdentInline, RopeExt, element::TextElement,
+    layout::LastLayout, mode::LayoutMode,
 };
 use gpui::{
     Bounds, Context, Hsla, Path, PathBuilder, Pixels, SharedString, TextRun, TextStyle, Window,

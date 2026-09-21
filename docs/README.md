@@ -12,5 +12,11 @@ rather than project-progress logs.
   on `gpui-base`: the engine seam, the render protocol, call scopes, the object
   model, capabilities and the sandbox, and the measured performance model.
 
+Active design work is kept separate from those implemented references:
+
+- [Document Editing Foundation RFC](DOCUMENT-EDITING-RFC.md) defines the staged
+  `gpui-base` contracts for a mixed readonly/editable document with projected
+  text, inline blocks, host transactions, and anchor-based scrolling.
+
 For component-level APIs and runnable examples, see the
 [gpui-base documentation](../website/base/index.md).

@@ -8,16 +8,6 @@ use sum_tree::Bias;
 use super::{InputBaseState, RopeExt as _};
 use crate::text_boundary::word_range_from_chars;
 
-/// Unique identifier for a cursor/selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
-pub(super) struct CursorId(usize);
-
-impl CursorId {
-    pub(super) fn new(id: usize) -> Self {
-        Self(id)
-    }
-}
-
 impl<M: InputModeKind> InputBaseState<M> {
     /// Select the word at the given offset on double-click.
     ///
