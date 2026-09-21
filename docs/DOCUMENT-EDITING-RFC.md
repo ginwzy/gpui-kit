@@ -277,10 +277,11 @@ the document during paint.
 
 Interactive blocks opt out of ancestor text keybindings with the
 `InputHandoff` key context. Base input bindings use the selector
-`Input && !InputHandoff`; ordinary Input, Textarea, and Editor behavior is
-unchanged, while a focused embedded terminal receives Enter, Tab, navigation,
-and deletion keys before the surrounding document. The application remains
-responsible for block-focus navigation and deletion semantics.
+`Input && !InputHandoff`, and component Root focus traversal uses
+`Root && !InputHandoff`; ordinary Input, Textarea, Editor, and focus traversal
+behavior is unchanged, while a focused embedded terminal receives Enter, Tab,
+navigation, and deletion keys before the surrounding document. The application
+remains responsible for block-focus navigation and deletion semantics.
 
 ## Trailer And Scrolling
 

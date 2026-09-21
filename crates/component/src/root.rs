@@ -20,10 +20,11 @@ use std::{any::TypeId, rc::Rc};
 actions!(root, [Tab, TabPrev]);
 
 const CONTEXT: &str = "Root";
+const TAB_CONTEXT: &str = "Root && !InputHandoff";
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("tab", Tab, Some(CONTEXT)),
-        KeyBinding::new("shift-tab", TabPrev, Some(CONTEXT)),
+        KeyBinding::new("tab", Tab, Some(TAB_CONTEXT)),
+        KeyBinding::new("shift-tab", TabPrev, Some(TAB_CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
