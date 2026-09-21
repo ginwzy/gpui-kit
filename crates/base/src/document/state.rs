@@ -2468,6 +2468,33 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             })
     }
 
+    fn text_position_for_display_in_item(
+        &self,
+        display: usize,
+        affinity: Affinity,
+        item_ix: usize,
+    ) -> Option<(Point<Pixels>, Pixels, usize, Bounds<Pixels>)> {
+        self.text_position_for_display(display, affinity)
+            .or_else(|| {
+                let record = self
+                    .text_layouts
+                    .iter()
+                    .find(|record| record.item_ix == item_ix)?;
+                let display = display.clamp(record.display.start, record.display.end);
+                record
+                    .layout
+                    .position_for_index(display - record.display.start)
+                    .map(|position| {
+                        (
+                            position,
+                            record.layout.line_height(),
+                            record.item_ix,
+                            record.bounds,
+                        )
+                    })
+            })
+    }
+
     fn restore_pending_viewport_anchor(&mut self, cx: &mut Context<Self>) {
         let Some(pending) = self.pending_viewport_anchor.as_ref() else {
             return;
@@ -2979,9 +3006,12 @@ impl<I: Clone + Eq + 'static> EntityInputHandler for DocumentState<I> {
             .model
             .source_to_display(source.start, Affinity::Before)?;
         let end_display = self.model.source_to_display(source.end, Affinity::After)?;
+        let start_item = self.layout_item_for_source(source.start);
+        let end_item = self.layout_item_for_source(source.end);
         let (start, line_height, _, _) =
-            self.text_position_for_display(start_display, Affinity::Before)?;
-        let (mut end, _, _, _) = self.text_position_for_display(end_display, Affinity::After)?;
+            self.text_position_for_display_in_item(start_display, Affinity::Before, start_item)?;
+        let (mut end, _, _, _) =
+            self.text_position_for_display_in_item(end_display, Affinity::After, end_item)?;
         end.y = start.y;
         Some(Bounds::from_corners(
             start,
@@ -3318,6 +3348,33 @@ mod tests {
                 assert_eq!(document.marked_text_range(window, cx), None);
                 assert_eq!(document.selected_range(), 10..10);
                 assert_eq!(document.text_input_editable_range(window, cx), Some(7..8));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn ime_candidate_bounds_follow_the_editable_caret(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            document.update(cx, |document, cx| {
+                let bounds = document.last_bounds.unwrap();
+                let before = document
+                    .bounds_for_range(7..7, bounds, window, cx)
+                    .expect("the editable caret should be laid out");
+                document.replace_and_mark_text_in_range(None, "nihao", Some(5..5), window, cx);
+                let marked = document
+                    .bounds_for_range(12..12, bounds, window, cx)
+                    .expect("marked text should retain the previous caret bounds until layout");
+                assert_eq!(marked, before);
+            });
+            let _ = window.draw(cx);
+            document.update(cx, |document, cx| {
+                let bounds = document.last_bounds.unwrap();
+                let drawn = document
+                    .bounds_for_range(12..12, bounds, window, cx)
+                    .expect("marked text should have precise bounds after layout");
+                assert!(drawn.origin.x > bounds.left());
             });
         });
     }
