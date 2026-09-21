@@ -1,10 +1,10 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, App, BorderStyle, Bounds, Corners, Edges, Element, ElementId, ElementInputHandler,
-    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, PaintQuad,
-    Pixels, Point, SharedString, Styled as _, StyledText, TextStyleRefinement, Window, fill, px,
-    size, transparent_black,
+    AnyElement, App, BorderStyle, Bounds, Corners, CursorStyle, Edges, Element, ElementId,
+    ElementInputHandler, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
+    LayoutId, PaintQuad, Pixels, Point, SharedString, Styled as _, StyledText, TextStyleRefinement,
+    Window, fill, px, size, transparent_black,
 };
 
 use super::{DocumentState, state::DocumentTextPresentation};
@@ -116,11 +116,12 @@ impl<I: Clone + Eq + 'static> Element for DocumentElement<I> {
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _: &mut Self::PrepaintState,
+        hitbox: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
         let focus_handle = self.state.read(cx).focus_handle_snapshot();
+        window.set_cursor_style(CursorStyle::IBeam, hitbox);
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(bounds, self.state.clone()),
