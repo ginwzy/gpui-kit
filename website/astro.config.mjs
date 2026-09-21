@@ -75,6 +75,6 @@ export default defineConfig({
   },
 
   vite: {
-    plugins: [tailwindcss(), wasmExamplesDevServer(BASE)],
+    plugins: [tailwindcss(), wasmExamplesDevServer('/')],
   },
 });
