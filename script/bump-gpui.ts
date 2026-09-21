@@ -919,8 +919,12 @@ function relaxExactVersion(spec: unknown): { spec: unknown; relaxed?: string } {
     return exact === null ? { spec } : { spec: exact[1], relaxed: exact[1] };
   }
   if (isPlainObject(spec) && !spec.workspace && spec.path === undefined) {
-    const exact = typeof spec.version === "string" ? EXACT_VERSION.exec(spec.version) : null;
-    if (exact !== null) return { spec: { ...spec, version: exact[1] }, relaxed: exact[1] };
+    const exact =
+      typeof spec.version === "string"
+        ? EXACT_VERSION.exec(spec.version)
+        : null;
+    if (exact !== null)
+      return { spec: { ...spec, version: exact[1] }, relaxed: exact[1] };
   }
   return { spec };
 }
@@ -988,7 +992,9 @@ function crateManifest(
         if (relaxed !== undefined) {
           entry = relaxedSpec;
           if (!crate.relaxedDeps.includes(name)) crate.relaxedDeps.push(name);
-          logInfo(`${crate.name}: relaxed \`${name} = "=${relaxed}"\` to \`^${relaxed}\``);
+          logInfo(
+            `${crate.name}: relaxed \`${name} = "=${relaxed}"\` to \`^${relaxed}\``,
+          );
         }
       }
       rewritten[name] = entry;
@@ -1050,7 +1056,9 @@ function workspaceManifest(
     } else {
       const { spec: relaxedSpec, relaxed } = relaxExactVersion(spec);
       if (relaxed !== undefined)
-        logInfo(`workspace: relaxed \`${name} = "=${relaxed}"\` to \`^${relaxed}\``);
+        logInfo(
+          `workspace: relaxed \`${name} = "=${relaxed}"\` to \`^${relaxed}\``,
+        );
       dependencies[name] = relaxedSpec;
     }
   }
@@ -1156,7 +1164,8 @@ function stageWorkspace(
 
 const FACADE_PATH_MODULE = "gpui_pre_facade_paths";
 const FACADE_PATH_MARKER = `mod ${FACADE_PATH_MODULE};`;
-const PROC_MACRO_ATTRIBUTE = /^#\[proc_macro(?:_derive\([^\n]*\)|_attribute)?\]$/;
+const PROC_MACRO_ATTRIBUTE =
+  /^#\[proc_macro(?:_derive\([^\n]*\)|_attribute)?\]$/;
 
 /**
  * Declarative macros cannot be repaired by the proc-macro output rewriter:
@@ -1174,12 +1183,16 @@ function makeDeclarativeMacrosCrateRelative(
     throw new BumpError("gpui is missing from the staged crate set");
   const actionPath = join(staging, gpui.relDir, "src/action.rs");
   if (!existsSync(actionPath))
-    throw new BumpError("gpui declarative macro source does not exist: src/action.rs");
+    throw new BumpError(
+      "gpui declarative macro source does not exist: src/action.rs",
+    );
   const source = readFileSync(actionPath, "utf8");
   writeFileSync(
     actionPath,
-    modificationNotice(zedSha, "the `actions!` derive paths are crate-relative") +
-      rewriteDeclarativeMacroPaths(source),
+    modificationNotice(
+      zedSha,
+      "the `actions!` derive paths are crate-relative",
+    ) + rewriteDeclarativeMacroPaths(source),
   );
   logInfo("gpui: made actions! derive paths crate-relative");
 }
@@ -1191,7 +1204,10 @@ function rewriteDeclarativeMacroPaths(source: string): string {
   // and must keep that spelling, since `$crate` is meaningless outside a macro.
   const header = "macro_rules! actions {";
   const start = source.indexOf(header);
-  if (start === -1) throw new BumpError("gpui src/action.rs no longer defines `macro_rules! actions`");
+  if (start === -1)
+    throw new BumpError(
+      "gpui src/action.rs no longer defines `macro_rules! actions`",
+    );
   let depth = 0;
   let end = -1;
   for (let index = start + header.length - 1; index < source.length; index++) {
@@ -1201,12 +1217,21 @@ function rewriteDeclarativeMacroPaths(source: string): string {
       break;
     }
   }
-  if (end === -1) throw new BumpError("gpui src/action.rs: unbalanced `macro_rules! actions` block");
+  if (end === -1)
+    throw new BumpError(
+      "gpui src/action.rs: unbalanced `macro_rules! actions` block",
+    );
   const body = source.slice(start, end);
   if (!body.includes(needle)) {
-    throw new BumpError(`gpui actions! no longer derives \`${needle}\`; update rewriteDeclarativeMacroPaths in script/bump-gpui.ts`);
+    throw new BumpError(
+      `gpui actions! no longer derives \`${needle}\`; update rewriteDeclarativeMacroPaths in script/bump-gpui.ts`,
+    );
   }
-  return source.slice(0, start) + body.replaceAll(needle, "$crate::Action)]") + source.slice(end);
+  return (
+    source.slice(0, start) +
+    body.replaceAll(needle, "$crate::Action)]") +
+    source.slice(end)
+  );
 }
 
 /**
@@ -1237,14 +1262,18 @@ function wrapProcMacroEntrypoints(source: string): {
 
     const between: string[] = [];
     let signatureIndex = index + 1;
-    while (signatureIndex < lines.length && lines[signatureIndex].startsWith("#[")) {
+    while (
+      signatureIndex < lines.length &&
+      lines[signatureIndex].startsWith("#[")
+    ) {
       between.push(lines[signatureIndex]);
       signatureIndex++;
     }
     const signature = lines[signatureIndex] ?? "";
-    const match = /^pub fn ([A-Za-z_][A-Za-z0-9_]*)\(([^)]*)\) -> TokenStream \{$/.exec(
-      signature,
-    );
+    const match =
+      /^pub fn ([A-Za-z_][A-Za-z0-9_]*)\(([^)]*)\) -> TokenStream \{$/.exec(
+        signature,
+      );
     if (match === null) {
       throw new BumpError(
         `gpui_macros proc-macro entry after \`${attribute}\` has an unsupported signature: \`${signature}\``,
@@ -1269,10 +1298,16 @@ function wrapProcMacroEntrypoints(source: string): {
     // the module it calls (e.g. `derive_inspector_reflection`), so an ungated
     // wrapper would reference a module that was configured out.
     const preceding: string[] = [];
-    for (let back = output.length - 1; back >= 0 && output[back].startsWith("#["); back--) {
+    for (
+      let back = output.length - 1;
+      back >= 0 && output[back].startsWith("#[");
+      back--
+    ) {
       preceding.unshift(output[back]);
     }
-    const gates = [...preceding, ...between].filter((line) => line.startsWith("#[cfg"));
+    const gates = [...preceding, ...between].filter((line) =>
+      line.startsWith("#[cfg"),
+    );
 
     output.push(attribute, ...between, signature);
     output.push(
@@ -1399,22 +1434,30 @@ function installFacadeAwareMacroPaths(
   const relativeLib = String(macros.manifest.lib?.path ?? "src/lib.rs");
   const libPath = join(crateDir, relativeLib);
   if (!existsSync(libPath))
-    throw new BumpError(`gpui_macros library entry does not exist: ${relativeLib}`);
+    throw new BumpError(
+      `gpui_macros library entry does not exist: ${relativeLib}`,
+    );
   const source = readFileSync(libPath, "utf8");
   if (source.includes(FACADE_PATH_MARKER))
-    throw new BumpError(`gpui_macros already declares \`${FACADE_PATH_MARKER}\``);
+    throw new BumpError(
+      `gpui_macros already declares \`${FACADE_PATH_MARKER}\``,
+    );
   const wrapped = wrapProcMacroEntrypoints(source);
   writeFileSync(
     libPath,
-    modificationNotice(zedSha, "the proc-macro entry points resolve gpui through a facade") +
-      `${FACADE_PATH_MARKER}\n${wrapped.source}`,
+    modificationNotice(
+      zedSha,
+      "the proc-macro entry points resolve gpui through a facade",
+    ) + `${FACADE_PATH_MARKER}\n${wrapped.source}`,
   );
   writeFileSync(
     join(dirname(libPath), `${FACADE_PATH_MODULE}.rs`),
     modificationNotice(zedSha, "this module is added by the script") +
       facadePathModuleSource(),
   );
-  logInfo(`gpui_macros: made ${wrapped.count} proc-macro entry points facade-aware`);
+  logInfo(
+    `gpui_macros: made ${wrapped.count} proc-macro entry points facade-aware`,
+  );
 }
 
 function runSelfTest() {
@@ -1428,13 +1471,16 @@ function runSelfTest() {
     "    pub struct Unbind;",
     "}",
   ].join("\n");
-  const declarativeTransformed = rewriteDeclarativeMacroPaths(declarativeFixture);
+  const declarativeTransformed =
+    rewriteDeclarativeMacroPaths(declarativeFixture);
   if (
     declarativeTransformed.split("$crate::Action)]").length - 1 !== 2 ||
     // The derive on gpui's own struct, outside the macro, keeps its path.
     declarativeTransformed.split("gpui::Action)]").length - 1 !== 1
   ) {
-    throw new BumpError("self-test did not make only the actions! body crate-relative");
+    throw new BumpError(
+      "self-test did not make only the actions! body crate-relative",
+    );
   }
   const fixture = `mod implementation;
 use proc_macro::TokenStream;
@@ -1458,7 +1504,8 @@ pub fn gated(args: TokenStream, input: TokenStream) -> TokenStream {
 fn helper(input: TokenStream) -> TokenStream { input }
 `;
   const transformed = wrapProcMacroEntrypoints(fixture);
-  if (transformed.count !== 3) throw new BumpError("self-test wrapped the wrong macro count");
+  if (transformed.count !== 3)
+    throw new BumpError("self-test wrapped the wrong macro count");
   for (const expected of [
     "rewrite(__gpui_pre_derive_action(input))",
     "fn __gpui_pre_test(args: TokenStream, item: TokenStream)",
@@ -1472,11 +1519,16 @@ fn helper(input: TokenStream) -> TokenStream { input }
   }
   let driftFailed = false;
   try {
-    wrapProcMacroEntrypoints("#[proc_macro]\npub unsafe fn changed() -> TokenStream {");
+    wrapProcMacroEntrypoints(
+      "#[proc_macro]\npub unsafe fn changed() -> TokenStream {",
+    );
   } catch (error) {
     driftFailed = error instanceof BumpError;
   }
-  if (!driftFailed) throw new BumpError("self-test did not reject an upstream signature change");
+  if (!driftFailed)
+    throw new BumpError(
+      "self-test did not reject an upstream signature change",
+    );
   const pathRewriter = facadePathModuleSource();
   for (const expected of [
     'crate_name("gpui-kit")',
@@ -1488,11 +1540,16 @@ fn helper(input: TokenStream) -> TokenStream { input }
       throw new BumpError(`self-test path rewriter is missing \`${expected}\``);
   }
   for (const [description, expected] of [
-    ["Zed's GPU-accelerated UI framework (gpui-pre snapshot of zed@5b055fa)", "5b055fa"],
+    [
+      "Zed's GPU-accelerated UI framework (gpui-pre snapshot of zed@5b055fa)",
+      "5b055fa",
+    ],
     ["no revision here", undefined],
   ] as const) {
     if (snapshotRev(description) !== expected)
-      throw new BumpError(`self-test read the wrong revision from \`${description}\``);
+      throw new BumpError(
+        `self-test read the wrong revision from \`${description}\``,
+      );
   }
   for (const [input, expected] of [
     ["=0.1.3", { spec: "0.1.3", relaxed: "0.1.3" }],
@@ -1501,17 +1558,51 @@ fn helper(input: TokenStream) -> TokenStream { input }
     [">=0.1, <0.2", { spec: ">=0.1, <0.2" }],
     [
       { version: "=0.1.3", features: ["general-category"] },
-      { spec: { version: "0.1.3", features: ["general-category"] }, relaxed: "0.1.3" },
+      {
+        spec: { version: "0.1.3", features: ["general-category"] },
+        relaxed: "0.1.3",
+      },
     ],
     // The republished crates keep their exact pins, and workspace inheritance
     // is resolved at the workspace table.
-    [{ path: "../gpui_util", version: "=0.3.5" }, { spec: { path: "../gpui_util", version: "=0.3.5" } }],
+    [
+      { path: "../gpui_util", version: "=0.3.5" },
+      { spec: { path: "../gpui_util", version: "=0.3.5" } },
+    ],
     [{ workspace: true }, { spec: { workspace: true } }],
   ] as const) {
     const actual = relaxExactVersion(input);
     if (JSON.stringify(actual) !== JSON.stringify(expected))
-      throw new BumpError(`self-test relaxed \`${JSON.stringify(input)}\` to \`${JSON.stringify(actual)}\``);
+      throw new BumpError(
+        `self-test relaxed \`${JSON.stringify(input)}\` to \`${JSON.stringify(actual)}\``,
+      );
   }
+  const workspaceFixture = [
+    'gpui = { package = "gpui-pre", version = "=0.3.6" }',
+    'gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", features = ["font-kit"] }',
+    '# gpui_web = { package = "gpui-pre-web", version = "=0.3.6" }',
+    'reqwest = { package = "gpui-pre-reqwest", version = "=0.12.15", default-features = false }',
+    'gpui_kit = { package = "gpui-kit", version = "=0.6.4" }',
+    'serde = { version = "1", features = ["derive"] }',
+    "[profile.dev.package]",
+    "gpui-pre = { opt-level = 3 }",
+  ].join("\n");
+  const snapshotCrates = ["gpui-pre", "gpui-pre-platform", "gpui-pre-web"].map(
+    (publishedName) => ({ publishedName }) as Crate,
+  );
+  const pinned = pinWorkspaceRequirements(
+    workspaceFixture,
+    snapshotCrates,
+    "0.3.7",
+  );
+  const expectedPinned = workspaceFixture
+    .replace('"gpui-pre", version = "=0.3.6"', '"gpui-pre", version = "=0.3.7"')
+    .replace(
+      '"gpui-pre-platform", version = "=0.3.6"',
+      '"gpui-pre-platform", version = "=0.3.7"',
+    );
+  if (pinned !== expectedPinned)
+    throw new BumpError(`self-test pinned the workspace to:\n${pinned}`);
   logSuccess("Facade-aware gpui_macros transformation self-test passed");
 }
 
@@ -1563,8 +1654,10 @@ function vendorGpuiSourcesForApple(
   }
   writeFileSync(
     buildRs,
-    modificationNotice(zedSha, "the gpui sources it reads are vendored under `vendor/gpui`") +
-      text.replaceAll(GPUI_APPLE_SIBLING, GPUI_APPLE_VENDORED),
+    modificationNotice(
+      zedSha,
+      "the gpui sources it reads are vendored under `vendor/gpui`",
+    ) + text.replaceAll(GPUI_APPLE_SIBLING, GPUI_APPLE_VENDORED),
   );
   logInfo(
     `gpui_apple: vendored ${sources.length} gpui source files for its shader bindings`,
@@ -1635,7 +1728,9 @@ function carryLicenseFiles(zed: string, staging: string, crates: Crate[]) {
   }
   logInfo(
     `LICENSE-APACHE travels with every crate (${copied} added)` +
-      (notices.length ? `, with ${notices.join(", ")}` : "; Zed ships no NOTICE"),
+      (notices.length
+        ? `, with ${notices.join(", ")}`
+        : "; Zed ships no NOTICE"),
   );
 }
 
@@ -1652,14 +1747,20 @@ function modificationNotice(zedSha: string, change: string): string {
 async function auditLicenses(staging: string, crates: Crate[]) {
   for (const crate of crates) {
     if (!existsSync(join(staging, crate.relDir, "LICENSE-APACHE")))
-      throw new BumpError(`${crate.name}: LICENSE-APACHE is missing from the staged crate`);
+      throw new BumpError(
+        `${crate.name}: LICENSE-APACHE is missing from the staged crate`,
+      );
   }
   // Not `--locked`: the lock file is Zed's, and the staged workspace is a
   // subset of it with pruned dependencies, so it has to be updated here the
   // way `cargo publish --dry-run` updates it in the next step.
   const cmd = ["cargo", "metadata", "--format-version", "1"];
   console.log(dim(`$ (cd ${staging} && ${cmd.join(" ")})`));
-  const process_ = Bun.spawn(cmd, { cwd: staging, stdout: "pipe", stderr: "inherit" });
+  const process_ = Bun.spawn(cmd, {
+    cwd: staging,
+    stdout: "pipe",
+    stderr: "inherit",
+  });
   const output = await new Response(process_.stdout).text();
   if ((await process_.exited) !== 0)
     throw new BumpError("cargo metadata failed on the staged workspace");
@@ -1946,19 +2047,59 @@ function parseCommandLine(argv: string[]): Args {
 
 /**
  * Build and test this repository against the staged crates before anything is
- * uploaded. Applications depend on `gpui-pre` with a caret requirement, so a
- * snapshot whose API drifted away from `gpui-component` would reach them on
- * their next `cargo update`; this turns that into a failed release instead.
+ * uploaded. The workspace pins the snapshot crates to an exact version, so a
+ * snapshot whose API drifted away from `gpui-component` never reaches an
+ * application on its own; it reaches them through the gpui-kit release that
+ * bumps the pin, and this makes the drift visible on the release itself so
+ * that bump can carry the adaptation. The snapshot is published either way:
+ * the fix is a change to this repository, which can only land against the
+ * published crates, so the failure is returned to the caller as a warning
+ * rather than thrown.
  *
- * The staged crates are injected with `--config patch.crates-io…` so no file
- * in the repository changes. They are patched from a copy outside the
- * repository: a path dependency under the workspace root would be treated as
- * a member of this workspace and lose its own `workspace = true` inheritance.
- * Cargo keeps a locked version when it still satisfies the requirement, so
- * the published crates are moved to the staged version in a scratch copy of
- * `Cargo.lock`, which is restored afterwards.
+ * The staged crates are injected with `--config patch.crates-io…`, and the
+ * workspace's exact pins are moved onto the staged version for the duration
+ * of the check (a `[patch]` only applies to a source that satisfies the
+ * requirement); `Cargo.toml` is restored afterwards, so no file in the
+ * repository changes. They are patched from a git repository built
+ * around a copy outside the repository, not as path dependencies: Cargo
+ * treats a path dependency as local code and compiles it without
+ * `--cap-lints allow`, so a `RUSTFLAGS=-D warnings` job (the release
+ * workflow's toolchain action sets it) would promote Zed's own warnings, such
+ * as the deprecated `cocoa` types in `gpui_apple`, to errors that no
+ * consumer of the registry crates ever sees. Git dependencies get the same
+ * lint capping as registry ones, so the check mirrors what an application
+ * building against the published snapshot gets. The copy also has to live
+ * outside the repository: a path under the workspace root would be treated
+ * as a member of this workspace and lose its own `workspace = true`
+ * inheritance. Cargo keeps a locked version when it still satisfies the
+ * requirement, so the published crates are moved to the staged version in a
+ * scratch copy of `Cargo.lock`, which is restored afterwards.
  */
-async function verifyKitAgainstStaging(staging: string, crates: Crate[], version: string) {
+/**
+ * Move the workspace's exact requirements on the published crates onto
+ * `version`, keeping every other byte of the manifest as it is. Only
+ * `=x.y.z` requirements on a `package = "gpui-pre-…"` dependency that is part
+ * of this snapshot are rewritten; a hand-published crate such as
+ * `gpui-pre-reqwest` keeps its own pin.
+ */
+function pinWorkspaceRequirements(
+  manifest: string,
+  crates: Crate[],
+  version: string,
+): string {
+  const published = new Set(crates.map((crate) => crate.publishedName));
+  return manifest.replace(
+    /^([A-Za-z0-9_-]+\s*=\s*\{[^\n]*?\bpackage\s*=\s*"([^"]+)"[^\n]*?\bversion\s*=\s*")=[^"]+(")/gm,
+    (line, head: string, name: string, tail: string) =>
+      published.has(name) ? `${head}=${version}${tail}` : line,
+  );
+}
+
+async function verifyKitAgainstStaging(
+  staging: string,
+  crates: Crate[],
+  version: string,
+): Promise<string | undefined> {
   const mirror = join(tmpdir(), `${PUBLISH_PREFIX}-kit-check`);
   rmSync(mirror, { recursive: true, force: true });
   cpSync(staging, mirror, {
@@ -1973,21 +2114,39 @@ async function verifyKitAgainstStaging(staging: string, crates: Crate[], version
   ]);
   const lockPath = join(REPO_ROOT, "Cargo.lock");
   const lockBackup = existsSync(lockPath) ? readFileSync(lockPath) : undefined;
+  const manifestPath = join(REPO_ROOT, "Cargo.toml");
+  const manifestBackup = readFileSync(manifestPath, "utf8");
+  writeFileSync(
+    manifestPath,
+    pinWorkspaceRequirements(manifestBackup, crates, version),
+  );
   const locked = new Set(
-    [...(lockBackup?.toString() ?? "").matchAll(/^name = "([^"]+)"$/gm)].map((m) => m[1]),
+    [...(lockBackup?.toString() ?? "").matchAll(/^name = "([^"]+)"$/gm)].map(
+      (m) => m[1],
+    ),
   );
   try {
     const toUpdate = crates.filter((crate) => locked.has(crate.publishedName));
     if (toUpdate.length > 0) {
       await run(
-        ["cargo", "update", ...patches, ...toUpdate.flatMap((crate) => ["-p", crate.publishedName])],
+        [
+          "cargo",
+          "update",
+          ...patches,
+          ...toUpdate.flatMap((crate) => ["-p", crate.publishedName]),
+        ],
         { cwd: REPO_ROOT },
       );
     }
 
     const metadata = JSON.parse(
-      await run(["cargo", "metadata", "--format-version", "1", ...patches], { cwd: REPO_ROOT, capture: true }),
-    ) as { packages: { name: string; version: string; manifest_path: string }[] };
+      await run(["cargo", "metadata", "--format-version", "1", ...patches], {
+        cwd: REPO_ROOT,
+        capture: true,
+      }),
+    ) as {
+      packages: { name: string; version: string; manifest_path: string }[];
+    };
     // A crate can appear twice when only part of the closure fell back to the
     // registry (a path dependency of a staged crate next to a registry copy),
     // so every package of the name is inspected, not the first one found.
@@ -1996,7 +2155,9 @@ async function verifyKitAgainstStaging(staging: string, crates: Crate[], version
       (pkg) => published.has(pkg.name) && !pkg.manifest_path.startsWith(mirror),
     );
     if (foreign.length > 0) {
-      const detail = foreign.map((pkg) => `${pkg.name} ${pkg.version} from ${pkg.manifest_path}`).join("\n  ");
+      const detail = foreign
+        .map((pkg) => `${pkg.name} ${pkg.version} from ${pkg.manifest_path}`)
+        .join("\n  ");
       throw new BumpError(
         `the workspace resolved these crates from the registry instead of the staged ${version}:\n  ${detail}\n` +
           "Either the workspace's Cargo.toml requirement excludes the new version, or a " +
@@ -2012,8 +2173,35 @@ async function verifyKitAgainstStaging(staging: string, crates: Crate[], version
     // to gpui-kit and do not promote upstream GPUI deprecations to errors.
     const commands = [
       ["cargo", "check", ...patches, "--workspace", "--all-targets"],
-      ["cargo", "clippy", ...patches, "--no-deps", "-p", "gpui-component", "-p", "gpui-component-story", "-p", "gpui-kit-assets", "-p", "gpui-kit", "--", "--deny", "warnings", "--allow", "deprecated"],
-      ["cargo", "test", ...patches, "--workspace", "--exclude", "gpui-shell", "--features", "gpui-component-story/test-support"],
+      [
+        "cargo",
+        "clippy",
+        ...patches,
+        "--no-deps",
+        "-p",
+        "gpui-component",
+        "-p",
+        "gpui-component-story",
+        "-p",
+        "gpui-kit-assets",
+        "-p",
+        "gpui-kit",
+        "--",
+        "--deny",
+        "warnings",
+        "--allow",
+        "deprecated",
+      ],
+      [
+        "cargo",
+        "test",
+        ...patches,
+        "--workspace",
+        "--exclude",
+        "gpui-shell",
+        "--features",
+        "gpui-component-story/test-support",
+      ],
     ];
     for (const cmd of commands) {
       const { code } = await runStreaming(cmd, REPO_ROOT);
@@ -2025,6 +2213,7 @@ async function verifyKitAgainstStaging(staging: string, crates: Crate[], version
       }
     }
   } finally {
+    writeFileSync(manifestPath, manifestBackup);
     if (lockBackup !== undefined) writeFileSync(lockPath, lockBackup);
     else if (existsSync(lockPath)) rmSync(lockPath);
   }
@@ -2118,9 +2307,14 @@ async function main(argv: string[]): Promise<number> {
   if (args.skipKitCheck) {
     logWarn("Skipping the gpui-kit compatibility check (--skip-kit-check)");
   } else {
-    logStep(`6/${totalSteps}`, "Building and testing gpui-kit against the staged crates");
+    logStep(
+      `6/${totalSteps}`,
+      "Building and testing gpui-kit against the staged crates",
+    );
     await verifyKitAgainstStaging(staging, crates, version);
-    logSuccess(`gpui-kit builds and passes its tests against gpui-pre ${version}`);
+    logSuccess(
+      `gpui-kit builds and passes its tests against gpui-pre ${version}`,
+    );
   }
   console.log();
   if (args.dryRun) {
