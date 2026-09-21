@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, error::Error, fmt, ops::Range, rc::Rc};
+use std::{cell::Cell, collections::BTreeMap, error::Error, fmt, ops::Range, rc::Rc};
 
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle,
@@ -11,6 +11,7 @@ use ropey::{LineType, Rope};
 use sum_tree::Bias;
 
 use crate::{
+    Scrollbar, ScrollbarHandle,
     actions::{SelectDown, SelectLeft, SelectRight, SelectUp},
     input::{
         Backspace, Copy, Cut, Delete, DeleteToBeginningOfLine, DeleteToEndOfLine,
@@ -1047,6 +1048,7 @@ pub struct DocumentState<I> {
     caret_reveal_pending: bool,
     caret_reveal_scheduled: bool,
     scroll_handler_installed: bool,
+    scrollbar_input_pending: Rc<Cell<bool>>,
     block_renderer: Option<BlockRenderer<I>>,
     text_renderer: Option<TextRenderer<I>>,
 }
@@ -1077,6 +1079,42 @@ struct ScrollPin<I> {
     id: I,
     anchor: DocumentAnchor,
     viewport_fraction: f32,
+}
+
+// ListState's wheel callback does not run for scrollbar offset writes. Keep
+// that input intent alongside the existing viewport, without a second offset.
+#[derive(Clone)]
+struct DocumentScrollbarHandle {
+    list: ListState,
+    input_pending: Rc<Cell<bool>>,
+}
+
+impl ScrollbarHandle for DocumentScrollbarHandle {
+    fn viewport_bounds(&self) -> Bounds<Pixels> {
+        self.list.viewport_bounds()
+    }
+
+    fn offset(&self) -> Point<Pixels> {
+        ScrollbarHandle::offset(&self.list)
+    }
+
+    fn set_offset(&self, offset: Point<Pixels>) {
+        self.input_pending.set(true);
+        ScrollbarHandle::set_offset(&self.list, offset);
+    }
+
+    fn content_size(&self) -> gpui::Size<Pixels> {
+        ScrollbarHandle::content_size(&self.list)
+    }
+
+    fn start_drag(&self) {
+        self.input_pending.set(true);
+        self.list.scrollbar_drag_started();
+    }
+
+    fn end_drag(&self) {
+        self.list.scrollbar_drag_ended();
+    }
 }
 
 impl<I: Clone + Eq + 'static> DocumentState<I> {
@@ -1111,6 +1149,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             caret_reveal_pending: false,
             caret_reveal_scheduled: false,
             scroll_handler_installed: false,
+            scrollbar_input_pending: Rc::default(),
             block_renderer: None,
             text_renderer: None,
         })
@@ -1369,6 +1408,16 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.model.anchors.remove(pin.anchor);
         cx.emit(DocumentEvent::StopFollowingRequested { pin_id: pin.id });
         cx.notify();
+    }
+
+    fn apply_scrollbar_input(&mut self, cx: &mut Context<Self>) {
+        if self.scrollbar_input_pending.replace(false) {
+            self.caret_reveal_pending = false;
+            if let Some(pending) = self.pending_viewport_anchor.take() {
+                self.model.anchors.remove(pending.anchor);
+            }
+            self.stop_following(cx);
+        }
     }
 
     pub fn remeasure_block(&mut self, id: &I, cx: &mut Context<Self>) -> bool {
@@ -2564,6 +2613,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     fn enforce_scroll_pin(&mut self, cx: &mut Context<Self>) {
+        self.apply_scrollbar_input(cx);
         let Some((anchor, viewport_fraction)) = self
             .scroll_pin
             .as_ref()
@@ -2652,6 +2702,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     pub(super) fn update_root_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+        self.apply_scrollbar_input(cx);
         self.last_bounds = Some(bounds);
         if self.dynamic_trailer
             && self.trailer_height != Some(bounds.size.height)
@@ -3009,6 +3060,10 @@ impl<I: Clone + Eq + 'static> Render for DocumentState<I> {
         .size_full()
         .into_any_element();
         let interaction_entity = entity.clone();
+        let scrollbar = Scrollbar::vertical(&DocumentScrollbarHandle {
+            list: self.list_state.clone(),
+            input_pending: self.scrollbar_input_pending.clone(),
+        });
         let interaction_layer = gpui::div()
             .absolute()
             .inset_0()
@@ -3067,6 +3122,7 @@ impl<I: Clone + Eq + 'static> Render for DocumentState<I> {
             .size_full()
             .child(interaction_layer)
             .child(DocumentElement::new(entity, content))
+            .child(scrollbar)
     }
 }
 
@@ -3715,6 +3771,84 @@ mod tests {
         document.read_with(&cx, |document, _| {
             assert_eq!(document.pinned_scroll_id(), None);
         });
+
+        // Scrollbar writes bypass ListState's wheel callback. Exercise the
+        // rendered track and thumb, including a click that does not drag.
+        let stopped = Rc::new(Cell::new(0));
+        let observed = stopped.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&document, move |_, event, _| {
+                if matches!(event, DocumentEvent::StopFollowingRequested { .. }) {
+                    observed.set(observed.get() + 1);
+                }
+            })
+        });
+        cx.update(|window, cx| {
+            Theme::global_mut(cx).scrollbar =
+                crate::ScrollbarTheme::new().with_mode(crate::ScrollbarMode::Always);
+            document.update(cx, |document, cx| {
+                document
+                    .pin_scroll(
+                        "turn-3",
+                        &DocumentPosition::new("history", anchor_offset, Affinity::After),
+                        0.381_966,
+                        cx,
+                    )
+                    .unwrap();
+            });
+            for _ in 0..3 {
+                let _ = window.draw(cx);
+            }
+        });
+        let selection = document.read_with(&cx, |document, _| document.model.selected_range());
+        let track_top = point(viewport.right() - px(8.), viewport.top() + px(8.));
+        cx.simulate_click(track_top, Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        document.read_with(&cx, |document, _| {
+            assert_eq!(document.pinned_scroll_id(), None);
+            assert_eq!(document.model.selected_range(), selection);
+        });
+        assert_eq!(stopped.get(), 1);
+
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document
+                    .pin_scroll(
+                        "turn-4",
+                        &DocumentPosition::new("history", 0, Affinity::After),
+                        0.,
+                        cx,
+                    )
+                    .unwrap();
+            });
+            for _ in 0..3 {
+                let _ = window.draw(cx);
+            }
+        });
+        cx.simulate_mouse_down(track_top, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            point(track_top.x, viewport.center().y),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            point(track_top.x, viewport.center().y),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.update(|window, cx| {
+            for _ in 0..3 {
+                let _ = window.draw(cx);
+            }
+        });
+        document.read_with(&cx, |document, _| {
+            assert_eq!(document.pinned_scroll_id(), None);
+            assert_eq!(document.model.selected_range(), selection);
+            assert!(document.list_state.logical_scroll_top().item_ix > 0);
+        });
+        assert_eq!(stopped.get(), 2);
     }
 
     #[gpui::test]
