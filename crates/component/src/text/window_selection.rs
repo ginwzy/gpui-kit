@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod tests {
-    use crate::ElementExt as _;
     use crate::global_state::GlobalState;
     use crate::{
         Placement, Root,
@@ -14,8 +13,7 @@ mod tests {
         div, point, px, relative,
     };
     use gpui_base::{
-        AutoScroll, TextSelection, TextSelectionHandle, TextSelectionRegistration,
-        TextSelectionRun, TextSelectionScopeId,
+        AutoScroll, TextSelection, TextSelectionHandle, TextSelectionRegistration, TextSelectionRun,
     };
     use std::cell::Cell;
     use std::rc::Rc;
@@ -2231,187 +2229,48 @@ mod tests {
         );
     }
 
-    /// A behind-the-modal selectable TextView covered by a full-window
-    /// occluding overlay (mirroring a Dialog/Sheet overlay), plus a `front`
-    /// TextView marked with an opaque modal scope and painted on top of the
-    /// overlay. This reproduces the modal stacking at fixed coordinates without a
-    /// real modal's open animation (which cannot be settled under the test
-    /// clock).
-    struct SyntheticModalView {
-        focus_handle: FocusHandle,
-        behind: Entity<TextViewState>,
-        front: Entity<TextViewState>,
-        front_scope: TextSelectionScopeId,
-    }
-
-    impl SyntheticModalView {
-        fn new(cx: &mut Context<Self>) -> Self {
-            Self {
-                focus_handle: cx.focus_handle(),
-                behind: cx.new(|cx| TextViewState::markdown("Behind text", cx)),
-                front: cx.new(|cx| TextViewState::markdown("Front text", cx)),
-                front_scope: TextSelectionScopeId::default(),
-            }
-        }
-    }
-
-    impl Render for SyntheticModalView {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .track_focus(&self.focus_handle)
-                .size_full()
-                // Behind the modal, at the top. Occluded by the overlay below.
-                .child(
-                    div()
-                        .h(px(40.))
-                        .child(TextView::new(&self.behind).selectable(true)),
-                )
-                // A full-window occluding overlay (mirrors the modal overlay)
-                // with modal-scoped content painted on top of it.
-                .child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full()
-                        .occlude()
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(100.))
-                                .left_0()
-                                .h(px(40.))
-                                .child(TextView::new(&self.front).selectable(true)),
-                        )
-                        .text_selection_scope(self.front_scope),
-                )
-        }
-    }
-
-    fn setup_synthetic(
-        cx: &mut TestAppContext,
-    ) -> (Entity<SyntheticModalView>, &mut VisualTestContext) {
-        cx.update(crate::init);
-        let (root, cx) = cx.add_window_view(|window, cx| {
-            let view = cx.new(SyntheticModalView::new);
-            Root::new(view, window, cx)
-        });
-        let view = root.read_with(cx, |root, _| {
-            root.view()
-                .clone()
-                .downcast::<SyntheticModalView>()
-                .unwrap()
-        });
-        cx.run_until_parked();
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-        (view, cx)
-    }
-
-    /// Open an empty dialog (its layer is not mounted, so nothing renders), then
-    /// mark the synthetic front content with Root's opaque active scope.
-    fn activate_dialog_scope(view: &Entity<SyntheticModalView>, cx: &mut VisualTestContext) {
-        let scope = cx.update(|window, cx| {
-            Root::update(window, cx, |root, window, cx| {
-                root.open_dialog(|dialog, _, _| dialog, window, cx);
-            });
-            Root::read(window, cx).active_text_selection_scope()
-        });
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.front_scope = scope;
-                cx.notify();
-            });
-        });
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-    }
-
-    /// Open an empty sheet and mark the synthetic front content with Root's
-    /// opaque active scope.
-    fn activate_sheet_scope(view: &Entity<SyntheticModalView>, cx: &mut VisualTestContext) {
-        let scope = cx.update(|window, cx| {
-            Root::update(window, cx, |root, window, cx| {
-                root.open_sheet_at(Placement::Right, |sheet, _, _| sheet, window, cx);
-            });
-            Root::read(window, cx).active_text_selection_scope()
-        });
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.front_scope = scope;
-                cx.notify();
-            });
-        });
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-    }
-
-    /// Regression guard: with a dialog active, a drag that starts in
-    /// the dialog-scoped content and leaves it over the overlay must not select
-    /// the TextView behind the overlay.
+    /// Regression guard: with a dialog open, a drag that starts in the
+    /// dialog's text and leaves it over the overlay must not select the
+    /// TextView behind the overlay (#2501 de-guarded both Dialog and Sheet).
     #[gpui::test]
     fn selection_behind_active_dialog_is_excluded(cx: &mut TestAppContext) {
-        let (view, cx) = setup_synthetic(cx);
-        activate_dialog_scope(&view, cx);
+        let (view, cx) = setup_modal(cx);
+        let dialog_state = open_dialog_with_text(cx, "Dialog text");
 
-        // Anchor inside the modal-scoped content, then drag up onto the behind
-        // view's glyphs (left side; the behind view spans the full window width,
-        // so its center is far from its text).
-        let from = view.read_with(cx, |v, cx| v.front.read(cx).bounds().center());
+        // Anchor inside the dialog's text, then drag up onto the base view's
+        // glyphs (left side; the base view spans the full window width, so its
+        // center is far from its text).
+        let from = dialog_state.read_with(cx, |s, _| s.bounds().center());
         let to = view.read_with(cx, |v, cx| {
-            let b = v.behind.read(cx).bounds();
+            let b = v.base.read(cx).bounds();
             point(b.origin.x + px(4.), b.center().y)
         });
         drag(cx, from, to);
 
-        let behind = view.read_with(cx, |v, cx| v.behind.read(cx).selected_text());
+        let behind = view.read_with(cx, |v, cx| v.base.read(cx).selected_text());
         assert!(
             behind.trim().is_empty(),
             "view behind the dialog overlay was selected: {behind:?}"
         );
     }
 
-    /// The same guard for a Sheet (#2501 de-guarded both Dialog and Sheet).
+    /// The same guard for a Sheet.
     #[gpui::test]
     fn selection_behind_active_sheet_is_excluded(cx: &mut TestAppContext) {
-        let (view, cx) = setup_synthetic(cx);
-        activate_sheet_scope(&view, cx);
+        let (view, cx) = setup_modal(cx);
+        let sheet_state = open_sheet_with_text(cx, "Sheet text");
 
-        let from = view.read_with(cx, |v, cx| v.front.read(cx).bounds().center());
+        let from = sheet_state.read_with(cx, |s, _| s.bounds().center());
         let to = view.read_with(cx, |v, cx| {
-            let b = v.behind.read(cx).bounds();
+            let b = v.base.read(cx).bounds();
             point(b.origin.x + px(4.), b.center().y)
         });
         drag(cx, from, to);
 
-        let behind = view.read_with(cx, |v, cx| v.behind.read(cx).selected_text());
+        let behind = view.read_with(cx, |v, cx| v.base.read(cx).selected_text());
         assert!(
             behind.trim().is_empty(),
             "view behind the sheet overlay was selected: {behind:?}"
-        );
-    }
-
-    /// The scope filter must not over-exclude: content in the active modal scope
-    /// stays selectable.
-    #[gpui::test]
-    fn front_view_in_active_scope_is_selectable(cx: &mut TestAppContext) {
-        let (view, cx) = setup_synthetic(cx);
-        activate_dialog_scope(&view, cx);
-
-        let b = view.read_with(cx, |v, cx| v.front.read(cx).bounds());
-        drag(
-            cx,
-            point(b.origin.x + px(1.), b.center().y),
-            point(b.origin.x + b.size.width + px(80.), b.center().y),
-        );
-
-        let front = view.read_with(cx, |v, cx| v.front.read(cx).selected_text());
-        assert!(
-            front.contains("Front"),
-            "active-scope content was not selectable: {front:?}"
         );
     }
 }

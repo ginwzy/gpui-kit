@@ -6,15 +6,12 @@ example: false
 
 # Root View
 
-The [Root] component for as the root provider of GPUI Component features in a window. We must to use [Root] as the **first level child** of a window to enable GPUI Component features.
+[Root] is the root view of a GPUI Kit window. It holds the window's dialogs, sheets and notifications and renders them above the view it wraps, and it hosts tooltips and menus. `gpui_kit::open_window` creates it for you; you only meet `Root` directly when a window needs a customized one.
 
-This is important, if we don't use [Root] as the first level child of a window, there will have some unexpected behaviors.
-
-This complete **Tested consumer recipe** is compiled from the isolated `gpui-kit` consumer workspace. It initializes GPUI Kit before creating a window, makes `Root` the first-level view, and renders every Root overlay layer.
+This complete **Tested consumer recipe** is compiled from the isolated `gpui-kit` consumer workspace. It initializes GPUI Kit, then opens a window whose root is a `Root` wrapping the application view.
 
 <!-- recipe:bootstrap:start -->
 ```rust
-use gpui_kit::component::Root;
 use gpui_kit::{
     AppContext as _, Context, IntoElement, ParentElement as _, Render, Styled as _, Window,
     WindowOptions, div,
@@ -25,54 +22,78 @@ pub fn run() {
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);
-            cx.spawn(async move |cx| {
-                cx.open_window(WindowOptions::default(), |window, cx| {
-                    let view = cx.new(|_| BootstrapView);
-                    cx.new(|cx| Root::new(view, window, cx))
-                })
-                .expect("failed to open window");
+            // The window's root view is a `Root` wrapping the view, which
+            // renders dialogs, sheets and notifications above it.
+            gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
+                cx.new(|_| BootstrapView)
             })
-            .detach();
+            .expect("failed to open window");
         });
 }
 
 struct BootstrapView;
 
 impl Render for BootstrapView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .child("My application")
-            .children(Root::render_dialog_layer(window, cx))
-            .children(Root::render_sheet_layer(window, cx))
-            .children(Root::render_notification_layer(window, cx))
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child("My application")
     }
 }
 ```
 <!-- recipe:bootstrap:end -->
 
-## Window Border
+## Customizing the Root
 
-By default, [Root] renders GPUI Component's client-side window border wrapper. For
-layer-shell fullscreen windows or other surfaces that should not render this
-wrapper, disable it with `bordered(false)`:
+`gpui_kit::open_window` is `cx.open_window` plus the `Root` wrapper. Build the
+`Root` yourself when it needs configuring — for example `bordered(false)` for a
+layer-shell fullscreen window that should not render GPUI Component's
+client-side window border:
 
 ```rs
-cx.new(|cx| Root::new(view, window, cx).bordered(false))
+cx.open_window(WindowOptions::default(), |window, cx| {
+    let view = cx.new(|_| MyApp);
+    cx.new(|cx| Root::new(view, window, cx).bordered(false))
+})
+```
+
+Whichever way it is built, `Root` must be the window's root view: `window.open_dialog`, `open_sheet` and `push_notification` store their state on it and panic with a pointer to this page when it is missing.
+
+`open_window` returns the window and the view, so a view that must be built inside the window (it owns an `InputState`, say) can still be kept:
+
+```rust
+let (window, editor) = gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+    cx.new(|cx| Editor::new(window, cx))
+})?;
+```
+
+## Default Keys
+
+`gpui_kit::init` binds the platform's quit shortcut — `cmd-q` on macOS, `alt-f4` on Windows and Linux — to `gpui_kit::base::actions::Quit`, which quits the application, so every window answers it. On macOS `cmd-w` is bound to `gpui_kit::base::actions::CloseWindow`, which closes the active window the way `File › Close` does (Windows and Linux close a window with `alt-f4`). Both live in `gpui-base`: they are window behavior, not styling. To ask before quitting or closing, bind the same shortcut to your own action; a binding added later wins:
+
+```rust
+cx.bind_keys([KeyBinding::new("cmd-q", ConfirmQuit, None)]);
 ```
 
 ## Overlays
 
-We have dialogs, sheets, notifications, we need placement for them to show, so [Root] provides methods to render these overlays:
+Dialogs, sheets and notifications render on layers that `Root` places above the view, so a view that never mentions them still shows them. An application that wants a layer somewhere else in its tree — under its own title bar, say, or below a HUD that must stay on top — renders that layer itself and `Root` leaves it out:
 
-- [Root::render_dialog_layer](https://docs.rs/gpui-component/latest/gpui_component/struct.Root.html#method.render_dialog_layer) - Render the current opened modals.
-- [Root::render_sheet_layer](https://docs.rs/gpui-component/latest/gpui_component/struct.Root.html#method.render_sheet_layer) - Render the current opened drawers.
-- [Root::render_notification_layer](https://docs.rs/gpui-component/latest/gpui_component/struct.Root.html#method.render_notification_layer) - Render the notification list.
+- [Root::render_dialog_layer](https://docs.rs/gpui-component/latest/gpui_component/struct.Root.html#method.render_dialog_layer) - the open dialogs.
+- [Root::render_sheet_layer](https://docs.rs/gpui-component/latest/gpui_component/struct.Root.html#method.render_sheet_layer) - the open sheet.
+- [Root::render_notification_layer](https://docs.rs/gpui-component/latest/gpui_component/struct.Root.html#method.render_notification_layer) - the notification list.
 
-Put these layers in the `render` method of the first-level view below `Root`; the tested recipe above shows their required `window, cx` arguments.
+```rust
+impl Render for MyApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .child(self.content.clone())
+            // Placed here on purpose; Root will not add a second one.
+            .children(Root::render_dialog_layer(window, cx))
+            .child(self.hud.clone())
+    }
+}
+```
 
-:::tip
-Here the example we used `children` method, it because if there is no opened dialogs, sheets, notifications, these methods will return `None`, so GPUI will not render anything.
-:::
+Each returns `None` while it has nothing to show, which is why the example uses `children`.
 
 [Root]: https://docs.rs/gpui-component/latest/gpui_component/root/struct.Root.html

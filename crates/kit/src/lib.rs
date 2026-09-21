@@ -33,11 +33,8 @@
 //! fn main() {
 //!     gpui_kit::application().run(|cx| {
 //!         gpui_kit::init(cx);
-//!         cx.spawn(async move |cx| {
-//!             cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| Hello))
-//!                 .expect("failed to open window");
-//!         })
-//!         .detach();
+//!         gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| Hello))
+//!             .expect("failed to open window");
 //!     });
 //! }
 //! ```
@@ -128,19 +125,71 @@ pub use gpui_base::is_mobile;
 /// fn main() {
 ///     gpui_kit::application().run(|cx| {
 ///         gpui_kit::init(cx);
-///         cx.spawn(async move |cx| {
-///             cx.open_window(WindowOptions::default(), |window, cx| {
-///                 let view = cx.new(|_| Hello);
-///                 cx.new(|cx| Root::new(view, window, cx))
-///             })
+///         gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| Hello))
 ///             .expect("failed to open window");
-///         })
-///         .detach();
 ///     });
 /// }
 /// ```
 #[cfg(feature = "component")]
 pub use ::gpui_component as component;
+
+/// Opens a window ready for GPUI Kit, with the view `build` returns as its
+/// content.
+///
+/// This is `cx.open_window` with the one thing every GPUI Kit window needs
+/// already done. With the `component` feature the window's root view is a
+/// [`component::Root`] wrapping the view, so dialogs, sheets, notifications,
+/// tooltips and menus work in it straight away; without it the view is the
+/// root. Either way `init` has already bound the platform's quit shortcut
+/// (`cmd-q` on macOS, `alt-f4` elsewhere) and, on macOS, `cmd-w` to close
+/// the window.
+///
+/// ```ignore
+/// gpui_kit::application().run(|cx| {
+///     gpui_kit::init(cx);
+///     gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| MyApp))
+///         .expect("failed to open window");
+/// });
+/// ```
+///
+/// It returns the window and the view, so a caller that keeps a handle to
+/// its view can build the view inside the window — where `InputState` and
+/// other window-bound state must be created — and still keep it:
+///
+/// ```ignore
+/// let (window, editor) = gpui_kit::open_window(options, cx, |window, cx| {
+///     cx.new(|cx| Editor::new(window, cx))
+/// })?;
+/// ```
+///
+/// From an async context, call it inside `cx.update`. Wrap the view yourself
+/// with `Root::new` when the window needs a customized `Root` —
+/// `bordered(false)` for a layer-shell surface, say.
+pub fn open_window<V: Render>(
+    options: WindowOptions,
+    cx: &mut App,
+    build: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
+) -> Result<(AnyWindowHandle, Entity<V>)> {
+    let mut built = None;
+    #[cfg(feature = "component")]
+    let window = cx
+        .open_window(options, |window, cx| {
+            let view = build(window, cx);
+            built = Some(view.clone());
+            cx.new(|cx| component::Root::new(view, window, cx))
+        })?
+        .into();
+    #[cfg(not(feature = "component"))]
+    let window = cx
+        .open_window(options, |window, cx| {
+            let view = build(window, cx);
+            built = Some(view.clone());
+            view
+        })?
+        .into();
+    let view = built.expect("open_window ran its build closure");
+    Ok((window, view))
+}
 #[cfg(feature = "assets")]
 pub use ::gpui_kit_assets as assets;
 

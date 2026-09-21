@@ -10,12 +10,13 @@ use crate::{
     window_border,
 };
 use gpui::{
-    AnyView, App, AppContext, ClipboardItem, Context, DefiniteLength, ElementId, Entity,
-    FocusHandle, InteractiveElement, IntoElement, KeyBinding, ParentElement as _, Pixels, Render,
-    StyleRefinement, Styled, WeakFocusHandle, Window, actions, div, prelude::FluentBuilder as _,
+    AnyElement, AnyView, App, AppContext, Bounds, ClipboardItem, Context, DefiniteLength, Element,
+    ElementId, Entity, FocusHandle, GlobalElementId, InspectorElementId, InteractiveElement,
+    IntoElement, KeyBinding, LayoutId, ParentElement as _, Pixels, Render, StyleRefinement, Styled,
+    WeakFocusHandle, Window, actions, div, prelude::FluentBuilder as _,
 };
 use gpui_base::{TextSelection, TextSelectionLayer, TextSelectionScopeId};
-use std::{any::TypeId, rc::Rc};
+use std::{any::TypeId, cell::Cell, rc::Rc};
 
 actions!(root, [Tab, TabPrev]);
 
@@ -33,10 +34,16 @@ pub(crate) fn init(cx: &mut App) {
 
 /// Root is a view for the App window for as the top level view (Must be the first view in the window).
 ///
-/// It is used to manage the Sheet, Dialog, and Notification.
+/// It holds the window's sheet, dialogs and notifications and renders them
+/// above the view it wraps. `gpui_kit::open_window` creates it for you.
 pub struct Root {
     style: StyleRefinement,
     view: AnyView,
+    /// Which overlay layers the application rendered itself this frame,
+    /// through [`Root::render_dialog_layer`] and its siblings. `Root` renders
+    /// the rest after the view, so a window whose content ignores the layers
+    /// still shows its dialogs.
+    app_rendered: AppRenderedLayers,
     pub(crate) active_sheet: Option<ActiveSheet>,
     pub(crate) active_dialogs: Vec<ActiveDialog>,
     pub(super) focused_input: Option<AnyInputState>,
@@ -104,6 +111,7 @@ impl Root {
         Self {
             style: StyleRefinement::default(),
             view: view.into(),
+            app_rendered: AppRenderedLayers::default(),
             active_sheet: None,
             active_dialogs: Vec::new(),
             focused_input: None,
@@ -157,10 +165,7 @@ impl Root {
     where
         F: FnOnce(&mut Self, &mut Window, &mut Context<Self>) -> R,
     {
-        let root = window
-            .root::<Root>()
-            .flatten()
-            .expect("BUG: window first layer should be a gpui_component::Root.");
+        let root = window.root::<Root>().flatten().expect(ROOT_MISSING);
 
         root.update(cx, |root, cx| f(root, window, cx))
     }
@@ -176,18 +181,26 @@ impl Root {
     pub fn read<'a>(window: &'a Window, cx: &'a App) -> &'a Self {
         &window
             .root::<Root>()
-            .expect("The window root view should be of type `ui::Root`.")
-            .unwrap()
+            .flatten()
+            .expect(ROOT_MISSING)
             .read(cx)
     }
 
-    // Render Notification layer.
+    /// Render the notification layer where the application wants it.
+    ///
+    /// `Root` renders this layer itself, after the view, when the
+    /// application does not; call this only to place it elsewhere in the
+    /// tree. It returns `None` when there is nothing to show.
     pub fn render_notification_layer(
         window: &mut Window,
         cx: &mut App,
     ) -> Option<impl IntoElement + use<>> {
         let root = window.root::<Root>()??;
+        root.read(cx).app_rendered.notification.set(true);
+        Self::notification_layer(&root, cx)
+    }
 
+    fn notification_layer(root: &Entity<Root>, cx: &App) -> Option<impl IntoElement + use<>> {
         let active_sheet_placement = root.read(cx).active_sheet.clone().map(|d| d.placement);
 
         let sheet_size = root.read(cx).sheet_size;
@@ -211,13 +224,25 @@ impl Root {
         )
     }
 
-    /// Render the Sheet layer.
+    /// Render the sheet layer where the application wants it.
+    ///
+    /// `Root` renders this layer itself, after the view, when the
+    /// application does not; call this only to place it elsewhere in the
+    /// tree. It returns `None` while no sheet is open.
     pub fn render_sheet_layer(
         window: &mut Window,
         cx: &mut App,
     ) -> Option<impl IntoElement + use<>> {
         let root = window.root::<Root>()??;
+        root.read(cx).app_rendered.sheet.set(true);
+        Self::sheet_layer(root, window, cx)
+    }
 
+    fn sheet_layer(
+        root: Entity<Root>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<impl IntoElement + use<>> {
         if let Some(active_sheet) = root.read(cx).active_sheet.clone() {
             let mut sheet = Sheet::new(window, cx);
             sheet = (active_sheet.builder)(sheet, window, cx);
@@ -238,13 +263,25 @@ impl Root {
         None
     }
 
-    /// Render the Dialog layer.
+    /// Render the dialog layer where the application wants it.
+    ///
+    /// `Root` renders this layer itself, after the view, when the
+    /// application does not; call this only to place it elsewhere in the
+    /// tree. It returns `None` while no dialog is open.
     pub fn render_dialog_layer(
         window: &mut Window,
         cx: &mut App,
     ) -> Option<impl IntoElement + use<>> {
         let root = window.root::<Root>()??;
+        root.read(cx).app_rendered.dialog.set(true);
+        Self::dialog_layer(&root, window, cx)
+    }
 
+    fn dialog_layer(
+        root: &Entity<Root>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<impl IntoElement + use<>> {
         let active_dialogs = root.read(cx).active_dialogs.clone();
 
         if active_dialogs.is_empty() {
@@ -582,6 +619,9 @@ impl Render for Root {
         window.set_rem_size(cx.theme().font_size);
         let active_scope = self.active_text_selection_scope();
         TextSelection::activate_scope(active_scope, window, cx);
+        // The view renders inside the layout pass below and reports the
+        // layers it placed itself; `RootLayers` reads the report after it.
+        self.app_rendered.reset();
 
         let inner = div()
             .id("root")
@@ -597,6 +637,7 @@ impl Render for Root {
             .refine_style(&self.style)
             .child(TextSelectionLayer)
             .child(self.view.clone())
+            .child(RootLayers::new(cx.entity()))
             .child(self.touch_selection_overlay.clone())
             .child(self.tooltip_overlay.clone())
             .child(self.native_menu_overlay.clone());
@@ -608,6 +649,125 @@ impl Render for Root {
                 .into_any_element()
         } else {
             inner.into_any_element()
+        }
+    }
+}
+
+/// What to tell a caller whose window root is not a [`Root`].
+const ROOT_MISSING: &str = "this window's root view is not a gpui_kit::component::Root, so it has \
+nowhere to keep dialogs, sheets and notifications. Open the window with \
+`gpui_kit::open_window`, or wrap your view: `cx.new(|cx| Root::new(view, window, cx))`.";
+
+/// The overlay layers the application placed itself this frame.
+#[derive(Default)]
+struct AppRenderedLayers {
+    sheet: Cell<bool>,
+    dialog: Cell<bool>,
+    notification: Cell<bool>,
+}
+
+impl AppRenderedLayers {
+    fn reset(&self) {
+        self.sheet.set(false);
+        self.dialog.set(false);
+        self.notification.set(false);
+    }
+}
+
+/// Renders the overlay layers the application did not place itself.
+///
+/// It is laid out after the view, so by the time its layout is requested
+/// the view has rendered and [`AppRenderedLayers`] says which layers it
+/// took. Being a later sibling also paints it above the view.
+struct RootLayers {
+    root: Entity<Root>,
+    child: Option<AnyElement>,
+}
+
+impl RootLayers {
+    fn new(root: Entity<Root>) -> Self {
+        Self { root, child: None }
+    }
+}
+
+impl IntoElement for RootLayers {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for RootLayers {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let root = self.root.clone();
+        let (sheet, dialog, notification) = {
+            let taken = &root.read(cx).app_rendered;
+            (
+                taken.sheet.get(),
+                taken.dialog.get(),
+                taken.notification.get(),
+            )
+        };
+        let mut layers = div().debug_selector(|| "root-layers".to_string());
+        if !sheet {
+            layers = layers.children(Root::sheet_layer(root.clone(), window, cx));
+        }
+        if !dialog {
+            layers = layers.children(Root::dialog_layer(&root, window, cx));
+        }
+        if !notification {
+            layers = layers.children(Root::notification_layer(&root, cx));
+        }
+        let mut child = layers.into_any_element();
+        let layout_id = child.request_layout(window, cx);
+        self.child = Some(child);
+        (layout_id, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        if let Some(child) = self.child.as_mut() {
+            child.prepaint(window, cx);
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(child) = self.child.as_mut() {
+            child.paint(window, cx);
         }
     }
 }

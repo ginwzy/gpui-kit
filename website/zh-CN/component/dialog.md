@@ -16,11 +16,9 @@ use gpui_kit::component::WindowExt;
 
 ## 用法
 
-### 在应用根视图中渲染 Dialog 图层
+### 对话框渲染在哪里
 
-如果你要展示对话框，需要在应用根视图中渲染 dialog layer。通常这会放在主应用结构体的 `render` 方法里。
-
-[Root::render_dialog_layer](https://docs.rs/gpui-component/latest/gpui_component/struct.Root.html#method.render_dialog_layer) 会把当前激活的对话框渲染在应用内容之上。
+对话框打开在窗口的 [Root](./root.md) 上，由它渲染在所包裹的视图之上。用 `gpui_kit::open_window` 打开的窗口不需要再做任何事。想自己决定图层位置——比如放在自己的标题栏之下——就在想要的位置渲染 [Root::render_dialog_layer](https://docs.rs/gpui-component/latest/gpui_component/struct.Root.html#method.render_dialog_layer)，`Root` 会跳过它：
 
 ```rust
 use gpui_kit::component::TitleBar;
@@ -31,17 +29,15 @@ struct MyApp {
 
 impl Render for MyApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let dialog_layer = Root::render_dialog_layer(window, cx);
-
         div()
             .size_full()
             .child(
                 v_flex()
                     .size_full()
                     .child(TitleBar::new())
-                    .child(div().flex_1().overflow_hidden().child(self.view.clone())),
+                    .child(div().flex_1().overflow_hidden().child(self.view.clone()))
+                    .children(Root::render_dialog_layer(window, cx)),
             )
-            .children(dialog_layer)
     }
 }
 ```

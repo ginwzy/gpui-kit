@@ -345,10 +345,10 @@ suites remain in place. Pure presentation components need geometry or pixel asse
 not invented interaction state. Custom parts register their existing native elements;
 unsupported properties remain unavailable, with no manual test-only override.
 
-Views that open dialogs, sheets or notifications through `WindowExt` must render the
-corresponding `Root::render_dialog_layer`, `Root::render_sheet_layer` and
-`Root::render_notification_layer` children, just as the production application does.
-Constructing `Root` alone does not mount those overlay layers.
+Views that open dialogs, sheets or notifications through `WindowExt` need a `Root`
+as the window's root view; `Root` renders those overlay layers above the view. A view
+that places a layer itself with `Root::render_dialog_layer` and its siblings gets it
+there, once.
 
 Use `within` for repeated controls. A Sheet's `"sheet"` host scope contains its
 `"sheet-content"` surface; Dialog's `"dialog"` scope contains the layer-indexed surface.
