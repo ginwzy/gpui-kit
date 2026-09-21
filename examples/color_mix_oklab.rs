@@ -5,6 +5,7 @@ use gpui_kit::component::{
     v_flex, Root, Sizable,
 };
 
+actions!(demo, [Quit]);
 
 struct ColorMixDemo {
     focus_handle: FocusHandle,
@@ -151,6 +152,10 @@ fn main() {
         gpui_kit::init(cx);
 
         cx.activate(true);
+        cx.on_action(|_: &Quit, cx: &mut AppContext| {
+            cx.quit();
+        });
+        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
 
         cx.spawn(|cx| async move {
             cx.open_window(

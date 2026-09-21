@@ -346,9 +346,8 @@ not invented interaction state. Custom parts register their existing native elem
 unsupported properties remain unavailable, with no manual test-only override.
 
 Views that open dialogs, sheets or notifications through `WindowExt` need a `Root`
-as the window's root view; `Root` renders those overlay layers above the view. A view
-that places a layer itself with `Root::render_dialog_layer` and its siblings gets it
-there, once.
+as the window's root view. `Root` always renders all three overlay layers above
+application content, including cached views. No manual layer mounting is needed.
 
 Use `within` for repeated controls. A Sheet's `"sheet"` host scope contains its
 `"sheet-content"` surface; Dialog's `"dialog"` scope contains the layer-indexed surface.

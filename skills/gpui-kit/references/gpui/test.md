@@ -51,8 +51,8 @@ is `cargo test -p gpui-kit --features test-support --test ui --locked`.
    inside a test only for a self-contained example or a deliberate fixture.
 2. Initialize with `cx.update(gpui_kit::init)`, open a headless window of an
    explicit size, and wrap a Component application in `Root`. `Root` renders
-   the dialog, sheet and notification layers above the view; a view that
-   places one itself with `Root::render_dialog_layer` gets it there, once.
+   the dialog, sheet and notification layers above the view automatically.
+   Do not mount overlay layers in the application view.
 3. Render a frame and locate existing control IDs. Custom native elements opt
    in with `.id("status").test_support()` through `TestSupportExt`. Place it
    before `.track_focus(&handle)`; custom wrappers must forward that method

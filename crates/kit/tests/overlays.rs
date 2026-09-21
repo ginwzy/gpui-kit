@@ -16,10 +16,7 @@ struct Workspace {
     draft: Entity<InputState>,
 }
 impl Render for Workspace {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let dialogs = Root::render_dialog_layer(window, cx);
-        let sheets = Root::render_sheet_layer(window, cx);
-        let notifications = Root::render_notification_layer(window, cx);
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let draft = self.draft.clone();
         let saved = self.saved.clone();
         div()
@@ -81,9 +78,6 @@ impl Render for Workspace {
                         );
                     }),
             )
-            .children(dialogs)
-            .children(sheets)
-            .children(notifications)
     }
 }
 
@@ -253,8 +247,7 @@ struct Stealer {
     outside: Entity<InputState>,
 }
 impl Render for Stealer {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let dialogs = Root::render_dialog_layer(window, cx);
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .p_4()
@@ -285,7 +278,6 @@ impl Render for Stealer {
                         });
                     }),
             )
-            .children(dialogs)
     }
 }
 

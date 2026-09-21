@@ -215,7 +215,6 @@ pub const fn is_mobile() -> bool {
 pub fn init(cx: &mut App) {
     let _ = Theme::global_mut(cx);
     GlobalState::init(cx);
-    actions::init(cx);
     reduce_motion::init(cx);
     dialog::init(cx);
     focus_trap::init(cx);

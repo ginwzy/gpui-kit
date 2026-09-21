@@ -381,21 +381,9 @@ v_flex().gap_4().p_4()
 
 ## Overlay Layers (Dialogs, Sheets, Notifications)
 
-The window's `Root` renders dialogs, sheets and notifications above the view, so a window opened with `gpui_kit::open_window` needs nothing else — `window.open_dialog(..)` just works, and the platform's quit shortcut (`cmd-q` / `alt-f4`) already quits; on macOS `cmd-w` closes the window. `open_window` returns `(AnyWindowHandle, Entity<V>)`. The complete tested consumer recipe is [`examples/ai_recipes/src/bootstrap.rs`](../../../examples/ai_recipes/src/bootstrap.rs).
+The window's `Root` renders dialogs, sheets and notifications above the view, so a window opened with `gpui_kit::open_window` needs nothing else — `window.open_dialog(..)` just works. Applications define their own quit and close-window actions, key bindings, and confirmation flows. `open_window` returns `(AnyWindowHandle, Entity<V>)`. The complete tested consumer recipe is [`examples/ai_recipes/src/bootstrap.rs`](../../../examples/ai_recipes/src/bootstrap.rs).
 
-Render a layer yourself only to place it elsewhere in the tree (under your title bar, below a HUD); `Root` then leaves that layer out:
-
-```rust
-impl Render for MyApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .child(self.main_content(window, cx))
-            .children(Root::render_dialog_layer(window, cx))
-            .child(self.hud.clone())
-    }
-}
-```
+Root always mounts all three layers. The former `Root::render_*_layer` methods have been removed; delete their calls from application views when migrating to 0.7.0.
 
 ---
 

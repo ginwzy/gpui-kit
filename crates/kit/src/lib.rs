@@ -140,9 +140,8 @@ pub use ::gpui_component as component;
 /// already done. With the `component` feature the window's root view is a
 /// [`component::Root`] wrapping the view, so dialogs, sheets, notifications,
 /// tooltips and menus work in it straight away; without it the view is the
-/// root. Either way `init` has already bound the platform's quit shortcut
-/// (`cmd-q` on macOS, `alt-f4` elsewhere) and, on macOS, `cmd-w` to close
-/// the window.
+/// root. Applications own their quit and close-window actions and key bindings,
+/// including any confirmation before closing.
 ///
 /// ```ignore
 /// gpui_kit::application().run(|cx| {
@@ -162,9 +161,10 @@ pub use ::gpui_component as component;
 /// })?;
 /// ```
 ///
-/// From an async context, call it inside `cx.update`. Wrap the view yourself
-/// with `Root::new` when the window needs a customized `Root` —
-/// `bordered(false)` for a layer-shell surface, say.
+/// From an async context, call it inside `cx.update`. When the window needs a
+/// customized `Root`, use `cx.open_window` and wrap the view with `Root::new`
+/// yourself — `bordered(false)` for a layer-shell surface, say. Do not return
+/// a `Root` from this helper's builder: it would be wrapped in another `Root`.
 pub fn open_window<V: Render>(
     options: WindowOptions,
     cx: &mut App,

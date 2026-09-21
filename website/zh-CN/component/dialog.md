@@ -16,31 +16,9 @@ use gpui_kit::component::WindowExt;
 
 ## 用法
 
-### 对话框渲染在哪里
+### 对话框的渲染位置
 
-对话框打开在窗口的 [Root](./root.md) 上，由它渲染在所包裹的视图之上。用 `gpui_kit::open_window` 打开的窗口不需要再做任何事。想自己决定图层位置——比如放在自己的标题栏之下——就在想要的位置渲染 [Root::render_dialog_layer](https://docs.rs/gpui-component/latest/gpui_component/struct.Root.html#method.render_dialog_layer)，`Root` 会跳过它：
-
-```rust
-use gpui_kit::component::TitleBar;
-
-struct MyApp {
-    view: AnyView,
-}
-
-impl Render for MyApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .child(
-                v_flex()
-                    .size_full()
-                    .child(TitleBar::new())
-                    .child(div().flex_1().overflow_hidden().child(self.view.clone()))
-                    .children(Root::render_dialog_layer(window, cx)),
-            )
-    }
-}
-```
+窗口的 [Root](./root.md) 会自动挂载并渲染对话框层。使用 `gpui_kit::open_window` 打开窗口，或将应用视图包裹在 `Root::new` 中即可，无需在视图中手动渲染浮层。
 
 ### 基础对话框
 

@@ -65,35 +65,16 @@ let (window, editor) = gpui_kit::open_window(WindowOptions::default(), cx, |wind
 })?;
 ```
 
-## Default Keys
+## Closing windows and quitting
 
-`gpui_kit::init` binds the platform's quit shortcut — `cmd-q` on macOS, `alt-f4` on Windows and Linux — to `gpui_kit::base::actions::Quit`, which quits the application, so every window answers it. On macOS `cmd-w` is bound to `gpui_kit::base::actions::CloseWindow`, which closes the active window the way `File › Close` does (Windows and Linux close a window with `alt-f4`). Both live in `gpui-base`: they are window behavior, not styling. To ask before quitting or closing, bind the same shortcut to your own action; a binding added later wins:
-
-```rust
-cx.bind_keys([KeyBinding::new("cmd-q", ConfirmQuit, None)]);
-```
+Applications define their own quit and close-window actions and key bindings. `gpui_kit::init` does not install them. Handle unsaved changes and any confirmation in the application before closing a window or quitting.
 
 ## Overlays
 
-Dialogs, sheets and notifications render on layers that `Root` places above the view, so a view that never mentions them still shows them. An application that wants a layer somewhere else in its tree — under its own title bar, say, or below a HUD that must stay on top — renders that layer itself and `Root` leaves it out:
+`Root` always mounts the dialog, sheet and notification layers above application content. Applications only call `window.open_dialog`, `window.open_sheet` or `window.push_notification`; no manual mounting or configuration is needed. Child view caching does not affect overlay rendering.
 
-- [Root::render_dialog_layer](https://docs.rs/gpui-component/latest/gpui_component/struct.Root.html#method.render_dialog_layer) - the open dialogs.
-- [Root::render_sheet_layer](https://docs.rs/gpui-component/latest/gpui_component/struct.Root.html#method.render_sheet_layer) - the open sheet.
-- [Root::render_notification_layer](https://docs.rs/gpui-component/latest/gpui_component/struct.Root.html#method.render_notification_layer) - the notification list.
+### Migrating to 0.7.0
 
-```rust
-impl Render for MyApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .child(self.content.clone())
-            // Placed here on purpose; Root will not add a second one.
-            .children(Root::render_dialog_layer(window, cx))
-            .child(self.hud.clone())
-    }
-}
-```
-
-Each returns `None` while it has nothing to show, which is why the example uses `children`.
+`Root::render_dialog_layer`, `Root::render_sheet_layer` and `Root::render_notification_layer` have been removed. Delete their calls and the corresponding `.children(...)` expressions from application views. Previously customized layer positions now use the window-level Root's overlay placement.
 
 [Root]: https://docs.rs/gpui-component/latest/gpui_component/root/struct.Root.html

@@ -1192,9 +1192,6 @@ impl Focusable for StoryRoot {
 
 impl Render for StoryRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sheet_layer = Root::render_sheet_layer(window, cx);
-        let dialog_layer = Root::render_dialog_layer(window, cx);
-        let notification_layer = Root::render_notification_layer(window, cx);
         let show_fps = AppState::global(cx).show_fps_monitor;
 
         div()
@@ -1215,14 +1212,9 @@ impl Render for StoryRoot {
                             .flex_1()
                             .overflow_hidden()
                             .child(self.view.clone()),
-                    )
-                    .children(sheet_layer)
-                    .children(dialog_layer)
-                    .children(notification_layer),
+                    ),
             )
             .relative()
-            // FPS must be the last sibling so notification/toast layers cannot
-            // paint over the HUD.
             .when(show_fps, |this| {
                 this.child(
                     div()

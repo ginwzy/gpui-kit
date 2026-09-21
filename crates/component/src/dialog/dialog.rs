@@ -785,10 +785,8 @@ pub(crate) mod tests {
     struct DialogHost;
 
     impl Render for DialogHost {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .size_full()
-                .children(Root::render_dialog_layer(window, cx))
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full()
         }
     }
 

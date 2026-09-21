@@ -1,0 +1,69 @@
+# Release Notes
+
+## Pending Updates
+
+### 0.7.0 (unreleased)
+
+#### Root owns window overlays
+
+`gpui_component::Root` now always mounts the dialog, sheet and notification
+layers above application content. Opening a dialog, sheet or notification no
+longer depends on the application's view rendering its layer. Notifications use
+the Root's full bounds, and cached content does not duplicate or suppress layers.
+
+#### Breaking changes
+
+The following `gpui-component` APIs have been removed:
+
+- `Root::render_dialog_layer`
+- `Root::render_sheet_layer`
+- `Root::render_notification_layer`
+
+Remove these calls from application render methods. There are no replacement
+layer switches or manual mounting APIs; Root renders all three layers itself.
+Existing custom layer positions move to Root's window-level overlay placement.
+
+```diff
+ div()
+     .size_full()
+     .child(self.content.clone())
+-    .children(Root::render_sheet_layer(window, cx))
+-    .children(Root::render_dialog_layer(window, cx))
+-    .children(Root::render_notification_layer(window, cx))
+```
+
+If a render method first stored these layers in local variables, remove those
+variables and the corresponding `.children(...)` calls as well.
+
+`window.open_dialog`, `window.open_sheet` and `window.push_notification` remain
+the application-facing APIs. Keep a `Root` as the window's root view, or use the
+new window helper below.
+
+#### Added: `gpui_kit::open_window`
+
+```rust
+pub fn open_window<V: Render>(
+    options: WindowOptions,
+    cx: &mut App,
+    build: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
+) -> Result<(AnyWindowHandle, Entity<V>)>
+```
+
+Opens a window and returns both the window handle and the content entity. With
+the `component` feature, the helper wraps the content in `component::Root`;
+without it, the content is the window root.
+
+```rust
+let (window, view) = gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+    cx.new(|cx| MyApp::new(window, cx))
+})?;
+```
+
+Call `gpui_kit::init(cx)` before opening component-backed windows. For a customized
+Root, use `cx.open_window` and construct `Root::new` yourself; do not return a
+Root from this helper's builder. In an async context, call the helper inside
+`cx.update`.
+
+Quit and close-window actions, keyboard shortcuts and confirmation flows remain
+application-owned. Kit initialization does not install default quit or close
+bindings.

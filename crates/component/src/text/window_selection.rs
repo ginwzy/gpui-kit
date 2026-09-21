@@ -2075,19 +2075,12 @@ mod tests {
     }
 
     impl Render for ModalScopeTestView {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let sheet_layer = Root::render_sheet_layer(window, cx);
-            let dialog_layer = Root::render_dialog_layer(window, cx);
-            div()
-                .track_focus(&self.focus_handle)
-                .size_full()
-                .child(
-                    div()
-                        .h(px(40.))
-                        .child(TextView::new(&self.base).selectable(true)),
-                )
-                .children(sheet_layer)
-                .children(dialog_layer)
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.focus_handle).size_full().child(
+                div()
+                    .h(px(40.))
+                    .child(TextView::new(&self.base).selectable(true)),
+            )
         }
     }
 

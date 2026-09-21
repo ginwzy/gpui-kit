@@ -62,35 +62,16 @@ let (window, editor) = gpui_kit::open_window(WindowOptions::default(), cx, |wind
 })?;
 ```
 
-## 默认快捷键
+## 关闭窗口与退出应用
 
-`gpui_kit::init` 把平台的退出快捷键——macOS 上 `cmd-q`，Windows 与 Linux 上 `alt-f4`——绑定到 `gpui_kit::base::actions::Quit` 退出应用，所以每个窗口都响应它。macOS 上 `cmd-w` 绑定到 `gpui_kit::base::actions::CloseWindow`，像 `File › Close` 一样关闭当前窗口（Windows 与 Linux 用 `alt-f4` 关窗口）。两者都在 `gpui-base`：它们是窗口行为，不是样式。想在退出或关闭前确认，把同一快捷键绑到你自己的 action 上即可，后绑定的优先：
-
-```rust
-cx.bind_keys([KeyBinding::new("cmd-q", ConfirmQuit, None)]);
-```
+应用自行定义退出和关闭窗口的 action 及快捷键，`gpui_kit::init` 不会安装这些绑定。应用应在关闭窗口或退出之前处理未保存的内容及确认流程。
 
 ## 浮层
 
-对话框、抽屉和通知渲染在 `Root` 放在视图之上的图层里，所以一个完全不提及它们的视图也能显示它们。应用想把某一层放在自己树里的别处——比如放在自己的标题栏之下，或放在一个必须压在最上面的 HUD 之下——就自己渲染那一层，`Root` 会跳过它：
+`Root` 统一挂载对话框、抽屉和通知层，始终渲染在应用内容之上。应用只需调用 `window.open_dialog`、`window.open_sheet` 或 `window.push_notification`，不需要手动挂载或配置开关。子视图是否缓存不影响浮层渲染。
 
-- [Root::render_dialog_layer](https://docs.rs/gpui-component/latest/gpui_component/struct.Root.html#method.render_dialog_layer) - 打开的对话框
-- [Root::render_sheet_layer](https://docs.rs/gpui-component/latest/gpui_component/struct.Root.html#method.render_sheet_layer) - 打开的抽屉
-- [Root::render_notification_layer](https://docs.rs/gpui-component/latest/gpui_component/struct.Root.html#method.render_notification_layer) - 通知列表
+### 迁移到 0.7.0
 
-```rust
-impl Render for MyApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .child(self.content.clone())
-            // 有意放在这里；Root 不会再加第二份。
-            .children(Root::render_dialog_layer(window, cx))
-            .child(self.hud.clone())
-    }
-}
-```
-
-没有内容可显示时它们返回 `None`，所以示例用的是 `children`。
+`Root::render_dialog_layer`、`Root::render_sheet_layer` 和 `Root::render_notification_layer` 已删除。删除视图中对应的调用及 `.children(...)` 即可。此前自定义的层位置统一改为窗口级 Root 的浮层位置。
 
 [Root]: https://docs.rs/gpui-component/latest/gpui_component/root/struct.Root.html

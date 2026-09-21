@@ -11,9 +11,12 @@ use gpui_kit::component::{
     table::{Column, ColumnSort, DataTable, TableDelegate, TableState},
     v_flex,
 };
-use gpui_kit::{prelude::FluentBuilder as _, *};
+use gpui_kit::{actions, prelude::FluentBuilder as _, *};
 use smol::Timer;
 use sysinfo::{Disks, Pid, System};
+
+// Define the Quit action
+actions!(system_monitor, [Quit]);
 
 const INTERVAL: Duration = Duration::from_millis(500);
 const MAX_DATA_POINTS: usize = 120;
@@ -601,7 +604,17 @@ fn main() {
     app.run(move |cx| {
         gpui_kit::init(cx);
 
-        // `gpui_kit::init` bound the platform's quit shortcut already.
+        cx.bind_keys([
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-q", Quit, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("alt-f4", Quit, None),
+        ]);
+
+        // Handle the Quit action
+        cx.on_action(|_: &Quit, cx: &mut App| {
+            cx.quit();
+        });
 
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(680.), px(600.)), cx)),
