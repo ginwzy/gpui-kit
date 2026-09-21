@@ -132,18 +132,15 @@ fn main() {
         // 使用任何 GPUI Component 功能之前必须先调用此函数。
         gpui_kit::init(cx);
 
-        cx.spawn(async move |cx| {
-            cx.open_window(WindowOptions::default(), |window, cx| {
-                let view = cx.new(|_| HelloWorld);
-                // 窗口的第一层应该是一个 Root。
-                cx.new(|cx| Root::new(view, window, cx))
-            })
-            .expect("Failed to open window");
+        gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
+            cx.new(|_| HelloWorld)
         })
-        .detach();
+        .expect("Failed to open window");
     });
 }
 ```
+
+`gpui_kit::open_window` 重导出 `gpui_base::open_window`，始终挂载 Base `Root`。Component 初始化时注册窗口展示与浮层扩展。仅使用 Base 的示例直接调用 `gpui_base::init` 和 `gpui_base::open_window`，无需依赖 Kit。
 
 ### 图标
 

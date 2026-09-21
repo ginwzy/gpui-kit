@@ -1,7 +1,7 @@
 use crate::{
-    ActiveTheme, ElementExt, Placement, StyledExt,
+    ActiveTheme, ElementExt, Placement,
     dialog::{ANIMATION_DURATION, Dialog},
-    input::{AnyInputState, Copy},
+    input::AnyInputState,
     native_menu::FallbackMenuOverlay,
     notification::{Notification, NotificationList},
     sheet::Sheet,
@@ -10,35 +10,19 @@ use crate::{
     window_border,
 };
 use gpui::{
-    AnyView, App, AppContext, ClipboardItem, Context, DefiniteLength, ElementId, Entity,
-    FocusHandle, InteractiveElement, IntoElement, KeyBinding, ParentElement as _, Pixels, Render,
-    RenderOnce, StyleRefinement, Styled, WeakFocusHandle, Window, actions, div,
+    App, AppContext, Context, DefiniteLength, ElementId, Entity, FocusHandle, InteractiveElement,
+    IntoElement, ParentElement as _, Render, RenderOnce, Styled, WeakFocusHandle, Window, div,
     prelude::FluentBuilder as _,
 };
-use gpui_base::{TextSelection, TextSelectionLayer, TextSelectionScopeId};
+use gpui_base::{TextSelection, TextSelectionScopeId};
 use std::{any::TypeId, rc::Rc};
 
-actions!(root, [Tab, TabPrev]);
-
-const CONTEXT: &str = "Root";
 pub(crate) fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("tab", Tab, Some(CONTEXT)),
-        KeyBinding::new("shift-tab", TabPrev, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-c", Copy, Some(CONTEXT)),
-    ]);
+    gpui_base::Root::register_extension::<WindowState>(cx, WindowState::new);
 }
 
-/// Root is a view for the App window for as the top level view (Must be the first view in the window).
-///
-/// It holds the window's sheet, dialogs and notifications and renders them
-/// above the view it wraps. `gpui_kit::open_window` creates it for you.
-pub struct Root {
-    style: StyleRefinement,
-    view: AnyView,
+/// Component-owned window state and presentation; Base owns the actual root.
+pub(crate) struct WindowState {
     pub(crate) active_sheet: Option<ActiveSheet>,
     pub(crate) active_dialogs: Vec<ActiveDialog>,
     pub(super) focused_input: Option<AnyInputState>,
@@ -47,13 +31,7 @@ pub struct Root {
     pub(crate) native_menu_overlay: Entity<FallbackMenuOverlay>,
     touch_selection_overlay: Entity<WindowTouchSelectionOverlay>,
     sheet_size: Option<DefiniteLength>,
-    window_shadow_size: Pixels,
-    /// Render the Linux CSD `window_border` wrapper.
-    bordered: bool,
-    /// The focus handle that will be restored after a dialog is closed with animation.
-    /// Used to handle rapid dialog opening/closing to maintain correct focus chain.
     pending_focus_restore: Option<WeakFocusHandle>,
-    window_id: gpui::WindowId,
 }
 
 #[derive(Clone)]
@@ -91,21 +69,9 @@ impl ActiveDialog {
     }
 }
 
-impl Root {
-    /// Clears window-owned text selection synchronously.
-    #[deprecated(note = "use gpui_base::TextSelection::clear instead")]
-    pub fn clear_text_selection(&mut self, cx: &mut Context<Self>) {
-        gpui_base::TextSelection::clear_for_window(self.window_id, cx);
-    }
-
-    /// Create a new Root view.
-    pub fn new(view: impl Into<AnyView>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        #[cfg(all(target_os = "macos", not(test)))]
-        gpui_base::install_window_hit_test_forwarder(window);
-
+impl WindowState {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
-            style: StyleRefinement::default(),
-            view: view.into(),
             active_sheet: None,
             active_dialogs: Vec::new(),
             focused_input: None,
@@ -115,11 +81,15 @@ impl Root {
             native_menu_overlay: cx.new(|_| FallbackMenuOverlay::new()),
             touch_selection_overlay: cx.new(|cx| WindowTouchSelectionOverlay::new(window, cx)),
             sheet_size: None,
-            window_shadow_size: window_border::SHADOW_SIZE,
-            bordered: true,
             pending_focus_restore: None,
-            window_id: window.window_handle().window_id(),
         }
+    }
+
+    fn entity(window: &Window, cx: &App) -> Option<Entity<Self>> {
+        window
+            .root::<gpui_base::Root>()??
+            .read(cx)
+            .extension::<Self>()
     }
 
     fn allocate_text_selection_scope(&mut self) -> TextSelectionScopeId {
@@ -138,28 +108,11 @@ impl Root {
             .unwrap_or_default()
     }
 
-    /// Enable or disable the Linux client-side window border wrapper.
-    ///
-    /// Defaults to `true`. Use `bordered(false)` for layer-shell fullscreen windows
-    /// or other surfaces that should not render GPUI Component's window border.
-    pub fn bordered(mut self, bordered: bool) -> Self {
-        self.bordered = bordered;
-        self
-    }
-
-    /// Set the window border shadow size for Linux client-side decorations.
-    ///
-    /// Default: [`window_border::SHADOW_SIZE`]
-    pub fn window_shadow_size(mut self, size: impl Into<Pixels>) -> Self {
-        self.window_shadow_size = size.into();
-        self
-    }
-
     pub fn update<F, R>(window: &mut Window, cx: &mut App, f: F) -> R
     where
         F: FnOnce(&mut Self, &mut Window, &mut Context<Self>) -> R,
     {
-        let root = window.root::<Root>().flatten().expect(ROOT_MISSING);
+        let root = Self::entity(window, cx).expect(ROOT_MISSING);
 
         root.update(cx, |root, cx| f(root, window, cx))
     }
@@ -168,19 +121,18 @@ impl Root {
     where
         F: FnOnce(&mut Self, &mut Window, &mut Context<Self>) -> R,
     {
-        let root = window.root::<Root>().flatten()?;
+        let root = Self::entity(window, cx)?;
         Some(root.update(cx, |root, cx| f(root, window, cx)))
     }
 
     pub fn read<'a>(window: &'a Window, cx: &'a App) -> &'a Self {
-        &window
-            .root::<Root>()
-            .flatten()
-            .expect(ROOT_MISSING)
-            .read(cx)
+        Self::entity(window, cx).expect(ROOT_MISSING).read(cx)
     }
 
-    fn notification_layer(root: &Entity<Root>, cx: &App) -> Option<impl IntoElement + use<>> {
+    fn notification_layer(
+        root: &Entity<WindowState>,
+        cx: &App,
+    ) -> Option<impl IntoElement + use<>> {
         let active_sheet_placement = root.read(cx).active_sheet.clone().map(|d| d.placement);
 
         let sheet_size = root.read(cx).sheet_size;
@@ -205,7 +157,7 @@ impl Root {
     }
 
     fn sheet_layer(
-        root: Entity<Root>,
+        root: Entity<WindowState>,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<impl IntoElement + use<>> {
@@ -230,7 +182,7 @@ impl Root {
     }
 
     fn dialog_layer(
-        root: &Entity<Root>,
+        root: &Entity<WindowState>,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<impl IntoElement + use<>> {
@@ -253,7 +205,7 @@ impl Root {
                 // Give the dialog the focus handle, because `dialog` is a temporary value, is not possible to
                 // keep the focus handle in the dialog.
                 //
-                // So we keep the focus handle in the `active_dialog`, this is owned by the `Root`.
+                // So we keep the focus handle in the `active_dialog`, this is owned by the `WindowState`.
                 dialog.focus_handle = active_dialog.focus_handle.clone();
                 dialog.selection_scope = active_dialog.selection_scope;
 
@@ -283,8 +235,12 @@ impl Root {
         )
     }
 
-    pub fn open_dialog<F>(&mut self, build: F, window: &mut Window, cx: &mut Context<'_, Root>)
-    where
+    pub fn open_dialog<F>(
+        &mut self,
+        build: F,
+        window: &mut Window,
+        cx: &mut Context<'_, WindowState>,
+    ) where
         F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
     {
         let mut previous_focused_handle = window.focused(cx).map(|h| h.downgrade());
@@ -319,7 +275,7 @@ impl Root {
             .and_then(|h| h.upgrade())
     }
 
-    pub fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+    pub fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<'_, WindowState>) {
         if let Some(handle) = self.close_dialog_internal() {
             window.focus(&handle, cx);
         }
@@ -327,7 +283,11 @@ impl Root {
         cx.notify();
     }
 
-    pub(crate) fn defer_close_dialog(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+    pub(crate) fn defer_close_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, WindowState>,
+    ) {
         if let Some(handle) = self.close_dialog_internal() {
             let dialogs_count = self.active_dialogs.len();
 
@@ -351,7 +311,7 @@ impl Root {
         cx.notify();
     }
 
-    pub fn close_all_dialogs(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+    pub fn close_all_dialogs(&mut self, window: &mut Window, cx: &mut Context<'_, WindowState>) {
         self.focused_input = None;
         let previous_focused_handle = self
             .active_dialogs
@@ -370,7 +330,7 @@ impl Root {
         placement: Placement,
         build: F,
         window: &mut Window,
-        cx: &mut Context<'_, Root>,
+        cx: &mut Context<'_, WindowState>,
     ) where
         F: Fn(Sheet, &mut Window, &mut App) -> Sheet + 'static,
     {
@@ -396,7 +356,7 @@ impl Root {
         cx.notify();
     }
 
-    pub fn close_sheet(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+    pub fn close_sheet(&mut self, window: &mut Window, cx: &mut Context<'_, WindowState>) {
         self.focused_input = None;
         if let Some(previous_handle) = self
             .active_sheet
@@ -415,7 +375,7 @@ impl Root {
         &mut self,
         note: impl Into<Notification>,
         window: &mut Window,
-        cx: &mut Context<'_, Root>,
+        cx: &mut Context<'_, WindowState>,
     ) {
         self.notification
             .update(cx, |view, cx| view.push(note, window, cx));
@@ -427,7 +387,7 @@ impl Root {
     pub fn remove_notification<T: Sized + 'static>(
         &mut self,
         window: &mut Window,
-        cx: &mut Context<'_, Root>,
+        cx: &mut Context<'_, WindowState>,
     ) {
         self.notification.update(cx, |view, cx| {
             view.close_by_type(TypeId::of::<T>(), window, cx);
@@ -440,7 +400,7 @@ impl Root {
         &mut self,
         key: impl Into<ElementId>,
         window: &mut Window,
-        cx: &mut Context<'_, Root>,
+        cx: &mut Context<'_, WindowState>,
     ) {
         let key = key.into();
         self.notification.update(cx, |view, cx| {
@@ -449,7 +409,7 @@ impl Root {
         cx.notify();
     }
 
-    pub fn clear_notifications(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
+    pub fn clear_notifications(&mut self, window: &mut Window, cx: &mut Context<'_, WindowState>) {
         self.notification
             .update(cx, |view, cx| view.clear(window, cx));
         cx.notify();
@@ -460,7 +420,7 @@ impl Root {
         window: &Window,
         cx: &App,
     ) -> Option<Entity<gpui_base::TooltipOverlay>> {
-        let root = window.root::<Root>()??;
+        let root = Self::entity(window, cx)?;
         Some(root.read(cx).tooltip_overlay.clone())
     }
 
@@ -469,197 +429,76 @@ impl Root {
         window: &Window,
         cx: &App,
     ) -> Option<Entity<FallbackMenuOverlay>> {
-        let root = window.root::<Root>()??;
+        let root = Self::entity(window, cx)?;
         Some(root.read(cx).native_menu_overlay.clone())
     }
-
-    /// Return the root view of the Root.
-    pub fn view(&self) -> &AnyView {
-        &self.view
-    }
-
-    fn on_action_tab(&mut self, _: &Tab, window: &mut Window, cx: &mut Context<Self>) {
-        // Check if we're inside a focus trap
-        if let Some(container_focus_handle) = gpui_base::active_focus_trap(window, cx) {
-            // We're in a focus trap - try to focus next, then check if we're still inside
-            let before_focus = window.focused(cx);
-
-            // Try normal focus navigation
-            window.focus_next(cx);
-
-            // Check if we're still in the trap
-            if !container_focus_handle.contains_focused(window, cx) {
-                // We jumped out of the trap - need to cycle back to the beginning
-                // Find the first focusable element in the trap by continuing to focus_next
-                let mut attempts = 0;
-                const MAX_ATTEMPTS: usize = 100; // Prevent infinite loop
-
-                while !container_focus_handle.contains_focused(window, cx)
-                    && attempts < MAX_ATTEMPTS
-                {
-                    window.focus_next(cx);
-                    attempts += 1;
-
-                    // If we cycled back to where we started, restore original focus
-                    if window.focused(cx) == before_focus {
-                        break;
-                    }
-                }
-            }
-            return;
-        }
-
-        // Normal tab navigation
-        window.focus_next(cx);
-    }
-
-    fn on_action_tab_prev(&mut self, _: &TabPrev, window: &mut Window, cx: &mut Context<Self>) {
-        // Check if we're inside a focus trap
-        if let Some(container_focus_handle) = gpui_base::active_focus_trap(window, cx) {
-            // We're in a focus trap - try to focus previous, then check if we're still inside
-            let before_focus = window.focused(cx);
-
-            // Try normal focus navigation
-            window.focus_prev(cx);
-
-            // Check if we're still in the trap
-            if !container_focus_handle.contains_focused(window, cx) {
-                // We jumped out of the trap - need to cycle back to the end
-                // Find the last focusable element in the trap by continuing to focus_prev
-                let mut attempts = 0;
-                const MAX_ATTEMPTS: usize = 100; // Prevent infinite loop
-
-                while !container_focus_handle.contains_focused(window, cx)
-                    && attempts < MAX_ATTEMPTS
-                {
-                    window.focus_prev(cx);
-                    attempts += 1;
-
-                    // If we cycled back to where we started, restore original focus
-                    if window.focused(cx) == before_focus {
-                        break;
-                    }
-                }
-            }
-            return;
-        }
-
-        // Normal tab navigation
-        window.focus_prev(cx);
-    }
-
-    fn on_action_copy(&mut self, _: &Copy, window: &mut Window, cx: &mut Context<Self>) {
-        let text = gpui_base::TextSelection::selected_text(window, cx)
-            .trim()
-            .to_string();
-        if text.is_empty() {
-            cx.propagate();
-            return;
-        }
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-    }
 }
 
-impl Styled for Root {
-    fn style(&mut self) -> &mut StyleRefinement {
-        &mut self.style
-    }
-}
-
-impl Render for Root {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl gpui_base::RootExtension for WindowState {
+    fn prepare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.set_rem_size(cx.theme().font_size);
-        let active_scope = self.active_text_selection_scope();
-        TextSelection::activate_scope(active_scope, window, cx);
+        TextSelection::activate_scope(self.active_text_selection_scope(), window, cx);
+    }
 
-        let inner = div()
-            .id("root")
-            .key_context(CONTEXT)
-            .on_action(cx.listener(Self::on_action_tab))
-            .on_action(cx.listener(Self::on_action_tab_prev))
-            .on_action(cx.listener(Self::on_action_copy))
-            .relative()
-            .size_full()
-            .font_family(cx.theme().font_family.clone())
-            .bg(cx.theme().tokens.background)
-            .text_color(cx.theme().foreground)
-            .refine_style(&self.style)
-            .child(TextSelectionLayer)
-            .child(self.view.clone())
-            .child(RootLayers { root: cx.entity() })
-            .child(self.touch_selection_overlay.clone())
-            .child(self.tooltip_overlay.clone())
-            .child(self.native_menu_overlay.clone());
+    fn style(&self, content: &mut gpui::Stateful<gpui::Div>, _window: &mut Window, cx: &mut App) {
+        use gpui::Refineable as _;
+        content.style().refine(
+            &gpui::StyleRefinement::default()
+                .font_family(cx.theme().font_family.clone())
+                .bg(cx.theme().tokens.background)
+                .text_color(cx.theme().foreground),
+        );
+    }
 
-        if self.bordered {
+    fn decorate(
+        &self,
+        content: gpui::AnyElement,
+        root: &gpui_base::Root,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> gpui::AnyElement {
+        if root.is_bordered() {
             window_border()
-                .shadow_size(self.window_shadow_size)
-                .child(inner)
+                .shadow_size(root.shadow_size())
+                .child(content)
                 .into_any_element()
         } else {
-            inner.into_any_element()
+            content
         }
     }
 }
 
-/// What to tell a caller whose window root is not a [`Root`].
-const ROOT_MISSING: &str = "this window's root view is not a gpui_kit::component::Root, so it has \
-nowhere to keep dialogs, sheets and notifications. Open the window with \
-`gpui_kit::open_window`, or wrap your view: `cx.new(|cx| Root::new(view, window, cx))`.";
+impl Render for WindowState {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .absolute()
+            .inset_0()
+            .child(WindowStateLayers { root: cx.entity() })
+            .child(self.touch_selection_overlay.clone())
+            .child(self.tooltip_overlay.clone())
+            .child(self.native_menu_overlay.clone())
+    }
+}
+
+const ROOT_MISSING: &str =
+    "component window state is missing; call gpui_component::init before gpui_base::open_window";
 
 /// Window-level layers, always mounted once after the application content.
 /// Child view caching does not affect their ownership or rendering.
 #[derive(IntoElement)]
-struct RootLayers {
-    root: Entity<Root>,
+struct WindowStateLayers {
+    root: Entity<WindowState>,
 }
 
-impl RenderOnce for RootLayers {
+impl RenderOnce for WindowStateLayers {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let root = self.root;
         div()
             .absolute()
             .inset_0()
             .debug_selector(|| "root-layers".to_string())
-            .children(Root::sheet_layer(root.clone(), window, cx))
-            .children(Root::dialog_layer(&root, window, cx))
-            .children(Root::notification_layer(&root, cx))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use gpui::TestAppContext;
-
-    struct TestView;
-
-    impl Render for TestView {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-        }
-    }
-
-    #[gpui::test]
-    fn bordered_builder_toggles_window_border(cx: &mut TestAppContext) {
-        cx.update(crate::init);
-
-        let (default_root, _) = cx.add_window_view(|window, cx| {
-            let view = cx.new(|_| TestView);
-            Root::new(view, window, cx)
-        });
-        assert!(default_root.read_with(cx, |root, _| root.bordered));
-
-        let (root, _) = cx.add_window_view(|window, cx| {
-            let view = cx.new(|_| TestView);
-            Root::new(view, window, cx).bordered(false)
-        });
-        assert!(!root.read_with(cx, |root, _| root.bordered));
-
-        let (root, _) = cx.add_window_view(|window, cx| {
-            let view = cx.new(|_| TestView);
-            Root::new(view, window, cx).bordered(false).bordered(true)
-        });
-        assert!(root.read_with(cx, |root, _| root.bordered));
+            .children(WindowState::sheet_layer(root.clone(), window, cx))
+            .children(WindowState::dialog_layer(&root, window, cx))
+            .children(WindowState::notification_layer(&root, cx))
     }
 }

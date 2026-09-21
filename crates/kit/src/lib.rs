@@ -111,7 +111,6 @@ pub use gpui_base::is_mobile;
 ///
 /// ```no_run
 /// use gpui_kit::component::button::*;
-/// use gpui_kit::component::Root;
 /// use gpui_kit::*;
 ///
 /// struct Hello;
@@ -133,65 +132,10 @@ pub use gpui_base::is_mobile;
 #[cfg(feature = "component")]
 pub use ::gpui_component as component;
 
-/// Opens a window ready for GPUI Kit, with the view `build` returns as its
-/// content.
-///
-/// This is `cx.open_window` with the one thing every GPUI Kit window needs
-/// already done. With the `component` feature the window's root view is a
-/// [`component::Root`] wrapping the view, so dialogs, sheets, notifications,
-/// tooltips and menus work in it straight away; without it the view is the
-/// root. Applications own their quit and close-window actions and key bindings,
-/// including any confirmation before closing.
-///
-/// ```ignore
-/// gpui_kit::application().run(|cx| {
-///     gpui_kit::init(cx);
-///     gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| MyApp))
-///         .expect("failed to open window");
-/// });
-/// ```
-///
-/// It returns the window and the view, so a caller that keeps a handle to
-/// its view can build the view inside the window — where `InputState` and
-/// other window-bound state must be created — and still keep it:
-///
-/// ```ignore
-/// let (window, editor) = gpui_kit::open_window(options, cx, |window, cx| {
-///     cx.new(|cx| Editor::new(window, cx))
-/// })?;
-/// ```
-///
-/// From an async context, call it inside `cx.update`. When the window needs a
-/// customized `Root`, use `cx.open_window` and wrap the view with `Root::new`
-/// yourself — `bordered(false)` for a layer-shell surface, say. Do not return
-/// a `Root` from this helper's builder: it would be wrapped in another `Root`.
-pub fn open_window<V: Render>(
-    options: WindowOptions,
-    cx: &mut App,
-    build: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
-) -> Result<(AnyWindowHandle, Entity<V>)> {
-    let mut built = None;
-    #[cfg(feature = "component")]
-    let window = cx
-        .open_window(options, |window, cx| {
-            let view = build(window, cx);
-            built = Some(view.clone());
-            cx.new(|cx| component::Root::new(view, window, cx))
-        })?
-        .into();
-    #[cfg(not(feature = "component"))]
-    let window = cx
-        .open_window(options, |window, cx| {
-            let view = build(window, cx);
-            built = Some(view.clone());
-            view
-        })?
-        .into();
-    let view = built.expect("open_window ran its build closure");
-    Ok((window, view))
-}
 #[cfg(feature = "assets")]
 pub use ::gpui_kit_assets as assets;
+/// Window startup always uses the Base Root, independently of Cargo features.
+pub use gpui_base::open_window;
 
 // Mobile applications provide their platform with `Application::with_platform`.
 #[cfg(not(any(target_os = "ios", target_os = "android")))]

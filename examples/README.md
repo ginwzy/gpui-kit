@@ -24,7 +24,7 @@ Shared sample documents live in `fixtures/`.
 ## Opening windows
 
 Examples use `gpui_kit::open_window(options, cx, build)` after
-`gpui_kit::init(cx)`. The helper mounts the component Root and returns the window
+`gpui_kit::init(cx)`. The helper mounts the Base Root and returns the window
 handle and content entity. The native and web story galleries share this path.
 
 `root_borderless` deliberately uses `cx.open_window` and `Root::new` because its

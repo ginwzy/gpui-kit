@@ -97,6 +97,7 @@ pub mod tree;
 pub use crate::Disableable;
 pub use element_ext::*;
 pub use global_state::GlobalState;
+pub use gpui_base::Root;
 pub use gpui_base::animation;
 pub(crate) use gpui_base::measurement_enabled as measure_enable;
 #[doc(hidden)]
@@ -115,7 +116,6 @@ pub use index_path::IndexPath;
 pub use input::{Rope, RopeExt, RopeLines};
 #[cfg(any(feature = "inspector", debug_assertions))]
 pub use inspector::*;
-pub use root::Root;
 pub use styled::*;
 pub use theme::*;
 pub use time::{calendar, date_picker};

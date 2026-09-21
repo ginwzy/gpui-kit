@@ -39,7 +39,7 @@ variables and the corresponding `.children(...)` calls as well.
 the application-facing APIs. Keep a `Root` as the window's root view, or use the
 new window helper below.
 
-#### Added: `gpui_kit::open_window`
+#### Added: `gpui_base::Root` and `gpui_base::open_window`
 
 ```rust
 pub fn open_window<V: Render>(
@@ -49,9 +49,19 @@ pub fn open_window<V: Render>(
 ) -> Result<(AnyWindowHandle, Entity<V>)>
 ```
 
-Opens a window and returns both the window handle and the content entity. With
-the `component` feature, the helper wraps the content in `component::Root`;
-without it, the content is the window root.
+Opens a window and returns both the window handle and the content entity. The
+helper always wraps content in `gpui_base::Root`, independent of Cargo features.
+`gpui_kit::open_window` directly re-exports this function, and `component::Root`
+re-exports the Base type.
+
+Base owns the root, content, overlay hosting, keyboard traversal and selection
+copying. Explicit `gpui_component::init` registers a per-window extension for
+styled dialogs, sheets, notifications, tooltips, menus, touch selection and
+window presentation. Base does not depend on Component or its theme. Extensions
+must be registered before creating windows; they do not retrofit existing roots.
+
+Component operations belong to `WindowExt`; the previous Component-specific
+Root methods and fields (including `notification`) are no longer exposed on Root.
 
 ```rust
 let (window, view) = gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -64,10 +74,12 @@ Root, use `cx.open_window` and construct `Root::new` yourself; do not return a
 Root from this helper's builder. In an async context, call the helper inside
 `cx.update`.
 
-Examples and the native/web story galleries use this helper for standard window
+Kit examples and the native/web story galleries use this helper for standard window
 startup. The borderless-root example keeps the lower-level constructor to
-configure `Root::bordered(false)`. Base-only examples disable Kit's default
-features. The previously standalone color-mixing source is now a workspace
+configure `Root::bordered(false)`. Base examples continue using `gpui_base::init`
+and `gpui_base::open_window`, without a dependency on Kit. The FPS example
+disables Kit's default features. The previously standalone color-mixing source
+is now a workspace
 package, runnable with `cargo run -p color_mix_oklab`.
 
 Quit and close-window actions, keyboard shortcuts and confirmation flows remain

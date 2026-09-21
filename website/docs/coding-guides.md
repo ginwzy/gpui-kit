@@ -105,14 +105,10 @@ Initialize GPUI Component once, before creating component-backed views, and put
 app.run(move |cx| {
     gpui_kit::init(cx);
 
-    cx.spawn(async move |cx| {
-        cx.open_window(WindowOptions::default(), |window, cx| {
-            let workspace = cx.new(|cx| Workspace::new(window, cx));
-            cx.new(|cx| Root::new(workspace, window, cx))
-        })
-        .expect("failed to open window");
+    gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+        cx.new(|cx| Workspace::new(window, cx))
     })
-    .detach();
+    .expect("failed to open window");
 });
 ```
 

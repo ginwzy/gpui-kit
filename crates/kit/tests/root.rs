@@ -170,3 +170,20 @@ fn cached_content_does_not_duplicate_automatic_layers(cx: &mut TestAppContext) {
         "the second frame must reuse the cached host"
     );
 }
+
+#[gpui_kit::test]
+fn base_startup_keeps_the_same_root_even_when_component_is_compiled(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::base::init);
+    let (window, content) = cx
+        .update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| PlainView))
+        })
+        .unwrap();
+    window
+        .downcast::<gpui_kit::base::Root>()
+        .unwrap()
+        .read_with(cx, |root, _| {
+            assert_eq!(root.view().entity_id(), content.entity_id());
+        })
+        .unwrap();
+}

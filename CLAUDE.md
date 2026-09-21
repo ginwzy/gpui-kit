@@ -125,37 +125,42 @@ implementing this architecture:
 
 ### Component Initialization
 
-**Critical requirement**: You must call `gpui_component::init(cx)` at your application's entry point before using any GPUI Component features.
+Call `gpui_kit::init(cx)` before opening windows that use styled components.
+It includes Base initialization and registers Component's window extension.
 
 ```rust
 fn main() {
-    let app = Application::new();
-    app.run(move |cx| {
-        // This must be called first
-        gpui_component::init(cx);
-
-        cx.spawn(async move |cx| {
-            cx.open_window(WindowOptions::default(), |window, cx| {
-                let view = cx.new(|_| MyView);
-                // The first level view in a window must be a Root
-                cx.new(|cx| Root::new(view, window, cx))
-            })
-            .expect("Failed to open window");
-        }).detach();
+    gpui_kit::application().run(|cx| {
+        gpui_kit::init(cx);
+        gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
+            cx.new(|_| MyView)
+        })
+        .expect("Failed to open window");
     });
 }
 ```
 
+Base-only examples call `gpui_base::init` and `gpui_base::open_window` directly;
+they must not depend on Kit or Component just to create a window.
+
 ### Root View System
 
-`Root` is the top-level view for a window and manages:
+`gpui_base::Root` is the top-level view for every window created by
+`gpui_base::open_window`. Kit re-exports this helper, and `component::Root`
+re-exports the Base type. Cargo features do not select a different root type.
 
-- Sheet (side panels)
-- Dialog (dialogs)
-- Notification (notifications)
-- Keyboard navigation (Tab/Shift-Tab)
+Base owns content and overlay hosting, keyboard navigation (Tab/Shift-Tab),
+and selection copying. Explicit Component initialization registers per-window
+state and presentation for dialogs, sheets, notifications, tooltips, menus,
+touch selection, themes and window chrome. Initialize before creating windows.
 
-The first view of every window must be a `Root`.
+The helper returns the window handle and application content entity. Its builder
+must return content, not another Root. Overlay layers mount automatically; do not
+call the removed `Root::render_*_layer` methods. In async contexts call the helper
+inside `cx.update`. Custom Root configuration still uses GPUI's lower-level
+window constructor and `Root::new` explicitly.
+
+Quit/close actions, keyboard shortcuts and confirmation flows belong to the application.
 
 ### Theme System
 

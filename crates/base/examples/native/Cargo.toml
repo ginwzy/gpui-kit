@@ -6,7 +6,6 @@ publish = false
 edition.workspace = true
 
 [dependencies]
-gpui-kit = { path = "../../../kit", default-features = false }
 gpui.workspace = true
 gpui-base = { path = "../.." }
 gpui_platform.workspace = true

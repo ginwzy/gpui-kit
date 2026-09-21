@@ -154,18 +154,15 @@ fn main() {
         // This must be called before using any GPUI Component features.
         gpui_kit::init(cx);
 
-        cx.spawn(async move |cx| {
-            cx.open_window(WindowOptions::default(), |window, cx| {
-                let view = cx.new(|_| HelloWorld);
-                // This first level on the window, should be a Root.
-                cx.new(|cx| Root::new(view, window, cx))
-            })
-            .expect("Failed to open window");
+        gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
+            cx.new(|_| HelloWorld)
         })
-        .detach();
+        .expect("Failed to open window");
     });
 }
 ```
+
+`gpui_kit::open_window` re-exports `gpui_base::open_window` and always mounts a Base `Root`. Component initialization registers the styled window facilities. Base-only examples use `gpui_base::init` and `gpui_base::open_window` without a Kit dependency.
 
 ### Icons
 

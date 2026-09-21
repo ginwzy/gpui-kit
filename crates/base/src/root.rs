@@ -1,0 +1,430 @@
+//! Window roots and presentation-layer extensions.
+use crate::input::Copy;
+use crate::{StyledExt, TextSelectionLayer};
+use gpui::{
+    AnyElement, AnyView, AnyWindowHandle, App, AppContext, ClipboardItem, Context, Div, Entity,
+    Global, InteractiveElement, IntoElement, KeyBinding, ParentElement, Pixels, Render, Stateful,
+    StyleRefinement, Styled, Window, WindowOptions, actions, div, px,
+};
+use std::{any::TypeId, rc::Rc};
+
+actions!(root, [Tab, TabPrev]);
+const CONTEXT: &str = "Root";
+
+pub(crate) fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("tab", Tab, Some(CONTEXT)),
+        KeyBinding::new("shift-tab", TabPrev, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-c", Copy, Some(CONTEXT)),
+    ]);
+}
+
+/// A presentation layer's retained, per-window facilities.
+///
+/// Register during explicit application initialization, before creating windows.
+/// The view renders above application content. Base owns the root regardless of
+/// which extensions are registered; Cargo features never select its type.
+///
+/// Extensions render in registration order, later ones above earlier ones.
+/// Notify their entity after changing state so the root also refreshes its
+/// preparation and surface styles. Preparation and styling must not notify.
+/// Factories are captured when a root is created, so registration affects only
+/// future windows.
+pub trait RootExtension: Render + Sized {
+    /// Update window settings before content and overlays render.
+    fn prepare(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    /// Apply default surface styles. Instance styles take precedence.
+    fn style(&self, _content: &mut Stateful<Div>, _window: &mut Window, _cx: &mut App) {}
+
+    /// Wrap the completed surface in optional presentation such as window chrome.
+    fn decorate(
+        &self,
+        content: AnyElement,
+        _root: &Root,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> AnyElement {
+        content
+    }
+}
+
+type ExtensionFactory = Rc<dyn Fn(&mut Window, &mut Context<Root>) -> Extension>;
+type Prepare = Rc<dyn Fn(&mut Window, &mut App)>;
+type SurfaceStyle = Rc<dyn Fn(&mut Stateful<Div>, &mut Window, &mut App)>;
+type Decorate = Rc<dyn Fn(AnyElement, &Root, &mut Window, &mut App) -> AnyElement>;
+#[derive(Default)]
+struct Extensions(Vec<(TypeId, ExtensionFactory)>);
+impl Global for Extensions {}
+struct Extension {
+    view: AnyView,
+    prepare: Prepare,
+    style: SurfaceStyle,
+    decorate: Decorate,
+}
+
+/// The window's content and overlay host, independent of any styled component library.
+pub struct Root {
+    view: AnyView,
+    style: StyleRefinement,
+    extensions: Vec<Extension>,
+    bordered: bool,
+    window_shadow_size: Pixels,
+    window_id: gpui::WindowId,
+}
+
+impl Root {
+    /// Register a presentation extension once per application. Re-registering its
+    /// type replaces the factory for future windows rather than mounting it twice.
+    pub fn register_extension<V: RootExtension>(
+        cx: &mut App,
+        build: fn(&mut Window, &mut Context<V>) -> V,
+    ) {
+        if !cx.has_global::<Extensions>() {
+            cx.set_global(Extensions::default());
+        }
+        let factory: ExtensionFactory = Rc::new(move |window, cx| {
+            let entity = cx.new(|cx| build(window, cx));
+            cx.observe(&entity, |_, _, cx| cx.notify()).detach();
+            let prepare = entity.clone();
+            let style = entity.clone();
+            let decorate = entity.clone();
+            Extension {
+                view: entity.into(),
+                prepare: Rc::new(move |window, cx| {
+                    prepare.update(cx, |state, cx| state.prepare(window, cx))
+                }),
+                style: Rc::new(move |content, window, cx| {
+                    style.update(cx, |state, cx| state.style(content, window, cx))
+                }),
+                decorate: Rc::new(move |content, root, window, cx| {
+                    decorate.update(cx, |state, cx| state.decorate(content, root, window, cx))
+                }),
+            }
+        });
+        let extensions = &mut cx.global_mut::<Extensions>().0;
+        if let Some(entry) = extensions
+            .iter_mut()
+            .find(|(id, _)| *id == TypeId::of::<V>())
+        {
+            entry.1 = factory;
+        } else {
+            extensions.push((TypeId::of::<V>(), factory));
+        }
+    }
+
+    pub fn new(view: impl Into<AnyView>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        #[cfg(all(target_os = "macos", not(test)))]
+        crate::install_window_hit_test_forwarder(window);
+        let factories = cx
+            .try_global::<Extensions>()
+            .map(|e| e.0.clone())
+            .unwrap_or_default();
+        Self {
+            view: view.into(),
+            style: StyleRefinement::default(),
+            extensions: factories
+                .into_iter()
+                .map(|(_, build)| build(window, cx))
+                .collect(),
+            bordered: true,
+            window_id: window.window_handle().window_id(),
+            window_shadow_size: if cfg!(target_os = "linux") {
+                px(20.)
+            } else {
+                px(0.)
+            },
+        }
+    }
+
+    /// Clears this window's text selection synchronously.
+    #[deprecated(note = "use gpui_base::TextSelection::clear instead")]
+    pub fn clear_text_selection(&mut self, cx: &mut Context<Self>) {
+        crate::TextSelection::clear_for_window(self.window_id, cx);
+    }
+
+    /// The original application content entity.
+    pub fn view(&self) -> &AnyView {
+        &self.view
+    }
+
+    /// Find a presentation extension owned by this window.
+    pub fn extension<V: RootExtension>(&self) -> Option<Entity<V>> {
+        self.extensions
+            .iter()
+            .find_map(|entry| entry.view.clone().downcast::<V>().ok())
+    }
+
+    /// Whether a presentation extension should draw client-side window chrome.
+    pub fn is_bordered(&self) -> bool {
+        self.bordered
+    }
+    /// Enable or disable client-side chrome supplied by a presentation extension.
+    pub fn bordered(mut self, bordered: bool) -> Self {
+        self.bordered = bordered;
+        self
+    }
+    /// Configure the physical shadow inset used by client-side window chrome.
+    pub fn window_shadow_size(mut self, size: impl Into<Pixels>) -> Self {
+        self.window_shadow_size = size.into();
+        self
+    }
+    /// The physical shadow inset for presentation extensions.
+    pub fn shadow_size(&self) -> Pixels {
+        self.window_shadow_size
+    }
+
+    pub fn read<'a>(window: &'a Window, cx: &'a App) -> &'a Self {
+        window
+            .root::<Self>()
+            .flatten()
+            .expect("window must be opened with gpui_base::open_window")
+            .read(cx)
+    }
+    pub fn update<R>(
+        window: &mut Window,
+        cx: &mut App,
+        f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) -> R,
+    ) -> R {
+        let root = window
+            .root::<Self>()
+            .flatten()
+            .expect("window must be opened with gpui_base::open_window");
+        root.update(cx, |root, cx| f(root, window, cx))
+    }
+    fn on_action_tab(&mut self, _: &Tab, window: &mut Window, cx: &mut Context<Self>) {
+        // Check if we're inside a focus trap
+        if let Some(container_focus_handle) = crate::active_focus_trap(window, cx) {
+            // We're in a focus trap - try to focus next, then check if we're still inside
+            let before_focus = window.focused(cx);
+
+            // Try normal focus navigation
+            window.focus_next(cx);
+
+            // Check if we're still in the trap
+            if !container_focus_handle.contains_focused(window, cx) {
+                // We jumped out of the trap - need to cycle back to the beginning
+                // Find the first focusable element in the trap by continuing to focus_next
+                let mut attempts = 0;
+                const MAX_ATTEMPTS: usize = 100; // Prevent infinite loop
+
+                while !container_focus_handle.contains_focused(window, cx)
+                    && attempts < MAX_ATTEMPTS
+                {
+                    window.focus_next(cx);
+                    attempts += 1;
+
+                    // If we cycled back to where we started, restore original focus
+                    if window.focused(cx) == before_focus {
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
+        // Normal tab navigation
+        window.focus_next(cx);
+    }
+
+    fn on_action_tab_prev(&mut self, _: &TabPrev, window: &mut Window, cx: &mut Context<Self>) {
+        // Check if we're inside a focus trap
+        if let Some(container_focus_handle) = crate::active_focus_trap(window, cx) {
+            // We're in a focus trap - try to focus previous, then check if we're still inside
+            let before_focus = window.focused(cx);
+
+            // Try normal focus navigation
+            window.focus_prev(cx);
+
+            // Check if we're still in the trap
+            if !container_focus_handle.contains_focused(window, cx) {
+                // We jumped out of the trap - need to cycle back to the end
+                // Find the last focusable element in the trap by continuing to focus_prev
+                let mut attempts = 0;
+                const MAX_ATTEMPTS: usize = 100; // Prevent infinite loop
+
+                while !container_focus_handle.contains_focused(window, cx)
+                    && attempts < MAX_ATTEMPTS
+                {
+                    window.focus_prev(cx);
+                    attempts += 1;
+
+                    // If we cycled back to where we started, restore original focus
+                    if window.focused(cx) == before_focus {
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
+        // Normal tab navigation
+        window.focus_prev(cx);
+    }
+
+    fn on_action_copy(&mut self, _: &Copy, window: &mut Window, cx: &mut Context<Self>) {
+        let text = crate::TextSelection::selected_text(window, cx)
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            cx.propagate();
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+}
+impl Styled for Root {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+impl Render for Root {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for extension in &self.extensions {
+            (extension.prepare)(window, cx);
+        }
+        let mut content = div()
+            .id("root")
+            .key_context(CONTEXT)
+            .on_action(cx.listener(Self::on_action_tab))
+            .on_action(cx.listener(Self::on_action_tab_prev))
+            .on_action(cx.listener(Self::on_action_copy))
+            .relative()
+            .size_full()
+            .child(TextSelectionLayer)
+            .child(self.view.clone())
+            .child(
+                div().absolute().inset_0().children(
+                    self.extensions
+                        .iter()
+                        .map(|extension| extension.view.clone()),
+                ),
+            );
+        for extension in &self.extensions {
+            (extension.style)(&mut content, window, cx);
+        }
+        let mut content = content.refine_style(&self.style).into_any_element();
+        for extension in &self.extensions {
+            content = (extension.decorate)(content, self, window, cx);
+        }
+        content
+    }
+}
+
+/// Open a window with a Base Root and return the window and application content.
+/// Applications own quit/close actions and confirmation flows.
+/// Initialize Base and any presentation extensions before calling this function.
+/// The builder returns application content, not another Root.
+///
+/// In an async context, call this inside `cx.update`. To configure window chrome
+/// or instance styling, use GPUI's `cx.open_window` with [`Root::new`] directly.
+///
+/// ```no_run
+/// use gpui::{App, AppContext, Context, IntoElement, Render, Window, WindowOptions, div};
+/// struct Content;
+/// impl Render for Content {
+///     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement { div() }
+/// }
+/// fn open(cx: &mut App) -> anyhow::Result<()> {
+///     gpui_base::init(cx);
+///     let (_window, _content) = gpui_base::open_window(
+///         WindowOptions::default(), cx, |_, cx| cx.new(|_| Content),
+///     )?;
+///     Ok(())
+/// }
+/// ```
+pub fn open_window<V: Render>(
+    options: WindowOptions,
+    cx: &mut App,
+    build: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
+) -> anyhow::Result<(AnyWindowHandle, Entity<V>)> {
+    let mut built = None;
+    let window = cx.open_window(options, |window, cx| {
+        let view = build(window, cx);
+        built = Some(view.clone());
+        cx.new(|cx| Root::new(view, window, cx))
+    })?;
+    Ok((
+        window.into(),
+        built.expect("open_window ran its build closure"),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    struct Content;
+    impl Render for Content {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+    struct Layer;
+    impl Render for Layer {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+    impl RootExtension for Layer {}
+    fn layer(_: &mut Window, _: &mut Context<Layer>) -> Layer {
+        Layer
+    }
+
+    #[gpui::test]
+    fn open_window_always_owns_content_in_a_base_root(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (window, content) = cx
+            .update(|cx| open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| Content)))
+            .unwrap();
+        let root = window.downcast::<Root>().expect("Base owns the root");
+        root.read_with(cx, |root, _| {
+            assert_eq!(root.view().entity_id(), content.entity_id());
+            assert!(root.extensions.is_empty());
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn extension_registration_is_idempotent_and_state_is_per_window(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init(cx);
+            Root::register_extension(cx, layer);
+            Root::register_extension(cx, layer);
+        });
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let (window, _) = cx
+                .update(|cx| open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| Content)))
+                .unwrap();
+            let id = window
+                .downcast::<Root>()
+                .unwrap()
+                .read_with(cx, |root, _| {
+                    assert_eq!(root.extensions.len(), 1);
+                    root.extension::<Layer>().unwrap().entity_id()
+                })
+                .unwrap();
+            ids.push(id);
+        }
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[gpui::test]
+    fn root_preserves_window_chrome_configuration(cx: &mut TestAppContext) {
+        let (root, _) = cx.add_window_view(|window, cx| {
+            let content = cx.new(|_| Content);
+            Root::new(content, window, cx)
+                .bordered(false)
+                .window_shadow_size(px(12.))
+        });
+        root.read_with(cx, |root, _| {
+            assert!(!root.is_bordered());
+            assert_eq!(root.shadow_size(), px(12.));
+        });
+    }
+}

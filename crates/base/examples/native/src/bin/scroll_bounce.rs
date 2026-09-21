@@ -138,14 +138,14 @@ impl Render for Example {
 
 fn main() {
     gpui_platform::application().run(|cx: &mut App| {
-        gpui_kit::init(cx);
+        gpui_base::init(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
         })
         .detach();
-        gpui_kit::open_window(
+        gpui_base::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(900.), px(650.)), cx)),
                 ..Default::default()

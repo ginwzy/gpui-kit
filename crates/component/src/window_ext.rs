@@ -1,5 +1,6 @@
+use crate::root::WindowState;
 use crate::{
-    Placement, Root,
+    Placement,
     dialog::{AlertDialog, Dialog},
     input::AnyInputState,
     notification::Notification,
@@ -120,19 +121,19 @@ impl WindowExt for Window {
     where
         F: Fn(Sheet, &mut Window, &mut App) -> Sheet + 'static,
     {
-        Root::update(self, cx, move |root, window, cx| {
+        WindowState::update(self, cx, move |root, window, cx| {
             root.open_sheet_at(placement, build, window, cx);
         })
     }
 
     #[inline]
     fn has_active_sheet(&mut self, cx: &mut App) -> bool {
-        Root::read(self, cx).active_sheet.is_some()
+        WindowState::read(self, cx).active_sheet.is_some()
     }
 
     #[inline]
     fn close_sheet(&mut self, cx: &mut App) {
-        Root::update(self, cx, |root, window, cx| {
+        WindowState::update(self, cx, |root, window, cx| {
             root.close_sheet(window, cx);
         })
     }
@@ -142,7 +143,7 @@ impl WindowExt for Window {
     where
         F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
     {
-        Root::update(self, cx, move |root, window, cx| {
+        WindowState::update(self, cx, move |root, window, cx| {
             root.open_dialog(build, window, cx);
         })
     }
@@ -159,19 +160,19 @@ impl WindowExt for Window {
 
     #[inline]
     fn has_active_dialog(&mut self, cx: &mut App) -> bool {
-        Root::read(self, cx).active_dialogs.len() > 0
+        !WindowState::read(self, cx).active_dialogs.is_empty()
     }
 
     #[inline]
     fn close_dialog(&mut self, cx: &mut App) {
-        Root::update(self, cx, |root, window, cx| {
+        WindowState::update(self, cx, |root, window, cx| {
             root.close_dialog(window, cx);
         })
     }
 
     #[inline]
     fn close_all_dialogs(&mut self, cx: &mut App) {
-        Root::update(self, cx, |root, window, cx| {
+        WindowState::update(self, cx, |root, window, cx| {
             root.close_all_dialogs(window, cx);
         })
     }
@@ -179,14 +180,14 @@ impl WindowExt for Window {
     #[inline]
     fn push_notification(&mut self, note: impl Into<Notification>, cx: &mut App) {
         let note = note.into();
-        Root::update(self, cx, |root, window, cx| {
+        WindowState::update(self, cx, |root, window, cx| {
             root.push_notification(note, window, cx);
         })
     }
 
     #[inline]
     fn remove_notification<T: Sized + 'static>(&mut self, cx: &mut App) {
-        Root::update(self, cx, |root, window, cx| {
+        WindowState::update(self, cx, |root, window, cx| {
             root.remove_notification::<T>(window, cx);
         })
     }
@@ -198,21 +199,26 @@ impl WindowExt for Window {
         cx: &mut App,
     ) {
         let key = key.into();
-        Root::update(self, cx, |root, window, cx| {
+        WindowState::update(self, cx, |root, window, cx| {
             root.remove_notification1::<T>(key, window, cx);
         })
     }
 
     #[inline]
     fn clear_notifications(&mut self, cx: &mut App) {
-        Root::update(self, cx, |root, window, cx| {
+        WindowState::update(self, cx, |root, window, cx| {
             root.clear_notifications(window, cx);
         })
     }
 
     #[inline]
     fn notifications(&mut self, cx: &mut App) -> Rc<Vec<Entity<Notification>>> {
-        Rc::new(Root::read(self, cx).notification.read(cx).notifications())
+        Rc::new(
+            WindowState::read(self, cx)
+                .notification
+                .read(cx)
+                .notifications(),
+        )
     }
 
     #[inline]
@@ -221,14 +227,14 @@ impl WindowExt for Window {
     }
 
     fn focused_input(&mut self, cx: &mut App) -> Option<AnyInputState> {
-        let state = Root::read(self, cx).focused_input.clone()?;
+        let state = WindowState::read(self, cx).focused_input.clone()?;
         if state.focus_handle(cx).is_focused(self) {
             return Some(state);
         }
 
         // An input removed from the tree while focused never re-renders to
         // unregister itself; drop the stale registration lazily.
-        Root::try_update(self, cx, |root, _, cx| {
+        WindowState::try_update(self, cx, |root, _, cx| {
             if root.focused_input.as_ref() == Some(&state) {
                 root.focused_input = None;
                 cx.notify();

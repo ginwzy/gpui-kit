@@ -2125,7 +2125,7 @@ mod tests {
         let state = cx.update(|_, cx| cx.new(|cx| TextViewState::markdown(text, cx)));
         let state_for_builder = state.clone();
         cx.update(|window, cx| {
-            Root::update(window, cx, |root, window, cx| {
+            crate::root::WindowState::update(window, cx, |root, window, cx| {
                 root.open_dialog(
                     move |dialog, _, _| {
                         dialog.child(TextView::new(&state_for_builder).selectable(true))
@@ -2146,7 +2146,7 @@ mod tests {
         let state = cx.update(|_, cx| cx.new(|cx| TextViewState::markdown(text, cx)));
         let state_for_builder = state.clone();
         cx.update(|window, cx| {
-            Root::update(window, cx, |root, window, cx| {
+            crate::root::WindowState::update(window, cx, |root, window, cx| {
                 root.open_sheet_at(
                     Placement::Right,
                     move |sheet, _, _| {

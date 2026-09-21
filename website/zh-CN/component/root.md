@@ -6,7 +6,9 @@ example: false
 
 # Root View
 
-[Root] 是 GPUI Kit 窗口的根视图。它持有窗口的对话框、抽屉和通知并把它们渲染在所包裹的视图之上，也承载 tooltip 与菜单。`gpui_kit::open_window` 会替你创建它；只有窗口需要定制 `Root` 时才会直接接触它。
+[Root] 是由 Base 提供的统一窗口根视图。`gpui_base::open_window` 始终创建这个类型；`gpui_kit::open_window` 直接重导出同一函数，`component::Root` 也重导出 Base 类型。
+
+Base 负责内容与浮层承载、键盘焦点遍历和文本选择复制。显式调用 `gpui_component::init` 会注册窗口展示扩展，提供对话框、抽屉、通知、tooltip、菜单、触屏选择、主题与窗口边框。必须在创建窗口前初始化。仅使用 Base 的应用调用 `gpui_base::init`，无需依赖 Component 或 Kit。Cargo feature 合并不会改变窗口根类型。
 
 下面这份完整的 **Tested consumer recipe** 在隔离的 `gpui-kit` 消费者工作区中编译。它先初始化 GPUI Kit，再打开一个以 `Root` 包裹应用视图为根的窗口。
 
@@ -74,4 +76,4 @@ let (window, editor) = gpui_kit::open_window(WindowOptions::default(), cx, |wind
 
 `Root::render_dialog_layer`、`Root::render_sheet_layer` 和 `Root::render_notification_layer` 已删除。删除视图中对应的调用及 `.children(...)` 即可。此前自定义的层位置统一改为窗口级 Root 的浮层位置。
 
-[Root]: https://docs.rs/gpui-component/latest/gpui_component/root/struct.Root.html
+[Root]: https://docs.rs/gpui-base/latest/gpui_base/struct.Root.html

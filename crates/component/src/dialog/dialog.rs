@@ -1,3 +1,4 @@
+use crate::root::WindowState;
 use gpui_base::TestSupportExt as _;
 use std::{rc::Rc, sync::LazyLock, time::Duration};
 
@@ -11,7 +12,7 @@ use gpui_base::{ElementExt as _, TextSelectionScopeId};
 use rust_i18n::t;
 
 use crate::{
-    ActiveTheme as _, IconName, Root, Sizable as _, StyledExt, TITLE_BAR_HEIGHT, WindowExt as _,
+    ActiveTheme as _, IconName, Sizable as _, StyledExt, TITLE_BAR_HEIGHT, WindowExt as _,
     animation::cubic_bezier,
     button::{Button, ButtonVariant, ButtonVariants as _},
     dialog::{DialogContent, DialogDispatchAnchor, DialogTitle},
@@ -497,7 +498,7 @@ impl Dialog {
     }
 
     fn defer_close_dialog(window: &mut Window, cx: &mut App) {
-        Root::update(window, cx, |root, window, cx| {
+        WindowState::update(window, cx, |root, window, cx| {
             root.defer_close_dialog(window, cx);
         });
     }
@@ -624,7 +625,8 @@ impl RenderOnce for Dialog {
                             .expect("Dialog base host is always present")
                             .layer(
                                 layer_ix,
-                                (self.layer_ix + 1) == Root::read(window, cx).active_dialogs.len(),
+                                (self.layer_ix + 1)
+                                    == WindowState::read(window, cx).active_dialogs.len(),
                             )
                             .focus_handle(self.focus_handle.clone())
                             .close_on_escape(self.props.keyboard)
@@ -802,7 +804,7 @@ pub(crate) mod tests {
         });
         let (_, cx) = cx.add_window_view(|window, cx| {
             let view = cx.new(|_| DialogHost);
-            Root::new(view, window, cx)
+            crate::Root::new(view, window, cx)
         });
         cx.simulate_resize(window_size);
         cx.update(|window, cx| window.draw(cx).clear(cx));

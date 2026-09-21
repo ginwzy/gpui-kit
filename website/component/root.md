@@ -6,7 +6,9 @@ example: false
 
 # Root View
 
-[Root] is the root view of a GPUI Kit window. It holds the window's dialogs, sheets and notifications and renders them above the view it wraps, and it hosts tooltips and menus. `gpui_kit::open_window` creates it for you; you only meet `Root` directly when a window needs a customized one.
+[Root] is the Base-owned root view of every GPUI Kit window. `gpui_base::open_window` always creates this type; `gpui_kit::open_window` re-exports the same function, and `component::Root` re-exports the Base type.
+
+Base owns the content and overlay host, keyboard traversal and selection copying. Calling `gpui_component::init` explicitly registers the styled window extension: dialogs, sheets, notifications, tooltips, menus, touch selection, theme and window chrome. Initialize it before creating windows. A Base-only application calls `gpui_base::init` and needs no Component or Kit dependency. Cargo feature unification does not change the root type.
 
 This complete **Tested consumer recipe** is compiled from the isolated `gpui-kit` consumer workspace. It initializes GPUI Kit, then opens a window whose root is a `Root` wrapping the application view.
 
@@ -77,4 +79,4 @@ Applications define their own quit and close-window actions and key bindings. `g
 
 `Root::render_dialog_layer`, `Root::render_sheet_layer` and `Root::render_notification_layer` have been removed. Delete their calls and the corresponding `.children(...)` expressions from application views. Previously customized layer positions now use the window-level Root's overlay placement.
 
-[Root]: https://docs.rs/gpui-component/latest/gpui_component/root/struct.Root.html
+[Root]: https://docs.rs/gpui-base/latest/gpui_base/struct.Root.html
