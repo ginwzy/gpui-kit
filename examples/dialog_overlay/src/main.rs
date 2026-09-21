@@ -108,14 +108,9 @@ fn main() {
     app.run(move |cx| {
         gpui_kit::init(cx);
 
-        cx.spawn(async move |cx| {
-            cx.open_window(TitleBar::window_options(), |window, cx| {
-                let view = cx.new(|_| HelloWorld);
-                // This first level on the window, should be a Root.
-                cx.new(|cx| Root::new(view, window, cx))
-            })
-            .expect("Failed to open window");
+        gpui_kit::open_window(TitleBar::window_options(), cx, |_, cx| {
+            cx.new(|_| HelloWorld)
         })
-        .detach();
+        .expect("Failed to open window");
     });
 }

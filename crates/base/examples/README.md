@@ -4,6 +4,9 @@
 component. It selects one component from the shared `showcase` implementation, so native and
 WebAssembly previews exercise the same Rust code without producing one binary per component.
 
+Window startup uses `gpui_kit::init` and `gpui_kit::open_window`. These example
+packages disable Kit's default features so standalone runs remain Base-only.
+
 Run an individual component natively:
 
 ```bash

@@ -3,10 +3,7 @@ use std::cell::RefCell;
 
 use gpui_component_story::{Gallery, StoryRoot};
 use gpui_kit::assets::Assets;
-use gpui_kit::component::{
-    Root,
-    theme::{Theme, ThemeMode},
-};
+use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::{prelude::*, *};
 use wasm_bindgen::prelude::*;
 
@@ -126,20 +123,19 @@ pub fn run(story: Option<String>, dark: Option<bool>) -> Result<(), JsValue> {
             cx,
         );
 
-        cx.open_window(WindowOptions::default(), move |window, cx| {
+        gpui_kit::open_window(WindowOptions::default(), cx, move |window, cx| {
             let embedded = story.is_some();
             let view = match story.as_deref() {
                 Some(story) => Gallery::embedded_view(story, window, cx),
                 None => Gallery::view(None, window, cx),
             };
-            let story_root = cx.new(|cx| {
+            cx.new(|cx| {
                 if embedded {
                     StoryRoot::embedded(view, window, cx)
                 } else {
                     StoryRoot::new("GPUI Component", view, window, cx)
                 }
-            });
-            cx.new(|cx| Root::new(story_root, window, cx))
+            })
         })
         .expect("Failed to open window");
         cx.activate(true);

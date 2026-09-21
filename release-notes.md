@@ -64,6 +64,12 @@ Root, use `cx.open_window` and construct `Root::new` yourself; do not return a
 Root from this helper's builder. In an async context, call the helper inside
 `cx.update`.
 
+Examples and the native/web story galleries use this helper for standard window
+startup. The borderless-root example keeps the lower-level constructor to
+configure `Root::bordered(false)`. Base-only examples disable Kit's default
+features. The previously standalone color-mixing source is now a workspace
+package, runnable with `cargo run -p color_mix_oklab`.
+
 Quit and close-window actions, keyboard shortcuts and confirmation flows remain
 application-owned. Kit initialization does not install default quit or close
 bindings.

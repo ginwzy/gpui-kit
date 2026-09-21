@@ -138,18 +138,19 @@ impl Render for Example {
 
 fn main() {
     gpui_platform::application().run(|cx: &mut App| {
-        gpui_base::init(cx);
+        gpui_kit::init(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
         })
         .detach();
-        cx.open_window(
+        gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(900.), px(650.)), cx)),
                 ..Default::default()
             },
+            cx,
             |_, cx| {
                 cx.new(|_| Example {
                     list: ListState::new(120, ListAlignment::Top, px(200.)).measure_all(),

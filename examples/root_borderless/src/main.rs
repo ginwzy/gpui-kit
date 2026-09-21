@@ -61,13 +61,12 @@ fn main() {
             ..Default::default()
         };
 
-        cx.spawn(async move |cx| {
-            cx.open_window(window_options, |window, cx| {
-                let view = cx.new(|_| RootBorderlessExample);
-                cx.new(|cx| Root::new(view, window, cx).bordered(false))
-            })
-            .expect("Failed to open window");
+        // This example customizes Root itself, so it uses the lower-level
+        // constructor instead of gpui_kit::open_window's default Root.
+        cx.open_window(window_options, |window, cx| {
+            let view = cx.new(|_| RootBorderlessExample);
+            cx.new(|cx| Root::new(view, window, cx).bordered(false))
         })
-        .detach();
+        .expect("Failed to open window");
     });
 }

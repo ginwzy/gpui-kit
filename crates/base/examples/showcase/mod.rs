@@ -659,7 +659,7 @@ impl Render for ComponentPage {
 pub fn run(app: Application, component: impl Into<String>) {
     let component = component.into();
     app.run(move |cx: &mut App| {
-        gpui_base::init(cx);
+        gpui_kit::init(cx);
         #[cfg(not(target_family = "wasm"))]
         {
             cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
@@ -682,7 +682,7 @@ pub fn run(app: Application, component: impl Into<String>) {
             window_bounds: Some(WindowBounds::centered(size(px(840.), px(640.)), cx)),
             ..WindowOptions::default()
         };
-        cx.open_window(options, move |window, cx| {
+        gpui_kit::open_window(options, cx, move |window, cx| {
             cx.new(|cx| BaseShowcase::new(component, window, cx))
         })
         .expect("failed to open gpui-base example window");
@@ -694,13 +694,13 @@ pub fn run(app: Application, component: impl Into<String>) {
 pub fn run_embedded(app: Application, component: impl Into<String>) -> gpui::ApplicationHandle {
     let component = component.into();
     app.run_embedded(move |cx: &mut App| {
-        gpui_base::init(cx);
+        gpui_kit::init(cx);
         cx.text_system()
             .add_fonts(vec![Cow::Borrowed(
                 include_bytes!("../../../story-web/fonts/Inter-Regular.ttf").as_slice(),
             )])
             .expect("failed to load gpui-base example font");
-        cx.open_window(WindowOptions::default(), move |window, cx| {
+        gpui_kit::open_window(WindowOptions::default(), cx, move |window, cx| {
             cx.new(|cx| BaseShowcase::new(component, window, cx))
         })
         .expect("failed to open gpui-base example window");

@@ -152,20 +152,22 @@ pub fn create_new_window_with_size<F, E>(
             ..TitleBar::window_options()
         };
 
-        let window = cx
-            .open_window(options, |window, cx| {
-                let view = crate_view_fn(window, cx);
-                let story_root = cx.new(|cx| StoryRoot::new(title.clone(), view, window, cx));
+        let (window, _) = cx
+            .update(|cx| {
+                gpui_kit::open_window(options, cx, |window, cx| {
+                    let view = crate_view_fn(window, cx);
+                    let story_root = cx.new(|cx| StoryRoot::new(title.clone(), view, window, cx));
 
-                // Set focus to the StoryRoot to enable it's actions.
-                let focus_handle = story_root.focus_handle(cx);
-                window.defer(cx, move |window, cx| {
-                    if window.focused(cx).is_none() {
-                        focus_handle.focus(window, cx);
-                    }
-                });
+                    // Set focus to the StoryRoot to enable it's actions.
+                    let focus_handle = story_root.focus_handle(cx);
+                    window.defer(cx, move |window, cx| {
+                        if window.focused(cx).is_none() {
+                            focus_handle.focus(window, cx);
+                        }
+                    });
 
-                cx.new(|cx| Root::new(story_root, window, cx))
+                    story_root
+                })
             })
             .expect("failed to open window");
 

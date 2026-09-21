@@ -1443,6 +1443,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "color_mix_oklab"
+version = "0.6.4"
+dependencies = [
+ "gpui-kit",
+]
+
+[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3752,6 +3759,7 @@ name = "gpui-base-examples"
 version = "0.6.4"
 dependencies = [
  "gpui-base",
+ "gpui-kit",
  "gpui-pre",
  "gpui-pre-platform",
  "gpui-pre-reqwest-client",
@@ -3765,6 +3773,7 @@ dependencies = [
  "console_error_panic_hook",
  "console_log",
  "gpui-base",
+ "gpui-kit",
  "gpui-pre",
  "gpui-pre-platform",
  "gpui-pre-reqwest-client",

@@ -687,18 +687,19 @@ fn advance_digit(current: f32, digit: u8) -> f32 {
 pub fn run() {
     let app: Application = gpui_platform::application();
     app.run(|cx: &mut App| {
-        gpui_base::init(cx);
+        gpui_kit::init(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
         })
         .detach();
-        cx.open_window(
+        gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::centered(gpui::size(px(820.), px(620.)), cx)),
                 ..Default::default()
             },
+            cx,
             |_, cx| cx.new(|_| MotionExample::new()),
         )
         .expect("failed to open motion example");
@@ -709,13 +710,13 @@ pub fn run() {
 #[cfg(target_family = "wasm")]
 pub fn run_embedded(app: Application) -> ApplicationHandle {
     app.run_embedded(|cx: &mut App| {
-        gpui_base::init(cx);
+        gpui_kit::init(cx);
         cx.text_system()
             .add_fonts(vec![Cow::Borrowed(
                 include_bytes!("../../../story-web/fonts/Inter-Regular.ttf").as_slice(),
             )])
             .expect("failed to load motion example font");
-        cx.open_window(WindowOptions::default(), |_, cx| {
+        gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
             cx.new(|_| MotionExample::new())
         })
         .expect("failed to open motion example");
