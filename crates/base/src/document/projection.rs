@@ -140,6 +140,9 @@ impl DocumentProjection {
     }
 
     pub(crate) fn transformed(&self, edits: &[super::TextEdit], new_source_len: usize) -> Self {
+        // User edits cannot overlap projected source. Insertions at either edge
+        // belong to adjacent editable text, so spans and their mappings must not
+        // grow to consume them.
         let spans = self
             .spans
             .iter()
@@ -149,13 +152,13 @@ impl DocumentProjection {
                     let edit_range = edit.range();
                     source.start = transform_offset(
                         source.start,
-                        Affinity::Before,
+                        Affinity::After,
                         &edit_range,
                         edit.replacement().len(),
                     );
                     source.end = transform_offset(
                         source.end,
-                        Affinity::After,
+                        Affinity::Before,
                         &edit_range,
                         edit.replacement().len(),
                     );
@@ -169,13 +172,13 @@ impl DocumentProjection {
                                 let edit_range = edit.range();
                                 source.start = transform_offset(
                                     source.start,
-                                    Affinity::Before,
+                                    Affinity::After,
                                     &edit_range,
                                     edit.replacement().len(),
                                 );
                                 source.end = transform_offset(
                                     source.end,
-                                    Affinity::After,
+                                    Affinity::Before,
                                     &edit_range,
                                     edit.replacement().len(),
                                 );
@@ -536,6 +539,39 @@ mod tests {
             DocumentProjection::new(6, vec![ProjectionSpan::replace(4..5, "X")]).unwrap();
         let transformed = projection.transformed(&[TextEdit::new(1..1, "++")], 8);
         assert_eq!(transformed.spans()[0].source(), 6..7);
+    }
+
+    #[test]
+    fn projection_boundaries_exclude_adjacent_edits() {
+        for span in [
+            ProjectionSpan::hide(2..4),
+            ProjectionSpan::replace(2..4, "Q"),
+            ProjectionSpan::mapped(2..4, "Q", vec![ProjectionMapping::new(0..1, 2..4)]),
+        ] {
+            let projection = DocumentProjection::new(6, vec![span]).unwrap();
+            for (edit, source, expected) in [
+                (TextEdit::new(2..2, "x"), "abxCDyz", 3..5),
+                (TextEdit::new(4..4, "x"), "abCDxyz", 2..4),
+                (TextEdit::new(0..2, "x"), "xCDyz", 1..3),
+                (TextEdit::new(4..6, "x"), "abCDx", 2..4),
+            ] {
+                let transformed = projection.transformed(&[edit], source.len());
+                let span = &transformed.spans()[0];
+                assert_eq!(span.source(), expected);
+                if let Some(mapping) = &span.mapping {
+                    assert_eq!(mapping[0].source(), expected);
+                }
+                assert_eq!(
+                    ProjectionMap::new(&Rope::from(source), &transformed).display_text(),
+                    format!(
+                        "{}{}{}",
+                        &source[..expected.start],
+                        span.replacement(),
+                        &source[expected.end..]
+                    ),
+                );
+            }
+        }
     }
 
     #[test]
