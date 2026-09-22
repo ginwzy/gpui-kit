@@ -1020,14 +1020,13 @@ pub struct DocumentState<I> {
     block_layouts: Vec<BlockLayoutRecord>,
     trailer_layout: Option<(usize, Bounds<Pixels>)>,
     last_bounds: Option<Bounds<Pixels>>,
+    layout_style: Option<(gpui::TextStyle, Pixels)>,
     drag_anchor: Option<usize>,
     undo: DocumentUndoManager<I>,
     pending_viewport_anchor: Option<PendingViewportAnchor>,
     viewport_restore_scheduled: bool,
     dynamic_trailer: bool,
     trailer_height: Option<Pixels>,
-    pending_trailer_height: Option<Pixels>,
-    trailer_resize_scheduled: bool,
     scroll_pin: Option<ScrollPin<I>>,
     scroll_pin_adjustment_scheduled: bool,
     caret_reveal_pending: bool,
@@ -1111,8 +1110,8 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     ) -> Result<Self, RegionError> {
         let model = DocumentModel::new(text, regions)?;
         let layout_items = model.layout_items();
-        let list_state = ListState::new(layout_items.len(), ListAlignment::Top, px(400.))
-            .with_uniform_item_height(px(21.));
+        let list_state =
+            ListState::new(layout_items.len(), ListAlignment::Top, px(400.)).measure_all();
         Ok(Self {
             model,
             layout_items,
@@ -1122,14 +1121,13 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             block_layouts: Vec::new(),
             trailer_layout: None,
             last_bounds: None,
+            layout_style: None,
             drag_anchor: None,
             undo: DocumentUndoManager::default(),
             pending_viewport_anchor: None,
             viewport_restore_scheduled: false,
             dynamic_trailer: false,
             trailer_height: None,
-            pending_trailer_height: None,
-            trailer_resize_scheduled: false,
             scroll_pin: None,
             scroll_pin_adjustment_scheduled: false,
             caret_reveal_pending: false,
@@ -1167,6 +1165,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) {
         self.block_renderer = Some(Rc::new(renderer));
+        self.list_state.remeasure_items(0..self.layout_items.len());
         cx.notify();
     }
 
@@ -1305,7 +1304,6 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.dynamic_trailer = enabled;
         if !enabled {
             self.trailer_height = None;
-            self.pending_trailer_height = None;
             self.trailer_layout = None;
         }
         self.reconcile_layout_items_from(0);
@@ -1411,6 +1409,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         ) else {
             return false;
         };
+        self.capture_viewport_anchor();
         self.list_state.remeasure_items(index..index + 1);
         cx.notify();
         true
@@ -1453,7 +1452,13 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         }
         let old_end = self.layout_items.len() - suffix;
         let replacement_count = next.len() - prefix - suffix;
-        self.list_state.splice(prefix..old_end, replacement_count);
+        if prefix != old_end || replacement_count != 0 {
+            self.list_state.splice(prefix..old_end, replacement_count);
+            // GPUI 0.3.5 splice does not re-arm measure_all. Keep retained
+            // measurements, but measure every inserted/replaced item before
+            // publishing the next scroll extent, including offscreen items.
+            self.list_state.clone().measure_all();
+        }
         self.layout_items = next;
     }
 
@@ -2738,48 +2743,51 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.schedule_caret_reveal(cx);
     }
 
-    pub(super) fn update_root_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+    pub(super) fn prepare_layout(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         self.apply_scrollbar_input(cx);
+        let layout_style = (window.text_style(), window.rem_size());
+        let style_changed = self
+            .layout_style
+            .as_ref()
+            .is_some_and(|previous| previous != &layout_style);
+        let width_changed = self
+            .last_bounds
+            .is_some_and(|previous| previous.size.width != bounds.size.width);
+        if style_changed || width_changed {
+            self.capture_viewport_anchor();
+        }
+        if style_changed {
+            self.list_state.remeasure_items(0..self.layout_items.len());
+        }
+        self.layout_style = Some(layout_style);
         self.last_bounds = Some(bounds);
         if self.dynamic_trailer
             && self.trailer_height != Some(bounds.size.height)
             && bounds.size.height > Pixels::ZERO
         {
-            self.pending_trailer_height = Some(bounds.size.height);
-            self.schedule_trailer_resize(cx);
+            // The viewport is known before List::prepaint measures its items.
+            // Include the actual trailer height in this frame's total.
+            self.trailer_height = Some(bounds.size.height);
+            if let Some(index) = self
+                .layout_items
+                .iter()
+                .position(|item| matches!(item, DocumentLayoutItem::Trailer))
+            {
+                self.list_state.remeasure_items(index..index + 1);
+            }
         }
+        self.text_layouts.clear();
+        self.block_layouts.clear();
+        self.trailer_layout = None;
     }
 
     pub(super) fn update_trailer_layout(&mut self, item_ix: usize, bounds: Bounds<Pixels>) {
         self.trailer_layout = Some((item_ix, bounds));
-    }
-
-    fn schedule_trailer_resize(&mut self, cx: &mut Context<Self>) {
-        if self.trailer_resize_scheduled {
-            return;
-        }
-        self.trailer_resize_scheduled = true;
-        let entity = cx.entity();
-        cx.defer(move |cx| {
-            entity.update(cx, |state, cx| {
-                state.trailer_resize_scheduled = false;
-                let Some(height) = state.pending_trailer_height.take() else {
-                    return;
-                };
-                if state.trailer_height == Some(height) {
-                    return;
-                }
-                state.trailer_height = Some(height);
-                if let Some(index) = state
-                    .layout_items
-                    .iter()
-                    .position(|item| matches!(item, DocumentLayoutItem::Trailer))
-                {
-                    state.list_state.remeasure_items(index..index + 1);
-                }
-                cx.notify();
-            });
-        });
     }
 
     pub(super) fn focus_handle_snapshot(&self) -> FocusHandle {
@@ -3096,9 +3104,6 @@ impl<I: Clone + Eq + 'static> Render for DocumentState<I> {
                 });
             });
         }
-        self.text_layouts.clear();
-        self.block_layouts.clear();
-        self.trailer_layout = None;
         let list_entity = entity.clone();
         let content = list(self.list_state.clone(), move |item_ix, window, cx| {
             list_entity.update(cx, |state, cx| {

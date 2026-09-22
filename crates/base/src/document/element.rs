@@ -103,10 +103,10 @@ impl<I: Clone + Eq + 'static> Element for DocumentElement<I> {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        self.content.prepaint(window, cx);
         self.state.update(cx, |state, cx| {
-            state.update_root_bounds(bounds, cx);
+            state.prepare_layout(bounds, window, cx);
         });
+        self.content.prepaint(window, cx);
         hitbox
     }
 

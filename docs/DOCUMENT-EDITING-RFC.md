@@ -267,9 +267,19 @@ that mapping. Immutable regions may hide Markdown syntax; the editable draft
 initially uses identity projection.
 
 Blocks are keyed by stable IDs. GPUI's SumTree-backed `ListState` retains
-variable measurements, splices changed item ranges, and lays out only the
-viewport plus bounded overdraw. Host insertion constrains the splice to the
-first edited item so repeated rows cannot make a changed prefix look unchanged.
+variable measurements and splices changed item ranges. Document layout measures
+all unmeasured items at the current width before exposing the scroll extent;
+only the viewport plus bounded overdraw is instantiated again during scrolling,
+and only visible items are painted. Scrolling unchanged content must not discover
+additional document height. Host insertion constrains the splice to the first
+edited item so repeated rows cannot make a changed prefix look unchanged.
+
+Splices re-arm complete measurement without invalidating retained item sizes.
+Block changes invalidate the affected item; width or inherited text style/rem
+changes invalidate layout globally. The trailer receives the current viewport
+height before measurement. `DocumentState` and its `ListState` remain the sole
+owners of layout and scroll geometry; the application does not maintain a second
+height estimate.
 
 Application render callbacks are side-effect-free. Model changes and block
 measurement feedback occur through explicit update paths, never by mutating
