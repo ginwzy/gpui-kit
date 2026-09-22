@@ -42,6 +42,8 @@ pub enum DocumentEditRejection {
     CrossesRegions,
     Readonly,
     Atomic,
+    InvalidBoundary,
+    InvalidRegions,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,22 +219,47 @@ impl<I> DocumentSnapshot<I> {
 }
 
 #[derive(Debug)]
-struct AnchorRecord {
+struct AnchorRecord<I> {
     offset: usize,
     bias: AnchorBias,
+    node_id: Option<I>,
+    affinity: Affinity,
 }
 
-#[derive(Debug, Default)]
-struct AnchorStore {
+#[derive(Debug)]
+struct AnchorStore<I> {
     next_id: u64,
-    anchors: BTreeMap<DocumentAnchor, AnchorRecord>,
+    anchors: BTreeMap<DocumentAnchor, AnchorRecord<I>>,
 }
 
-impl AnchorStore {
-    fn create(&mut self, offset: usize, bias: AnchorBias) -> DocumentAnchor {
+impl<I> Default for AnchorStore<I> {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            anchors: BTreeMap::new(),
+        }
+    }
+}
+
+impl<I> AnchorStore<I> {
+    fn create_for_node(
+        &mut self,
+        offset: usize,
+        bias: AnchorBias,
+        node_id: Option<I>,
+        affinity: Affinity,
+    ) -> DocumentAnchor {
         let anchor = DocumentAnchor::new(self.next_id);
         self.next_id = self.next_id.saturating_add(1);
-        self.anchors.insert(anchor, AnchorRecord { offset, bias });
+        self.anchors.insert(
+            anchor,
+            AnchorRecord {
+                offset,
+                bias,
+                node_id,
+                affinity,
+            },
+        );
         anchor
     }
 
@@ -359,7 +386,7 @@ struct DocumentModel<I> {
     text: Rope,
     revision: DocumentRevision,
     regions: DocumentRegions<I>,
-    anchors: AnchorStore,
+    anchors: AnchorStore<I>,
     selection: DocumentSelection,
     marked: Option<DocumentSelection>,
     projection: DocumentProjection,
@@ -393,6 +420,8 @@ pub(super) struct DocumentTextPresentation {
 enum DocumentLayoutItem<I> {
     Text {
         display: Range<usize>,
+        source: Range<usize>,
+        node_id: Option<I>,
         text: SharedString,
         presentation: Box<DocumentTextPresentation>,
     },
@@ -409,15 +438,19 @@ impl<I: Eq> DocumentLayoutItem<I> {
             (
                 Self::Text {
                     text: left,
+                    node_id: left_node,
                     presentation: left_presentation,
                     ..
                 },
                 Self::Text {
                     text: right,
+                    node_id: right_node,
                     presentation: right_presentation,
                     ..
                 },
-            ) => left == right && left_presentation == right_presentation,
+            ) => {
+                left_node == right_node && left == right && left_presentation == right_presentation
+            }
             (Self::Block { id: left, .. }, Self::Block { id: right, .. }) => left == right,
             (Self::Trailer, Self::Trailer) => true,
             _ => false,
@@ -429,15 +462,19 @@ impl<I: Clone + Eq> DocumentModel<I> {
     fn new(text: impl Into<String>, regions: Vec<DocumentRegion<I>>) -> Result<Self, RegionError> {
         let text = Rope::from(text.into());
         let regions = DocumentRegions::new(regions, text.len())?;
-        let initial_offset = regions
+        let initial_region = regions
             .as_slice()
             .iter()
             .rev()
-            .find(|region| region.policy() == EditPolicy::Editable)
-            .map(|region| region.range().start)
-            .unwrap_or(0);
+            .find(|region| region.policy() == EditPolicy::Editable);
+        let initial_offset = initial_region.map_or(0, |region| region.range().start);
         let mut anchors = AnchorStore::default();
-        let cursor = anchors.create(initial_offset, AnchorBias::Right);
+        let cursor = anchors.create_for_node(
+            initial_offset,
+            AnchorBias::Right,
+            initial_region.map(|region| region.id().clone()),
+            Affinity::After,
+        );
         let projection = DocumentProjection::identity(text.len());
         let projection_map = ProjectionMap::new(&text, &projection);
 
@@ -521,9 +558,21 @@ impl<I: Clone + Eq> DocumentModel<I> {
     fn layout_items(&self) -> Vec<DocumentLayoutItem<I>> {
         let display_text = self.display_text();
         let mut display_cursor = 0;
+        let mut source_cursor = 0;
         let mut items = Vec::new();
-        for block in &self.blocks {
-            let source = block.source();
+        let mut blocks = self.blocks.iter().peekable();
+        for (region_ix, region) in self.regions.as_slice().iter().enumerate() {
+            let block = blocks
+                .peek()
+                .filter(|block| block.id() == region.id())
+                .copied();
+            let empty_text = region.policy() == EditPolicy::Editable
+                && region.range().is_empty()
+                && region_ix + 1 != self.regions.as_slice().len();
+            if block.is_none() && !empty_text {
+                continue;
+            }
+            let source = region.range();
             let display_start = self
                 .source_to_display(source.start, Affinity::Before)
                 .expect("validated block source must map to display");
@@ -534,18 +583,34 @@ impl<I: Clone + Eq> DocumentModel<I> {
                 &mut items,
                 display_text,
                 display_cursor..display_start,
+                source_cursor..source.start,
                 false,
             );
-            items.push(DocumentLayoutItem::Block {
-                id: block.id().clone(),
-                source,
-            });
+            if let Some(block) = block {
+                items.push(DocumentLayoutItem::Block {
+                    id: block.id().clone(),
+                    source: source.clone(),
+                });
+                blocks.next();
+            } else {
+                let mut item = self.text_layout_item(
+                    display_text,
+                    display_start..display_start,
+                    source.clone(),
+                );
+                if let DocumentLayoutItem::Text { node_id, .. } = &mut item {
+                    *node_id = Some(region.id().clone());
+                }
+                items.push(item);
+            }
             display_cursor = display_end;
+            source_cursor = source.end;
         }
         self.push_text_layout_items(
             &mut items,
             display_text,
             display_cursor..display_text.len(),
+            source_cursor..self.text.len(),
             true,
         );
         items
@@ -556,6 +621,7 @@ impl<I: Clone + Eq> DocumentModel<I> {
         items: &mut Vec<DocumentLayoutItem<I>>,
         display_text: &str,
         range: Range<usize>,
+        source: Range<usize>,
         include_empty_tail: bool,
     ) {
         let mut start = range.start;
@@ -563,15 +629,35 @@ impl<I: Clone + Eq> DocumentModel<I> {
             // The line terminator separates layout items. Passing it to StyledText
             // creates another visual row inside each item and doubles line spacing.
             let end = range.start + newline.0;
-            items.push(self.text_layout_item(display_text, start..end));
+            items.push(self.text_layout_item(display_text, start..end, source.clone()));
             start = end + 1;
         }
         if start < range.end || (include_empty_tail && start == range.end) {
-            items.push(self.text_layout_item(display_text, start..range.end));
+            items.push(self.text_layout_item(display_text, start..range.end, source));
         }
     }
 
-    fn text_layout_item(&self, display_text: &str, display: Range<usize>) -> DocumentLayoutItem<I> {
+    fn text_layout_item(
+        &self,
+        display_text: &str,
+        display: Range<usize>,
+        segment: Range<usize>,
+    ) -> DocumentLayoutItem<I> {
+        // A hidden object shares display offsets with both adjacent text runs.
+        // Keep the source extent so caret ownership does not cross that object.
+        let source_start = self
+            .display_to_source(display.start, Affinity::After)
+            .unwrap_or(segment.end)
+            .clamp(segment.start, segment.end);
+        let source_end = self
+            .display_to_source(display.end, Affinity::Before)
+            .unwrap_or(segment.end)
+            .clamp(source_start, segment.end);
+        let source = source_start..source_end;
+        let node_id = self
+            .position_for_offset(source_start, Affinity::After)
+            .ok()
+            .map(DocumentPosition::into_node_id);
         let text_style = self
             .resolved_styles
             .paragraphs
@@ -595,6 +681,8 @@ impl<I: Clone + Eq> DocumentModel<I> {
         DocumentLayoutItem::Text {
             text: display_text[display.clone()].to_string().into(),
             display,
+            source,
+            node_id,
             presentation: Box::new(DocumentTextPresentation {
                 text_style,
                 highlights,
@@ -628,17 +716,162 @@ impl<I: Clone + Eq> DocumentModel<I> {
         self.selection_offsets().1
     }
 
+    fn position_for_offset(
+        &self,
+        offset: usize,
+        affinity: Affinity,
+    ) -> Result<DocumentPosition<I>, PositionError> {
+        if offset > self.text.len() {
+            return Err(PositionError::SourceOffsetOutOfBounds {
+                offset,
+                source_len: self.text.len(),
+            });
+        }
+        let mut candidates = self
+            .regions
+            .as_slice()
+            .iter()
+            .filter(|region| region.range().contains_inclusive(offset));
+        let region = if affinity == Affinity::Before {
+            candidates.next()
+        } else {
+            candidates.next_back()
+        }
+        .ok_or(PositionError::NodeNotFound)?;
+        Ok(DocumentPosition::new(
+            region.id().clone(),
+            offset - region.range().start,
+            affinity,
+        ))
+    }
+
+    fn resolve_position(&self, position: &DocumentPosition<I>) -> Result<usize, PositionError> {
+        let index = self
+            .region_index(position.node_id())
+            .ok_or(PositionError::NodeNotFound)?;
+        let range = self.regions.as_slice()[index].range();
+        if position.offset() > range.len() {
+            return Err(PositionError::NodeOffsetOutOfBounds {
+                offset: position.offset(),
+                node_len: range.len(),
+            });
+        }
+        Ok(range.start + position.offset())
+    }
+
+    fn position_for_anchor(
+        &self,
+        anchor: DocumentAnchor,
+    ) -> Result<DocumentPosition<I>, PositionError> {
+        let record = self
+            .anchors
+            .anchors
+            .get(&anchor)
+            .expect("document anchor must be live");
+        if let Some(node_id) = &record.node_id
+            && let Some(index) = self.region_index(node_id)
+        {
+            let range = self.regions.as_slice()[index].range();
+            if range.contains_inclusive(record.offset) {
+                return Ok(DocumentPosition::new(
+                    node_id.clone(),
+                    record.offset - range.start,
+                    record.affinity,
+                ));
+            }
+        }
+        self.position_for_offset(record.offset, record.affinity)
+    }
+
+    fn selection_anchor(
+        &mut self,
+        offset: usize,
+        bias: AnchorBias,
+        affinity: Affinity,
+    ) -> DocumentAnchor {
+        let node_id = self
+            .position_for_offset(offset, affinity)
+            .ok()
+            .map(DocumentPosition::into_node_id);
+        self.anchors
+            .create_for_node(offset, bias, node_id, affinity)
+    }
+
     fn replace_selection(&mut self, anchor_offset: usize, head_offset: usize) {
+        if anchor_offset == head_offset {
+            self.collapse_selection(head_offset);
+            return;
+        }
         self.release_selection(self.selection);
-        let anchor = self.anchors.create(anchor_offset, AnchorBias::Left);
-        let head = self.anchors.create(head_offset, AnchorBias::Right);
+        let reversed = head_offset < anchor_offset;
+        let anchor = self.selection_anchor(
+            anchor_offset,
+            AnchorBias::Left,
+            if reversed {
+                Affinity::Before
+            } else {
+                Affinity::After
+            },
+        );
+        let head = self.selection_anchor(
+            head_offset,
+            AnchorBias::Right,
+            if reversed {
+                Affinity::After
+            } else {
+                Affinity::Before
+            },
+        );
         self.selection = DocumentSelection::new(anchor, head);
     }
 
     fn collapse_selection(&mut self, offset: usize) {
         self.release_selection(self.selection);
-        let cursor = self.anchors.create(offset, AnchorBias::Right);
+        let cursor = self.selection_anchor(offset, AnchorBias::Right, Affinity::After);
         self.selection = DocumentSelection::new(cursor, cursor);
+    }
+
+    fn replace_selection_positions(
+        &mut self,
+        anchor: DocumentPosition<I>,
+        head: DocumentPosition<I>,
+    ) -> Result<(), PositionError> {
+        let anchor_offset = self.resolve_position(&anchor)?;
+        let head_offset = self.resolve_position(&head)?;
+        self.release_selection(self.selection);
+        if anchor == head {
+            let cursor = self.anchors.create_for_node(
+                head_offset,
+                AnchorBias::Right,
+                Some(head.node_id().clone()),
+                head.affinity(),
+            );
+            self.selection = DocumentSelection::new(cursor, cursor);
+        } else {
+            let anchor = self.anchors.create_for_node(
+                anchor_offset,
+                AnchorBias::Left,
+                Some(anchor.node_id().clone()),
+                anchor.affinity(),
+            );
+            let head = self.anchors.create_for_node(
+                head_offset,
+                AnchorBias::Right,
+                Some(head.node_id().clone()),
+                head.affinity(),
+            );
+            self.selection = DocumentSelection::new(anchor, head);
+        }
+        Ok(())
+    }
+
+    fn select_in_region(&mut self, index: usize, anchor: usize, head: usize) {
+        let region = &self.regions.as_slice()[index];
+        self.replace_selection_positions(
+            DocumentPosition::new(region.id().clone(), anchor, Affinity::After),
+            DocumentPosition::new(region.id().clone(), head, Affinity::After),
+        )
+        .expect("region-relative selection must resolve");
     }
 
     fn release_selection(&mut self, selection: DocumentSelection) {
@@ -653,8 +886,22 @@ impl<I: Clone + Eq> DocumentModel<I> {
             self.release_selection(marked);
         }
         self.marked = range.map(|range| {
-            let start = self.anchors.create(range.start, AnchorBias::Left);
-            let end = self.anchors.create(range.end, AnchorBias::Right);
+            let node_id = self
+                .position_for_anchor(self.selection.head())
+                .ok()
+                .map(DocumentPosition::into_node_id);
+            let start = self.anchors.create_for_node(
+                range.start,
+                AnchorBias::Left,
+                node_id.clone(),
+                Affinity::After,
+            );
+            let end = self.anchors.create_for_node(
+                range.end,
+                AnchorBias::Right,
+                node_id,
+                Affinity::Before,
+            );
             DocumentSelection::new(start, end)
         });
     }
@@ -673,12 +920,16 @@ impl<I: Clone + Eq> DocumentModel<I> {
         })
     }
 
-    fn route_and_apply(&mut self, transaction: &EditTransaction) -> RoutingOutcome<I> {
+    fn route_and_apply(
+        &mut self,
+        transaction: &EditTransaction,
+        node_id: Option<&I>,
+    ) -> RoutingOutcome<I> {
         if transaction.revision() != self.revision {
             return RoutingOutcome::Rejected(DocumentEditRejection::StaleRevision);
         }
 
-        let target = match self.target_region_for_transaction(transaction) {
+        let target = match self.target_region_for_transaction(transaction, node_id) {
             Ok(target) => target,
             Err(reason) => return RoutingOutcome::Rejected(reason),
         };
@@ -687,20 +938,34 @@ impl<I: Clone + Eq> DocumentModel<I> {
             EditPolicy::Readonly => RoutingOutcome::Rejected(DocumentEditRejection::Readonly),
             EditPolicy::Atomic => RoutingOutcome::Rejected(DocumentEditRejection::Atomic),
             EditPolicy::Routed => RoutingOutcome::Routed(region.id().clone()),
-            EditPolicy::Editable => {
-                self.apply_to_editable_region(target, transaction);
-                RoutingOutcome::Applied
-            }
+            EditPolicy::Editable => match self.apply_to_editable_region(target, transaction) {
+                Ok(()) => RoutingOutcome::Applied,
+                Err(reason) => RoutingOutcome::Rejected(reason),
+            },
         }
     }
 
     fn target_region_for_transaction(
         &self,
         transaction: &EditTransaction,
+        node_id: Option<&I>,
     ) -> Result<usize, DocumentEditRejection> {
         let mut target = None;
         for edit in transaction.edits() {
-            let Some(index) = self.region_for_range(&edit.range()) else {
+            let range = edit.range();
+            let index = node_id
+                .and_then(|id| self.region_index(id))
+                .filter(|index| {
+                    let region = self.regions.as_slice()[*index].range();
+                    region.start <= range.start && range.end <= region.end
+                });
+            let Some(index) = index.or_else(|| {
+                if node_id.is_some() {
+                    None
+                } else {
+                    self.region_for_range(&range)
+                }
+            }) else {
                 return Err(DocumentEditRejection::OutsideRegion);
             };
             if target.replace(index).is_some_and(|target| target != index) {
@@ -712,6 +977,12 @@ impl<I: Clone + Eq> DocumentModel<I> {
 
     fn region_for_range(&self, range: &Range<usize>) -> Option<usize> {
         if range.is_empty() {
+            if range.start == self.cursor()
+                && let Ok(position) = self.position_for_anchor(self.selection.head())
+                && let Some(index) = self.region_index(position.node_id())
+            {
+                return Some(index);
+            }
             return self
                 .regions
                 .as_slice()
@@ -740,21 +1011,22 @@ impl<I: Clone + Eq> DocumentModel<I> {
             .map(|(index, _)| index)
     }
 
-    fn apply_to_editable_region(&mut self, target: usize, transaction: &EditTransaction) {
+    fn apply_to_editable_region(
+        &mut self,
+        target: usize,
+        transaction: &EditTransaction,
+    ) -> Result<(), DocumentEditRejection> {
+        // Validate the resulting regions before mutating any text or anchors.
         let mut net_delta = 0isize;
         for edit in transaction.edits() {
             let range = edit.range();
-            let replacement_len = edit.replacement().len();
-            self.anchors.apply_edit(&range, replacement_len);
-            self.text.replace(range.clone(), edit.replacement());
-            net_delta += replacement_len as isize - range.len() as isize;
+            if self.text.clip_offset(range.start, Bias::Left) != range.start
+                || self.text.clip_offset(range.end, Bias::Right) != range.end
+            {
+                return Err(DocumentEditRejection::InvalidBoundary);
+            }
+            net_delta += edit.replacement().len() as isize - range.len() as isize;
         }
-        self.projection = self
-            .projection
-            .transformed(transaction.edits(), self.text.len());
-        self.blocks = transform_blocks(&self.blocks, transaction.edits());
-        self.projection_map = ProjectionMap::new(&self.text, &self.projection);
-
         let regions = self
             .regions
             .as_slice()
@@ -771,9 +1043,42 @@ impl<I: Clone + Eq> DocumentModel<I> {
                 DocumentRegion::new(region.id().clone(), range, region.policy())
             })
             .collect();
-        self.regions = DocumentRegions::new(regions, self.text.len())
-            .expect("an in-region edit must preserve region invariants");
+        let regions = DocumentRegions::new(regions, shift_offset(self.text.len(), net_delta))
+            .map_err(|_| DocumentEditRejection::InvalidRegions)?;
+        for edit in transaction.edits() {
+            let range = edit.range();
+            let replacement_len = edit.replacement().len();
+            self.anchors.apply_edit(&range, replacement_len);
+            self.text.replace(range.clone(), edit.replacement());
+        }
+        self.projection = self
+            .projection
+            .transformed(transaction.edits(), self.text.len());
+        self.blocks = transform_blocks(&self.blocks, transaction.edits());
+        self.projection_map = ProjectionMap::new(&self.text, &self.projection);
+
+        self.regions = regions;
+        self.reconcile_anchor_nodes();
         self.revision = self.revision.next();
+        Ok(())
+    }
+
+    fn reconcile_anchor_nodes(&mut self) {
+        for record in self.anchors.anchors.values_mut() {
+            if let Some(id) = &record.node_id {
+                if let Some(region) = self
+                    .regions
+                    .as_slice()
+                    .iter()
+                    .find(|region| region.id() == id)
+                {
+                    let range = region.range();
+                    record.offset = record.offset.clamp(range.start, range.end);
+                } else {
+                    record.node_id = None;
+                }
+            }
+        }
     }
 
     fn editable_range_for_cursor(&self) -> Option<Range<usize>> {
@@ -806,6 +1111,11 @@ impl<I: Clone + Eq> DocumentModel<I> {
         let anchor = self.anchors.resolve(selection.anchor())?;
         let head = self.anchors.resolve(selection.head())?;
         if !range.contains_inclusive(anchor) || !range.contains_inclusive(head) {
+            return None;
+        }
+        if self.position_for_anchor(selection.anchor()).ok()?.node_id() != region.id()
+            || self.position_for_anchor(selection.head()).ok()?.node_id() != region.id()
+        {
             return None;
         }
         Some(RelativeSelection {
@@ -848,9 +1158,10 @@ impl<I: Clone + Eq> DocumentModel<I> {
     fn restore_active_selection(&mut self, capture: &RegionSelection<I>) {
         if let Some(index) = self.region_index(&capture.region_id) {
             let range = self.regions.as_slice()[index].range();
-            self.replace_selection(
-                range.start + capture.selection.anchor.min(range.len()),
-                range.start + capture.selection.head.min(range.len()),
+            self.select_in_region(
+                index,
+                capture.selection.anchor.min(range.len()),
+                capture.selection.head.min(range.len()),
             );
         }
     }
@@ -1192,30 +1503,17 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             .map_err(PresentationError::Regions)?;
         model.set_rich_presentation(snapshot.projection, snapshot.blocks, snapshot.styles)?;
         if let Some(selection) = snapshot.selection {
-            let index = model
-                .region_index(selection.node_id())
-                .ok_or(PresentationError::Position(PositionError::NodeNotFound))?;
-            let region = &model.regions.as_slice()[index];
-            if selection.offset() > region.range().len() {
-                return Err(PresentationError::Position(
-                    PositionError::NodeOffsetOutOfBounds {
-                        offset: selection.offset(),
-                        node_len: region.range().len(),
-                    },
-                ));
-            }
-            let offset = region.range().start + selection.offset();
-            let bias = match selection.affinity() {
-                Affinity::Before => AnchorBias::Left,
-                Affinity::After => AnchorBias::Right,
-            };
-            let cursor = model.anchors.create(offset, bias);
-            model.selection = DocumentSelection::new(cursor, cursor);
+            model
+                .replace_selection_positions(selection.clone(), selection)
+                .map_err(PresentationError::Position)?;
         }
+        model.revision = self.model.revision.next();
         self.model = model;
         self.auto_scroll.stop();
         self.undo = DocumentUndoManager::default();
         self.pending_viewport_anchor = None;
+        self.scroll_pin = None;
+        self.caret_reveal_pending = false;
         self.text_layouts.clear();
         self.block_layouts.clear();
         self.trailer_layout = None;
@@ -1287,10 +1585,11 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     pub fn selected_positions(
         &self,
     ) -> Result<(DocumentPosition<I>, DocumentPosition<I>), PositionError> {
-        let (anchor, head) = self.model.selection_offsets();
         Ok((
-            self.position_for_offset(anchor, Affinity::Before)?,
-            self.position_for_offset(head, Affinity::After)?,
+            self.model
+                .position_for_anchor(self.model.selection.anchor())?,
+            self.model
+                .position_for_anchor(self.model.selection.head())?,
         ))
     }
 
@@ -1331,13 +1630,15 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         if let Some(previous) = self.scroll_pin.take() {
             self.model.anchors.remove(previous.anchor);
         }
-        let anchor = self.model.anchors.create(
+        let anchor = self.model.anchors.create_for_node(
             offset,
             if position.affinity() == Affinity::Before {
                 AnchorBias::Left
             } else {
                 AnchorBias::Right
             },
+            Some(position.node_id().clone()),
+            position.affinity(),
         );
         self.scroll_pin = Some(ScrollPin {
             id: pin_id,
@@ -1420,13 +1721,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.layout_items
             .iter()
             .position(|item| match item {
-                DocumentLayoutItem::Text { display, .. } => {
-                    let end = self
-                        .model
-                        .display_to_source(display.end, Affinity::After)
-                        .unwrap_or(self.model.text.len());
-                    source <= end
-                }
+                DocumentLayoutItem::Text { source: text, .. } => source <= text.end,
                 DocumentLayoutItem::Block { source: block, .. } => source <= block.end,
                 DocumentLayoutItem::Trailer => true,
             })
@@ -1476,42 +1771,25 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         offset: usize,
         affinity: Affinity,
     ) -> Result<DocumentPosition<I>, PositionError> {
-        if offset > self.model.text.len() {
-            return Err(PositionError::SourceOffsetOutOfBounds {
-                offset,
-                source_len: self.model.text.len(),
-            });
-        }
-        let mut candidates = self.model.regions.as_slice().iter().filter(|region| {
-            let range = region.range();
-            range.start <= offset && offset <= range.end
-        });
-        let region = if affinity == Affinity::Before {
-            candidates.next()
-        } else {
-            candidates.next_back()
-        }
-        .ok_or(PositionError::NodeNotFound)?;
-        Ok(DocumentPosition::new(
-            region.id().clone(),
-            offset - region.range().start,
-            affinity,
-        ))
+        self.model.position_for_offset(offset, affinity)
     }
 
     pub fn resolve_position(&self, position: &DocumentPosition<I>) -> Result<usize, PositionError> {
-        let index = self
-            .model
-            .region_index(position.node_id())
-            .ok_or(PositionError::NodeNotFound)?;
-        let range = self.model.regions.as_slice()[index].range();
-        if position.offset() > range.len() {
-            return Err(PositionError::NodeOffsetOutOfBounds {
-                offset: position.offset(),
-                node_len: range.len(),
-            });
-        }
-        Ok(range.start + position.offset())
+        self.model.resolve_position(position)
+    }
+
+    /// Selects node-relative positions without losing ownership at a shared boundary.
+    pub fn set_selection_positions(
+        &mut self,
+        anchor: DocumentPosition<I>,
+        head: DocumentPosition<I>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), PositionError> {
+        self.model.replace_selection_positions(anchor, head)?;
+        self.auto_scroll.stop();
+        cx.emit(DocumentEvent::SelectionChanged);
+        cx.notify();
+        Ok(())
     }
 
     pub fn set_selection(&mut self, range: Range<usize>, reversed: bool, cx: &mut Context<Self>) {
@@ -1536,13 +1814,22 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         transaction: EditTransaction,
         cx: &mut Context<Self>,
     ) -> EditDecision<I> {
+        self.apply_transaction_in_region(transaction, None, cx)
+    }
+
+    fn apply_transaction_in_region(
+        &mut self,
+        transaction: EditTransaction,
+        node_id: Option<&I>,
+        cx: &mut Context<Self>,
+    ) -> EditDecision<I> {
         let first_changed_item = transaction
             .edits()
             .iter()
             .map(|edit| self.layout_item_for_source(edit.range().start))
             .min()
             .unwrap_or(0);
-        match self.model.route_and_apply(&transaction) {
+        match self.model.route_and_apply(&transaction, node_id) {
             RoutingOutcome::Applied => {
                 self.reconcile_layout_items_from(first_changed_item);
                 let revision = self.model.revision;
@@ -1751,6 +2038,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             self.model.text.replace(edit.range(), edit.replacement());
         }
         self.model.regions = next_regions;
+        self.model.reconcile_anchor_nodes();
         self.model.projection = next_projection;
         self.model.projection_map = next_projection_map;
         self.model.blocks = next_blocks;
@@ -1801,7 +2089,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             EditOrigin::User | EditOrigin::Paste | EditOrigin::Composition
         ) {
             self.model
-                .target_region_for_transaction(&transaction)
+                .target_region_for_transaction(&transaction, None)
                 .ok()
                 .filter(|index| {
                     self.model.regions.as_slice()[*index].policy() == EditPolicy::Editable
@@ -1821,9 +2109,16 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             None
         };
 
+        let target = self
+            .model
+            .target_region_for_transaction(&transaction, None)
+            .ok();
         let decision = self.apply_transaction(transaction, cx);
         if decision == EditDecision::Apply {
-            self.model.collapse_selection(range.start + text.len());
+            let index = target.expect("applied edits have a target region");
+            let offset =
+                range.start + text.len() - self.model.regions.as_slice()[index].range().start;
+            self.model.select_in_region(index, offset, offset);
             if let Some((region_id, before, selection_before)) = undo_seed
                 && let Some(index) = self.model.region_index(&region_id)
                 && let Some(selection_after) = self
@@ -1881,16 +2176,18 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             self.model.text.len(),
         )
         .expect("an editable region replacement is a valid transaction");
-        if self.apply_transaction(transaction, cx) != EditDecision::Apply {
+        if self.apply_transaction_in_region(transaction, Some(&record.region_id), cx)
+            != EditDecision::Apply
+        {
             return false;
         }
         let Some(index) = self.model.region_index(&record.region_id) else {
             return false;
         };
-        let start = self.model.regions.as_slice()[index].range().start;
-        self.model.replace_selection(
-            start + selection.anchor.min(replacement.len()),
-            start + selection.head.min(replacement.len()),
+        self.model.select_in_region(
+            index,
+            selection.anchor.min(replacement.len()),
+            selection.head.min(replacement.len()),
         );
         self.model.set_marked_range(None);
         self.request_caret_reveal(cx);
@@ -1926,6 +2223,27 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
         self.model.text.offset_utf16_to_offset(range.start)
             ..self.model.text.offset_utf16_to_offset(range.end)
+    }
+
+    fn input_position_for_offset(
+        &self,
+        offset: usize,
+        affinity: Affinity,
+    ) -> Option<DocumentPosition<I>> {
+        let head = self
+            .model
+            .position_for_anchor(self.model.selection.head())
+            .ok()?;
+        let region = self.region(head.node_id())?.range();
+        if region.contains_inclusive(offset) {
+            Some(DocumentPosition::new(
+                head.into_node_id(),
+                offset - region.start,
+                affinity,
+            ))
+        } else {
+            self.position_for_offset(offset, affinity).ok()
+        }
     }
 
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
@@ -2004,18 +2322,53 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     fn move_selection_head(&mut self, offset: usize, extend: bool, cx: &mut Context<Self>) {
+        let position = self
+            .model
+            .position_for_anchor(self.model.selection.head())
+            .ok()
+            .and_then(|position| {
+                let region = self.region(position.node_id())?.range();
+                region.contains_inclusive(offset).then(|| {
+                    DocumentPosition::new(
+                        position.into_node_id(),
+                        offset - region.start,
+                        Affinity::After,
+                    )
+                })
+            })
+            .or_else(|| self.position_for_offset(offset, Affinity::After).ok());
+        if let Some(position) = position {
+            self.move_selection_to_position(position, extend, cx);
+        }
+    }
+
+    fn move_selection_to_position(
+        &mut self,
+        position: DocumentPosition<I>,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
         if extend {
-            let (anchor, _) = self.model.selection_offsets();
-            self.model.replace_selection(anchor, offset);
+            let Ok(anchor) = self
+                .model
+                .position_for_anchor(self.model.selection.anchor())
+            else {
+                return;
+            };
+            self.model
+                .replace_selection_positions(anchor, position)
+                .expect("navigation positions must resolve");
         } else {
-            self.model.collapse_selection(offset);
+            self.model
+                .replace_selection_positions(position.clone(), position)
+                .expect("navigation position must resolve");
         }
         self.request_caret_reveal(cx);
         cx.emit(DocumentEvent::SelectionChanged);
         cx.notify();
     }
 
-    fn vertical_offset(&self, down: bool, page: bool) -> usize {
+    fn vertical_position(&self, down: bool, page: bool) -> Option<DocumentPosition<I>> {
         let range = self.model.selected_range();
         let cursor = if range.is_empty() {
             self.model.cursor()
@@ -2024,13 +2377,17 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         } else {
             range.start
         };
-        let Some(display) = self.model.source_to_display(cursor, Affinity::After) else {
-            return cursor;
+        let cursor = if cursor == self.model.cursor() {
+            self.model
+                .position_for_anchor(self.model.selection.head())
+                .ok()?
+        } else {
+            self.position_for_offset(cursor, Affinity::After).ok()?
         };
         let Some((position, line_height, item_ix, bounds)) =
-            self.text_position_for_display(display, Affinity::After)
+            self.text_position_for_position(&cursor)
         else {
-            return cursor;
+            return Some(cursor);
         };
         let distance = if page {
             self.list_state
@@ -2061,10 +2418,16 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                 } else {
                     record.bounds.bottom() - record.layout.line_height() / 2.
                 };
-                return self.offset_for_point(point(position.x, y));
+                return self.position_for_point(point(position.x, y));
             }
         }
-        self.offset_for_point(point(position.x, y))
+        self.position_for_point(point(position.x, y))
+    }
+
+    fn move_vertical(&mut self, down: bool, page: bool, extend: bool, cx: &mut Context<Self>) {
+        if let Some(position) = self.vertical_position(down, page) {
+            self.move_selection_to_position(position, extend, cx);
+        }
     }
 
     fn move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -2098,27 +2461,27 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selection_head(self.vertical_offset(false, false), false, cx);
+        self.move_vertical(false, false, false, cx);
     }
 
     fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selection_head(self.vertical_offset(true, false), false, cx);
+        self.move_vertical(true, false, false, cx);
     }
 
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selection_head(self.vertical_offset(false, false), true, cx);
+        self.move_vertical(false, false, true, cx);
     }
 
     fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selection_head(self.vertical_offset(true, false), true, cx);
+        self.move_vertical(true, false, true, cx);
     }
 
     fn move_page_up(&mut self, _: &MovePageUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selection_head(self.vertical_offset(false, true), false, cx);
+        self.move_vertical(false, true, false, cx);
     }
 
     fn move_page_down(&mut self, _: &MovePageDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selection_head(self.vertical_offset(true, true), false, cx);
+        self.move_vertical(true, true, false, cx);
     }
 
     fn move_home(&mut self, _: &MoveHome, _: &mut Window, cx: &mut Context<Self>) {
@@ -2319,11 +2682,19 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     fn offset_for_point(&self, point: Point<Pixels>) -> usize {
+        self.position_for_point(point)
+            .and_then(|position| self.resolve_position(&position).ok())
+            .unwrap_or_else(|| self.model.cursor())
+    }
+
+    fn position_for_point(&self, point: Point<Pixels>) -> Option<DocumentPosition<I>> {
         if self
             .trailer_layout
             .is_some_and(|(_, bounds)| point.y >= bounds.top())
         {
-            return self.model.text.len();
+            return self
+                .position_for_offset(self.model.text.len(), Affinity::After)
+                .ok();
         }
 
         // Typography and host wrappers leave gaps between text layouts. Those
@@ -2350,19 +2721,44 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                     .then_with(|| a.1.cmp(&b.1))
             });
         match nearest {
-            Some((_, _, Some(record), _)) => self.text_offset_for_point(record, point),
+            Some((_, _, Some(record), _)) => self.text_position_for_point(record, point),
             Some((_, _, _, Some(record))) => {
                 if point.y < record.bounds.center().y {
-                    record.source.start
+                    self.position_for_offset(record.source.start, Affinity::After)
+                        .ok()
                 } else {
-                    record.source.end
+                    self.position_for_offset(record.source.end, Affinity::Before)
+                        .ok()
                 }
             }
-            _ => self.model.cursor(),
+            _ => self
+                .model
+                .position_for_anchor(self.model.selection.head())
+                .ok(),
         }
     }
 
-    fn text_offset_for_point(&self, record: &TextLayoutRecord, point: Point<Pixels>) -> usize {
+    fn text_position_for_point(
+        &self,
+        record: &TextLayoutRecord,
+        point: Point<Pixels>,
+    ) -> Option<DocumentPosition<I>> {
+        let DocumentLayoutItem::Text {
+            source, node_id, ..
+        } = self.layout_items.get(record.item_ix)?
+        else {
+            return None;
+        };
+        if source.is_empty()
+            && let Some(node_id) = node_id
+        {
+            let region = self.region(node_id)?.range();
+            return Some(DocumentPosition::new(
+                node_id.clone(),
+                source.start - region.start,
+                Affinity::After,
+            ));
+        }
         let local = if point.y < record.bounds.top() {
             0
         } else if point.y >= record.bounds.bottom() {
@@ -2384,9 +2780,20 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         } else {
             Affinity::After
         };
-        self.model
+        let offset = self
+            .model
             .display_to_source(record.display.start + local, affinity)
             .expect("laid out display positions map to source")
+            .clamp(source.start, source.end);
+        self.position_for_offset(
+            offset,
+            if offset == self.model.text.len() {
+                Affinity::After
+            } else {
+                affinity
+            },
+        )
+        .ok()
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2403,14 +2810,20 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.clear_pending_viewport_anchor();
         self.caret_reveal_pending = false;
         self.focus_handle.focus(window, cx);
-        let offset = self.offset_for_point(event.position);
+        let Some(position) = self.position_for_point(event.position) else {
+            return;
+        };
         let anchor = if event.modifiers.shift {
-            self.model.selection_offsets().0
+            self.model
+                .position_for_anchor(self.model.selection.anchor())
+                .unwrap_or_else(|_| position.clone())
         } else {
-            offset
+            position.clone()
         };
         self.auto_scroll.last_drag_position = Some(event.position);
-        self.model.replace_selection(anchor, offset);
+        self.model
+            .replace_selection_positions(anchor, position)
+            .expect("hit-tested positions must resolve");
         cx.emit(DocumentEvent::SelectionChanged);
         cx.notify();
     }
@@ -2451,12 +2864,27 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         };
         let viewport = self.list_state.viewport_bounds();
         point.y = point.y.clamp(viewport.top(), viewport.bottom());
-        let head = self.offset_for_point(point);
+        let Some(head) = self.position_for_point(point) else {
+            return;
+        };
         // The selection anchor is already tracked through host transactions.
         // Keeping another raw byte offset here would drift during streaming.
-        let (anchor, previous_head) = self.model.selection_offsets();
-        if head != previous_head {
-            self.model.replace_selection(anchor, head);
+        let Ok(anchor) = self
+            .model
+            .position_for_anchor(self.model.selection.anchor())
+        else {
+            return;
+        };
+        if self
+            .model
+            .position_for_anchor(self.model.selection.head())
+            .ok()
+            .as_ref()
+            != Some(&head)
+        {
+            self.model
+                .replace_selection_positions(anchor, head)
+                .expect("drag positions must resolve");
             cx.emit(DocumentEvent::SelectionChanged);
             cx.notify();
         }
@@ -2477,16 +2905,27 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             return;
         }
         let probe = point(viewport.left(), viewport.top() + gpui::px(1.));
-        let offset = self.offset_for_point(probe);
+        let Some(position) = self.position_for_point(probe) else {
+            return;
+        };
+        let Ok(offset) = self.resolve_position(&position) else {
+            return;
+        };
         let viewport_y = self
-            .screen_position_for_source(offset, Affinity::After)
-            .map_or(probe.y, |position| position.y);
+            .text_position_for_position(&position)
+            .map_or(probe.y, |(point, _, _, _)| point.y);
         self.pending_viewport_anchor = Some(PendingViewportAnchor {
-            anchor: self.model.anchors.create(offset, AnchorBias::Right),
+            anchor: self.model.anchors.create_for_node(
+                offset,
+                AnchorBias::Right,
+                Some(position.node_id().clone()),
+                position.affinity(),
+            ),
             viewport_y,
         });
     }
 
+    #[cfg(test)]
     fn screen_position_for_source(
         &self,
         source: usize,
@@ -2495,6 +2934,53 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         let display = self.model.source_to_display(source, affinity)?;
         self.text_position_for_display(display, affinity)
             .map(|(position, _, _, _)| position)
+    }
+
+    fn text_item_for_position(&self, position: &DocumentPosition<I>) -> Option<usize> {
+        let offset = self.resolve_position(position).ok()?;
+        let mut fallback = None;
+        let mut owned = None;
+        for (ix, item) in self.layout_items.iter().enumerate() {
+            let DocumentLayoutItem::Text {
+                source, node_id, ..
+            } = item
+            else {
+                continue;
+            };
+            let same_node = node_id.as_ref() == Some(position.node_id());
+            if !source.contains_inclusive(offset) || (source.is_empty() && !same_node) {
+                continue;
+            }
+            if fallback.is_none() || position.affinity() == Affinity::After {
+                fallback = Some(ix);
+            }
+            if same_node && (owned.is_none() || position.affinity() == Affinity::After) {
+                owned = Some(ix);
+            }
+        }
+        owned.or(fallback)
+    }
+
+    fn text_position_for_position(
+        &self,
+        position: &DocumentPosition<I>,
+    ) -> Option<(Point<Pixels>, Pixels, usize, Bounds<Pixels>)> {
+        let source = self.resolve_position(position).ok()?;
+        let display = self.model.source_to_display(source, position.affinity())?;
+        let item_ix = self.text_item_for_position(position)?;
+        let record = self
+            .text_layouts
+            .iter()
+            .find(|record| record.item_ix == item_ix)?;
+        let local = display.clamp(record.display.start, record.display.end) - record.display.start;
+        record.layout.position_for_index(local).map(|position| {
+            (
+                position,
+                record.layout.line_height(),
+                item_ix,
+                record.bounds,
+            )
+        })
     }
 
     fn text_position_for_display(
@@ -2573,14 +3059,10 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         let Some(pending) = self.pending_viewport_anchor.as_ref() else {
             return;
         };
-        let Some(offset) = self.model.anchors.resolve(pending.anchor) else {
+        let Ok(position) = self.model.position_for_anchor(pending.anchor) else {
             return;
         };
-        let Some(display) = self.model.source_to_display(offset, Affinity::After) else {
-            return;
-        };
-        let Some((position, _, _, _)) = self.text_position_for_display(display, Affinity::After)
-        else {
+        let Some((position, _, _, _)) = self.text_position_for_position(&position) else {
             return;
         };
         let pending = self
@@ -2654,16 +3136,11 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         if !self.caret_reveal_pending {
             return;
         }
-        let Some(display) = self
-            .model
-            .source_to_display(self.model.cursor(), Affinity::After)
-        else {
+        let Ok(caret) = self.model.position_for_anchor(self.model.selection.head()) else {
             return;
         };
-        let Some((position, line_height, _, _)) =
-            self.text_position_for_display(display, Affinity::After)
-        else {
-            if let Some(item_ix) = self.text_item_for_display(display, Affinity::After) {
+        let Some((position, line_height, _, _)) = self.text_position_for_position(&caret) else {
+            if let Some(item_ix) = self.text_item_for_position(&caret) {
                 if self.list_state.bounds_for_item(item_ix).is_some() {
                     self.list_state.scroll_to_reveal_item(item_ix);
                 } else {
@@ -2919,9 +3396,14 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         };
         let cursor = self
             .model
-            .source_to_display(self.model.cursor(), Affinity::After)
-            .filter(|cursor| self.text_item_for_display(*cursor, Affinity::After) == Some(item_ix))
-            .map(|cursor| cursor - display.start);
+            .position_for_anchor(self.model.selection.head())
+            .ok()
+            .filter(|position| self.text_item_for_position(position) == Some(item_ix))
+            .and_then(|position| {
+                self.model
+                    .source_to_display(self.model.cursor(), position.affinity())
+            })
+            .map(|cursor| cursor.clamp(display.start, display.end) - display.start);
         (self.focus_handle.clone(), selected_range, cursor)
     }
 
@@ -2939,23 +3421,17 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         {
             DocumentLayoutItem::Text {
                 display,
+                source,
+                node_id,
                 text,
                 presentation,
             } => {
-                let source_start = self
-                    .model
-                    .display_to_source(display.start, Affinity::After)
-                    .unwrap_or(0);
-                let source_end = self
-                    .model
-                    .display_to_source(display.end, Affinity::After)
-                    .unwrap_or(self.model.text.len());
-                if let Ok(position) = self.position_for_offset(source_start, Affinity::After) {
-                    let region = self.region(position.node_id()).map(DocumentRegion::range);
+                if let Some(node_id) = node_id {
+                    let region = self.region(node_id).map(DocumentRegion::range);
                     text_context = Some(DocumentTextContext {
-                        node_id: position.node_id().clone(),
-                        source: source_start..source_end,
-                        first_line: region.is_some_and(|region| source_start <= region.start),
+                        node_id: node_id.clone(),
+                        source: source.clone(),
+                        first_line: region.is_some_and(|region| source.start <= region.start),
                     });
                 }
                 DocumentChild::Text {
@@ -3095,7 +3571,18 @@ impl<I: Clone + Eq + 'static> EntityInputHandler for DocumentState<I> {
         } else {
             marked.end..marked.end
         };
-        self.model.replace_selection(selected.start, selected.end);
+        let node = self
+            .model
+            .position_for_anchor(self.model.selection.head())
+            .ok();
+        if let Some(index) = node
+            .as_ref()
+            .and_then(|position| self.model.region_index(position.node_id()))
+        {
+            let start = self.model.regions.as_slice()[index].range().start;
+            self.model
+                .select_in_region(index, selected.start - start, selected.end - start);
+        }
         cx.emit(DocumentEvent::SelectionChanged);
         cx.notify();
     }
@@ -3121,10 +3608,18 @@ impl<I: Clone + Eq + 'static> EntityInputHandler for DocumentState<I> {
         let end_item = self
             .text_item_for_display(end_display, Affinity::After)
             .unwrap_or_else(|| self.layout_item_for_source(source.end));
-        let (start, line_height, _, _) =
-            self.text_position_for_display_in_item(start_display, start_affinity, start_item)?;
-        let (mut end, _, _, _) =
-            self.text_position_for_display_in_item(end_display, Affinity::After, end_item)?;
+        let (start, line_height, _, _) = self
+            .input_position_for_offset(source.start, start_affinity)
+            .and_then(|position| self.text_position_for_position(&position))
+            .or_else(|| {
+                self.text_position_for_display_in_item(start_display, start_affinity, start_item)
+            })?;
+        let (mut end, _, _, _) = self
+            .input_position_for_offset(source.end, Affinity::After)
+            .and_then(|position| self.text_position_for_position(&position))
+            .or_else(|| {
+                self.text_position_for_display_in_item(end_display, Affinity::After, end_item)
+            })?;
         end.y = start.y;
         Some(Bounds::from_corners(
             start,
@@ -3152,7 +3647,16 @@ impl<I: Clone + Eq + 'static> EntityInputHandler for DocumentState<I> {
         cx: &mut Context<Self>,
     ) {
         let range = self.range_from_utf16(&range_utf16);
-        self.model.replace_selection(range.start, range.end);
+        if let (Some(anchor), Some(head)) = (
+            self.input_position_for_offset(range.start, Affinity::After),
+            self.input_position_for_offset(range.end, Affinity::Before),
+        ) {
+            self.model
+                .replace_selection_positions(anchor, head)
+                .expect("platform selection must resolve");
+        } else {
+            self.model.replace_selection(range.start, range.end);
+        }
         cx.emit(DocumentEvent::SelectionChanged);
         cx.notify();
     }
@@ -3331,7 +3835,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            model.route_and_apply(&transaction),
+            model.route_and_apply(&transaction, None),
             RoutingOutcome::Applied
         ));
         assert_eq!(model.text(), "history draft");
@@ -3352,7 +3856,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            model.route_and_apply(&transaction),
+            model.route_and_apply(&transaction, None),
             RoutingOutcome::Rejected(DocumentEditRejection::Readonly)
         ));
         assert_eq!(model.text(), "history");
@@ -3375,7 +3879,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            model.route_and_apply(&transaction),
+            model.route_and_apply(&transaction, None),
             RoutingOutcome::Routed("resend")
         ));
         assert_eq!(model.text(), "old user");
@@ -3386,6 +3890,173 @@ mod tests {
         let range = 4..4;
         assert_eq!(transform_offset(4, AnchorBias::Left, &range, 3), 4);
         assert_eq!(transform_offset(4, AnchorBias::Right, &range, 3), 7);
+    }
+
+    #[gpui::test]
+    fn empty_middle_text_keeps_its_identity_through_input_host_updates_and_undo(
+        cx: &mut TestAppContext,
+    ) {
+        let (document, mut cx) = document_view(cx);
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.set_block_renderer(|_, _, _| div().h(px(60.)).into_any_element(), cx);
+                document
+                    .reset(
+                        DocumentSnapshot::new(
+                            "h\n中\u{fffc}tail",
+                            vec![
+                                DocumentRegion::new("history", 0..2, EditPolicy::Readonly),
+                                DocumentRegion::new("before", 2..5, EditPolicy::Editable),
+                                DocumentRegion::new("object", 5..8, EditPolicy::Atomic),
+                                DocumentRegion::new("after", 8..12, EditPolicy::Editable),
+                            ],
+                            DocumentProjection::new(12, vec![ProjectionSpan::hide(5..8)]).unwrap(),
+                            vec![DocumentBlock::new("object", 5..8)],
+                            DocumentStyles::default(),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+                document.set_selection(2..5, false, cx);
+                document.replace_text_in_range(None, "", window, cx);
+                assert_eq!(document.region(&"before").unwrap().range(), 2..2);
+                assert_eq!(
+                    document.selected_positions().unwrap().1.node_id(),
+                    &"before"
+                );
+
+                let host = EditTransaction::new(
+                    document.revision(),
+                    EditOrigin::Host,
+                    vec![TextEdit::new(0..0, "x\n")],
+                    document.text().len(),
+                )
+                .unwrap();
+                document
+                    .apply_host_transaction_with_presentation(
+                        host,
+                        vec![
+                            DocumentRegion::new("history", 0..4, EditPolicy::Readonly),
+                            DocumentRegion::new("before", 4..4, EditPolicy::Editable),
+                            DocumentRegion::new("object", 4..7, EditPolicy::Atomic),
+                            DocumentRegion::new("after", 7..11, EditPolicy::Editable),
+                        ],
+                        DocumentProjection::new(11, vec![ProjectionSpan::hide(4..7)]).unwrap(),
+                        vec![DocumentBlock::new("object", 4..7)],
+                        cx,
+                    )
+                    .unwrap();
+                assert_eq!(document.selected_range(), 4..4);
+                assert_eq!(
+                    document.selected_positions().unwrap().1.node_id(),
+                    &"before"
+                );
+                document.replace_and_mark_text_in_range(None, "n", Some(1..1), window, cx);
+                document.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, cx);
+                document.replace_text_in_range(None, "你", window, cx);
+                assert_eq!(document.text(), "x\nh\n你\u{fffc}tail");
+                assert_eq!(document.model.blocks[0].source(), 7..10);
+                document.undo(&Undo, window, cx);
+                assert_eq!(document.region_text(&"before").as_deref(), Some(""));
+                document.undo(&Undo, window, cx);
+                assert_eq!(document.region_text(&"before").as_deref(), Some("中"));
+                document.redo(&Redo, window, cx);
+                assert_eq!(document.region_text(&"before").as_deref(), Some(""));
+                document.redo(&Redo, window, cx);
+                assert_eq!(document.region_text(&"before").as_deref(), Some("你"));
+                assert_eq!(document.region_text(&"after").as_deref(), Some("tail"));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn empty_text_rows_keep_pointer_caret_and_ime_ownership_between_objects(
+        cx: &mut TestAppContext,
+    ) {
+        let (document, mut cx) = document_view(cx);
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document
+                    .set_block_renderer(|_, _, _| div().h(px(50.)).w_full().into_any_element(), cx);
+                document
+                    .reset(
+                        DocumentSnapshot::new(
+                            "\u{fffc}\u{fffc}tail",
+                            vec![
+                                DocumentRegion::new("left", 0..0, EditPolicy::Editable),
+                                DocumentRegion::new("first", 0..3, EditPolicy::Atomic),
+                                DocumentRegion::new("middle", 3..3, EditPolicy::Editable),
+                                DocumentRegion::new("second", 3..6, EditPolicy::Atomic),
+                                DocumentRegion::new("right", 6..10, EditPolicy::Editable),
+                            ],
+                            DocumentProjection::new(
+                                10,
+                                vec![ProjectionSpan::hide(0..3), ProjectionSpan::hide(3..6)],
+                            )
+                            .unwrap(),
+                            vec![
+                                DocumentBlock::new("first", 0..3),
+                                DocumentBlock::new("second", 3..6),
+                            ],
+                            DocumentStyles::default(),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            });
+            let _ = window.draw(cx);
+        });
+        for id in ["left", "middle"] {
+            let click = document.read_with(&cx, |document, _| {
+                let position = DocumentPosition::new(id, 0, Affinity::After);
+                let (_, line_height, _, bounds) =
+                    document.text_position_for_position(&position).unwrap();
+                point(bounds.left() + px(1.), bounds.top() + line_height / 2.)
+            });
+            cx.simulate_click(click, Modifiers::default());
+            cx.update(|window, cx| {
+                document.update(cx, |document, cx| {
+                    assert_eq!(document.selected_positions().unwrap().1.node_id(), &id);
+                    let item = document
+                        .text_item_for_position(&DocumentPosition::new(id, 0, Affinity::After))
+                        .unwrap();
+                    let painted = document
+                        .text_layouts
+                        .iter()
+                        .filter(|record| {
+                            document
+                                .segment_paint_snapshot(record.item_ix, &record.display)
+                                .2
+                                .is_some()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(painted.len(), 1);
+                    assert_eq!(painted[0].item_ix, item);
+                    let expected = painted[0].layout.position_for_index(0).unwrap();
+                    let utf16 = document
+                        .model
+                        .text
+                        .offset_to_offset_utf16(document.model.cursor());
+                    let bounds = document
+                        .bounds_for_range(utf16..utf16, document.last_bounds.unwrap(), window, cx)
+                        .unwrap();
+                    assert_eq!(bounds.origin, expected);
+                });
+            });
+            cx.simulate_keystrokes("x y backspace backspace");
+            document.read_with(&cx, |document, _| {
+                assert_eq!(document.region_text(&id).as_deref(), Some(""));
+                assert_eq!(document.selected_positions().unwrap().1.node_id(), &id);
+                assert_eq!(document.text(), "\u{fffc}\u{fffc}tail");
+                validate_blocks(
+                    &document.model.blocks,
+                    &document.model.regions,
+                    &document.model.projection,
+                    document.model.text.len(),
+                )
+                .unwrap();
+            });
+        }
     }
 
     #[gpui::test]

@@ -154,12 +154,17 @@ Domain concepts do not become variants in Base. A consumer may interpret one
 routed region as resend, another as comment reply, and an atomic block as an
 input handoff.
 
-Readonly and routed regions may be zero-width so an empty history node can
-retain stable identity for reveal and follow. A zero-width editable region must
-be the final region: the current input router resolves mutation targets from a
-source selection, so it cannot disambiguate an empty editable node from a
-following block at the same offset. Atomic blocks always occupy an object
-replacement marker.
+Text regions may be zero-width, including between atomic blocks. Clearing text
+preserves the region ID, selection ownership and undo target. Selection anchors
+retain node identity and affinity alongside their tracked source offsets, so an
+empty text node and an adjacent object can share an offset without sharing an
+input target. `set_selection_positions` preserves that identity for application
+navigation and restoration. Atomic blocks occupy an object replacement marker.
+
+Empty editable nodes before other content have a text layout row. Hit testing,
+caret paint and platform input geometry resolve through that row's source extent
+and node identity. User transactions validate their resulting region ranges and
+UTF-8 edit boundaries before changing text, anchors or presentation.
 
 An edit crossing incompatible policies is rejected as one operation. Base does
 not silently apply the editable subset, because that changes deletion, paste,

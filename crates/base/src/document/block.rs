@@ -127,16 +127,22 @@ pub(crate) fn transform_blocks<I: Clone>(
             for edit in edits {
                 let edit_range = edit.range();
                 source.start =
-                    transform_offset(source.start, &edit_range, edit.replacement().len());
-                source.end = transform_offset(source.end, &edit_range, edit.replacement().len());
+                    transform_offset(source.start, true, &edit_range, edit.replacement().len());
+                source.end =
+                    transform_offset(source.end, false, &edit_range, edit.replacement().len());
             }
             DocumentBlock::new(block.id().clone(), source)
         })
         .collect()
 }
 
-fn transform_offset(offset: usize, range: &Range<usize>, replacement_len: usize) -> usize {
-    if offset <= range.start {
+fn transform_offset(
+    offset: usize,
+    after: bool,
+    range: &Range<usize>,
+    replacement_len: usize,
+) -> usize {
+    if offset < range.start || (offset == range.start && !after) {
         offset
     } else if offset >= range.end {
         if replacement_len >= range.len() {

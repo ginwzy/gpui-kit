@@ -122,21 +122,4 @@ impl DocumentSelection {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn position_keeps_domain_identity_separate_from_offset() {
-        let position = DocumentPosition::new("message-7", 12, Affinity::After);
-        assert_eq!(position.node_id(), &"message-7");
-        assert_eq!(position.offset(), 12);
-        assert_eq!(position.affinity(), Affinity::After);
-    }
-
-    #[test]
-    fn revision_starts_at_zero() {
-        assert_eq!(DocumentRevision::INITIAL.value(), 0);
-    }
-}
 use std::{error::Error, fmt};

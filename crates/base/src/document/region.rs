@@ -65,15 +65,6 @@ impl<I: Eq> DocumentRegions<I> {
                 .then_with(|| left.range.end.cmp(&right.range.end))
         });
 
-        for (index, region) in regions.iter().enumerate() {
-            if region.range.is_empty()
-                && region.policy == EditPolicy::Editable
-                && index + 1 != regions.len()
-            {
-                return Err(RegionError::ZeroWidthEditableRegionMustBeLast { index });
-            }
-        }
-
         for (index, pair) in regions.windows(2).enumerate() {
             if pair[0].range.end > pair[1].range.start {
                 return Err(RegionError::Overlap {
@@ -101,7 +92,6 @@ pub enum RegionError {
     OutOfBounds { index: usize, source_len: usize },
     DuplicateId { index: usize },
     Overlap { left: usize, right: usize },
-    ZeroWidthEditableRegionMustBeLast { index: usize },
 }
 
 impl fmt::Display for RegionError {
@@ -119,12 +109,6 @@ impl fmt::Display for RegionError {
             Self::DuplicateId { index } => write!(formatter, "region {index} repeats an id"),
             Self::Overlap { left, right } => {
                 write!(formatter, "regions {left} and {right} overlap")
-            }
-            Self::ZeroWidthEditableRegionMustBeLast { index } => {
-                write!(
-                    formatter,
-                    "zero-width editable region {index} is not trailing"
-                )
             }
         }
     }
@@ -165,23 +149,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(regions.as_slice()[1].id(), &"empty");
-    }
-
-    #[test]
-    fn non_trailing_zero_width_editable_region_is_rejected() {
-        let error = DocumentRegions::new(
-            vec![
-                DocumentRegion::new("draft", 4..4, EditPolicy::Editable),
-                DocumentRegion::new("after", 4..8, EditPolicy::Readonly),
-            ],
-            8,
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            error,
-            RegionError::ZeroWidthEditableRegionMustBeLast { index: 0 }
-        );
     }
 
     #[test]
