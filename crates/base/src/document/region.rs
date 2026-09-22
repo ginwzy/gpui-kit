@@ -88,6 +88,7 @@ impl<I: Eq> DocumentRegions<I> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegionError {
+    InvalidBoundary { index: usize },
     InvalidRange { index: usize },
     OutOfBounds { index: usize, source_len: usize },
     DuplicateId { index: usize },
@@ -97,6 +98,9 @@ pub enum RegionError {
 impl fmt::Display for RegionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidBoundary { index } => {
+                write!(formatter, "region {index} is not on UTF-8 boundaries")
+            }
             Self::InvalidRange { index } => {
                 write!(formatter, "region {index} has an invalid range")
             }

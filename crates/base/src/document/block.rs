@@ -123,36 +123,12 @@ pub(crate) fn transform_blocks<I: Clone>(
     blocks
         .iter()
         .map(|block| {
-            let mut source = block.source();
-            for edit in edits {
-                let edit_range = edit.range();
-                source.start =
-                    transform_offset(source.start, true, &edit_range, edit.replacement().len());
-                source.end =
-                    transform_offset(source.end, false, &edit_range, edit.replacement().len());
-            }
-            DocumentBlock::new(block.id().clone(), source)
+            DocumentBlock::new(
+                block.id().clone(),
+                super::position::transform_source_range(block.source(), edits),
+            )
         })
         .collect()
-}
-
-fn transform_offset(
-    offset: usize,
-    after: bool,
-    range: &Range<usize>,
-    replacement_len: usize,
-) -> usize {
-    if offset < range.start || (offset == range.start && !after) {
-        offset
-    } else if offset >= range.end {
-        if replacement_len >= range.len() {
-            offset.saturating_add(replacement_len - range.len())
-        } else {
-            offset.saturating_sub(range.len() - replacement_len)
-        }
-    } else {
-        range.start + replacement_len
-    }
 }
 
 #[cfg(test)]

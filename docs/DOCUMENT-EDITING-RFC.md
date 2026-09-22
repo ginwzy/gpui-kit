@@ -227,7 +227,27 @@ the base transaction.
 
 User edits and IME composition participate in user undo. A composition opens
 one transaction, refinements replace its marked range, and commit or cancel
-closes it. A rejected composition does not partially modify the document.
+closes it. Rejected and routed requests preserve the marked range, selection,
+revision and undo grouping. The public `apply_transaction` accepts only User,
+Paste and Composition; all successful input paths finish selection and undo
+before emitting change events. Host, Undo and Redo use dedicated paths.
+
+Undo stores local removed/inserted text relative to a stable region ID and
+node-relative selections. Adjacent typing and deletion coalesce until navigation,
+an explicit selection, a different edit intent or a resource limit ends the
+group. Composition refinements coalesce into one record. Replay validates a
+tentative model before replacing live state, so a failed replay is atomic.
+History retains at most 1,000 records, 1,000 changes per record and 16 MiB of
+allocated text buffers across undo and redo, including unused string capacity.
+Oldest records are evicted first; a single
+edit exceeding the limits is applied but starts a history boundary and is not
+retained. No keystroke captures a complete editable region.
+
+Model entry points validate UTF-8 boundaries against the actual Rope for
+regions, positions, user/host edits and all projection spans. Edits transform
+styles, projection spans and blocks together and validate the next presentation
+before writing text or anchors. An edit that destroys a required paragraph
+style boundary is rejected without changing input state.
 
 Host projection updates use a separate entry point:
 
@@ -297,6 +317,15 @@ receive moves/releases outside the viewport, and reuse `AutoScroll` at viewport
 edges. Hit testing after scrolling runs after the new visible layout is ready.
 Applications may scope the existing SelectAll action to a domain text region
 by setting the one document selection; Base's default remains document-wide.
+
+Consecutive vertical moves retain their preferred x in `DocumentState`, even
+across a shorter line. Horizontal moves, explicit selection, pointer input,
+editing, reset and changes to layout width/style end this sequence. Platform
+IME geometry preserves the single-caret rectangle; ranges spanning visual
+lines return a valid rectangle at the first caret instead of a negative width.
+Hit testing compares the shaped glyph boundaries and the final caret on the
+target visual line. Small floating-point errors near the last glyph must not
+advance navigation or pointer selection directly to the line end.
 
 Application render callbacks are side-effect-free. Model changes and block
 measurement feedback occur through explicit update paths, never by mutating

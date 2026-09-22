@@ -24,6 +24,17 @@ impl DocumentStyles {
     pub fn is_empty(&self) -> bool {
         self.paragraphs.is_empty() && self.inline.is_empty()
     }
+
+    pub(super) fn transformed(&self, edits: &[super::TextEdit]) -> Self {
+        let mut styles = self.clone();
+        for style in &mut styles.paragraphs {
+            style.source = super::position::transform_source_range(style.source.clone(), edits);
+        }
+        for style in &mut styles.inline {
+            style.source = super::position::transform_source_range(style.source.clone(), edits);
+        }
+        styles
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

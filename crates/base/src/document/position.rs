@@ -1,3 +1,5 @@
+use std::{error::Error, fmt, ops::Range};
+
 /// Which side of an ambiguous visual or structural boundary a position uses.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Affinity {
@@ -50,6 +52,7 @@ impl<N> DocumentPosition<N> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PositionError {
+    InvalidBoundary { offset: usize },
     SourceOffsetOutOfBounds { offset: usize, source_len: usize },
     NodeNotFound,
     NodeOffsetOutOfBounds { offset: usize, node_len: usize },
@@ -58,6 +61,9 @@ pub enum PositionError {
 impl fmt::Display for PositionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidBoundary { offset } => {
+                write!(formatter, "offset {offset} is not on a UTF-8 boundary")
+            }
             Self::SourceOffsetOutOfBounds { offset, source_len } => write!(
                 formatter,
                 "source offset {offset} exceeds document length {source_len}"
@@ -122,4 +128,69 @@ impl DocumentSelection {
     }
 }
 
-use std::{error::Error, fmt};
+pub(super) fn transform_offset(
+    offset: usize,
+    bias: AnchorBias,
+    range: &Range<usize>,
+    replacement_len: usize,
+) -> usize {
+    if range.is_empty() {
+        return if offset < range.start {
+            offset
+        } else if offset > range.start {
+            shift_offset(offset, replacement_len as isize)
+        } else if bias == AnchorBias::Right {
+            range.start + replacement_len
+        } else {
+            range.start
+        };
+    }
+
+    if offset < range.start {
+        offset
+    } else if offset > range.end {
+        shift_offset(offset, replacement_len as isize - range.len() as isize)
+    } else if offset == range.end {
+        range.start + replacement_len
+    } else if bias == AnchorBias::Right {
+        range.start + replacement_len
+    } else {
+        range.start
+    }
+}
+
+pub(super) fn shift_offset(offset: usize, delta: isize) -> usize {
+    if delta >= 0 {
+        offset.saturating_add(delta as usize)
+    } else {
+        offset.saturating_sub(delta.unsigned_abs())
+    }
+}
+
+// Descriptors outside editable source use right-biased starts and left-biased
+// ends, so insertion at either edge cannot swallow neighboring text.
+pub(super) fn transform_source_range(
+    mut range: Range<usize>,
+    edits: &[super::TextEdit],
+) -> Range<usize> {
+    for edit in edits {
+        let was_empty = range.is_empty();
+        range.start = transform_offset(
+            range.start,
+            AnchorBias::Right,
+            &edit.range(),
+            edit.replacement().len(),
+        );
+        range.end = if was_empty {
+            range.start
+        } else {
+            transform_offset(
+                range.end,
+                AnchorBias::Left,
+                &edit.range(),
+                edit.replacement().len(),
+            )
+        };
+    }
+    range
+}

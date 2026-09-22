@@ -30,6 +30,7 @@ use super::{
     EditTransaction, PositionError, ProjectionError, RegionError, TextEdit, TransactionError,
     block::{transform_blocks, validate_blocks},
     element::DocumentChild,
+    position::{shift_offset, transform_offset},
     projection::ProjectionMap,
 };
 
@@ -37,6 +38,7 @@ const DOCUMENT_INPUT_CONTEXT: &str = "Input";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentEditRejection {
+    InvalidOrigin,
     StaleRevision,
     OutsideRegion,
     CrossesRegions,
@@ -44,11 +46,13 @@ pub enum DocumentEditRejection {
     Atomic,
     InvalidBoundary,
     InvalidRegions,
+    InvalidPresentation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostTransactionError {
     InvalidOrigin,
+    InvalidEditRange(Range<usize>),
     StaleRevision,
     TouchesEditableRegion,
     InvalidRegions(RegionError),
@@ -64,6 +68,10 @@ pub enum HostTransactionError {
 impl fmt::Display for HostTransactionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidEditRange(range) => write!(
+                formatter,
+                "host edit range {range:?} is outside the source or not on UTF-8 boundaries"
+            ),
             Self::InvalidOrigin => {
                 formatter.write_str("host transaction must use EditOrigin::Host")
             }
@@ -218,7 +226,7 @@ impl<I> DocumentSnapshot<I> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct AnchorRecord<I> {
     offset: usize,
     bias: AnchorBias,
@@ -226,7 +234,7 @@ struct AnchorRecord<I> {
     affinity: Affinity,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct AnchorStore<I> {
     next_id: u64,
     anchors: BTreeMap<DocumentAnchor, AnchorRecord<I>>,
@@ -278,45 +286,6 @@ impl<I> AnchorStore<I> {
     }
 }
 
-fn transform_offset(
-    offset: usize,
-    bias: AnchorBias,
-    range: &Range<usize>,
-    replacement_len: usize,
-) -> usize {
-    if range.is_empty() {
-        return if offset < range.start {
-            offset
-        } else if offset > range.start {
-            shift_offset(offset, replacement_len as isize)
-        } else if bias == AnchorBias::Right {
-            range.start + replacement_len
-        } else {
-            range.start
-        };
-    }
-
-    if offset < range.start {
-        offset
-    } else if offset > range.end {
-        shift_offset(offset, replacement_len as isize - range.len() as isize)
-    } else if offset == range.end {
-        range.start + replacement_len
-    } else if bias == AnchorBias::Right {
-        range.start + replacement_len
-    } else {
-        range.start
-    }
-}
-
-fn shift_offset(offset: usize, delta: isize) -> usize {
-    if delta >= 0 {
-        offset.saturating_add(delta as usize)
-    } else {
-        offset.saturating_sub(delta.unsigned_abs())
-    }
-}
-
 enum RoutingOutcome<I> {
     Applied,
     Routed(I),
@@ -335,20 +304,48 @@ struct RegionSelection<I> {
     selection: RelativeSelection,
 }
 
+// A record owns only replaced text, in region-relative coordinates. Multiple
+// changes are in application order; undo replays them in reverse.
+#[derive(Clone, Debug)]
+struct UndoChange {
+    range: Range<usize>,
+    removed: String,
+    inserted: String,
+}
+
 #[derive(Clone, Debug)]
 struct UndoRecord<I> {
     region_id: I,
-    before: String,
-    after: String,
-    selection_before: RelativeSelection,
-    selection_after: RelativeSelection,
+    changes: Vec<UndoChange>,
+    selection_before: Option<(DocumentPosition<I>, DocumentPosition<I>)>,
+    selection_after: Option<(DocumentPosition<I>, DocumentPosition<I>)>,
 }
+
+impl<I> UndoRecord<I> {
+    fn bytes(&self) -> usize {
+        self.changes
+            .iter()
+            .map(|change| change.removed.len() + change.inserted.len())
+            .sum()
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.changes
+            .iter()
+            .map(|change| change.removed.capacity() + change.inserted.capacity())
+            .sum()
+    }
+}
+
+const MAX_UNDO_RECORDS: usize = 1000;
+const MAX_UNDO_CHANGES: usize = 1000;
+const MAX_UNDO_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug)]
 struct DocumentUndoManager<I> {
     undo: Vec<UndoRecord<I>>,
     redo: Vec<UndoRecord<I>>,
-    composition_open: bool,
+    coalescing: Option<EditOrigin>,
 }
 
 impl<I> Default for DocumentUndoManager<I> {
@@ -356,32 +353,130 @@ impl<I> Default for DocumentUndoManager<I> {
         Self {
             undo: Vec::new(),
             redo: Vec::new(),
-            composition_open: false,
+            coalescing: None,
         }
     }
 }
 
 impl<I: Clone + Eq> DocumentUndoManager<I> {
-    fn record(&mut self, record: UndoRecord<I>, origin: EditOrigin) {
-        if origin == EditOrigin::Composition
-            && self.composition_open
-            && let Some(previous) = self.undo.last_mut()
-            && previous.region_id == record.region_id
-        {
-            previous.after = record.after;
-            previous.selection_after = record.selection_after;
-        } else {
+    fn record(&mut self, mut record: UndoRecord<I>, origin: EditOrigin) {
+        self.redo.clear();
+        let previous = self.undo.last_mut().filter(|previous| {
+            self.coalescing == Some(origin)
+                && previous.region_id == record.region_id
+                && previous.selection_after == record.selection_before
+        });
+        let merged = previous.is_some_and(|previous| {
+            if origin == EditOrigin::Composition {
+                if let ([left], [right]) =
+                    (previous.changes.as_mut_slice(), record.changes.as_slice())
+                    && right.range == (left.range.start..left.range.start + left.inserted.len())
+                    && right.removed == left.inserted
+                {
+                    if left.removed.len() + right.inserted.len() > MAX_UNDO_BYTES {
+                        return false;
+                    }
+                    left.inserted = right.inserted.clone();
+                } else if previous.changes.len() + record.changes.len() <= MAX_UNDO_CHANGES {
+                    if previous.bytes() + record.bytes() > MAX_UNDO_BYTES {
+                        return false;
+                    }
+                    previous.changes.append(&mut record.changes);
+                } else {
+                    return false;
+                }
+            } else if origin == EditOrigin::User {
+                let ([left], [right]) =
+                    (previous.changes.as_mut_slice(), record.changes.as_slice())
+                else {
+                    return false;
+                };
+                if left.removed.len()
+                    + left.inserted.len()
+                    + right.removed.len()
+                    + right.inserted.len()
+                    > MAX_UNDO_BYTES
+                {
+                    return false;
+                }
+                if left.removed.is_empty()
+                    && right.removed.is_empty()
+                    && right.range.start == left.range.start + left.inserted.len()
+                    && !left.inserted.contains(['\n', '\r'])
+                    && !right.inserted.contains(['\n', '\r'])
+                {
+                    left.inserted.push_str(&right.inserted);
+                } else if left.inserted.is_empty()
+                    && right.inserted.is_empty()
+                    && right.range.end == left.range.start
+                {
+                    left.range.start = right.range.start;
+                    left.removed.insert_str(0, &right.removed);
+                } else if left.inserted.is_empty()
+                    && right.inserted.is_empty()
+                    && right.range.start == left.range.start
+                {
+                    left.range.end += right.removed.len();
+                    left.removed.push_str(&right.removed);
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+            previous.selection_after.clone_from(&record.selection_after);
+            true
+        });
+        if !merged {
             self.undo.push(record);
         }
-        self.composition_open = origin == EditOrigin::Composition;
-        self.redo.clear();
+        // A canceled composition contributes no text change and must not hide
+        // the previous undo entry.
+        if self.undo.last().is_some_and(|record| {
+            record
+                .changes
+                .iter()
+                .all(|change| change.removed == change.inserted)
+        }) {
+            self.undo.pop();
+            self.break_coalescing();
+        } else {
+            self.coalescing =
+                matches!(origin, EditOrigin::User | EditOrigin::Composition).then_some(origin);
+        }
+        self.trim(MAX_UNDO_RECORDS, MAX_UNDO_BYTES);
+    }
+
+    fn trim(&mut self, records: usize, bytes: usize) {
+        if self
+            .undo
+            .last()
+            .is_some_and(|record| record.changes.len() > MAX_UNDO_CHANGES)
+        {
+            self.undo.clear();
+        }
+        let mut retained: usize = self.undo.iter().map(UndoRecord::allocated_bytes).sum();
+        while self.undo.len() > records || retained > bytes {
+            retained -= self.undo.remove(0).allocated_bytes();
+        }
+        // An individual edit larger than the budget is deliberately not retained.
+        if self.undo.is_empty() {
+            self.break_coalescing();
+        }
     }
 
     fn finish_composition(&mut self) {
-        self.composition_open = false;
+        if self.coalescing == Some(EditOrigin::Composition) {
+            self.break_coalescing();
+        }
+    }
+
+    fn break_coalescing(&mut self) {
+        self.coalescing = None;
     }
 }
 
+#[derive(Clone)]
 struct DocumentModel<I> {
     text: Rope,
     revision: DocumentRevision,
@@ -462,6 +557,7 @@ impl<I: Clone + Eq> DocumentModel<I> {
     fn new(text: impl Into<String>, regions: Vec<DocumentRegion<I>>) -> Result<Self, RegionError> {
         let text = Rope::from(text.into());
         let regions = DocumentRegions::new(regions, text.len())?;
+        validate_region_boundaries(&regions, &text)?;
         let initial_region = regions
             .as_slice()
             .iter()
@@ -727,6 +823,9 @@ impl<I: Clone + Eq> DocumentModel<I> {
                 source_len: self.text.len(),
             });
         }
+        if self.text.clip_offset(offset, Bias::Left) != offset {
+            return Err(PositionError::InvalidBoundary { offset });
+        }
         let mut candidates = self
             .regions
             .as_slice()
@@ -756,7 +855,11 @@ impl<I: Clone + Eq> DocumentModel<I> {
                 node_len: range.len(),
             });
         }
-        Ok(range.start + position.offset())
+        let offset = range.start + position.offset();
+        if self.text.clip_offset(offset, Bias::Left) != offset {
+            return Err(PositionError::InvalidBoundary { offset });
+        }
+        Ok(offset)
     }
 
     fn position_for_anchor(
@@ -925,8 +1028,8 @@ impl<I: Clone + Eq> DocumentModel<I> {
         transaction: &EditTransaction,
         node_id: Option<&I>,
     ) -> RoutingOutcome<I> {
-        if transaction.revision() != self.revision {
-            return RoutingOutcome::Rejected(DocumentEditRejection::StaleRevision);
+        if let Err(reason) = self.validate_transaction(transaction) {
+            return RoutingOutcome::Rejected(reason);
         }
 
         let target = match self.target_region_for_transaction(transaction, node_id) {
@@ -943,6 +1046,23 @@ impl<I: Clone + Eq> DocumentModel<I> {
                 Err(reason) => RoutingOutcome::Rejected(reason),
             },
         }
+    }
+
+    fn validate_transaction(
+        &self,
+        transaction: &EditTransaction,
+    ) -> Result<(), DocumentEditRejection> {
+        if transaction.revision() != self.revision {
+            return Err(DocumentEditRejection::StaleRevision);
+        }
+        if transaction
+            .edits()
+            .iter()
+            .any(|edit| !valid_source_range(&self.text, &edit.range()))
+        {
+            return Err(DocumentEditRejection::InvalidBoundary);
+        }
+        Ok(())
     }
 
     fn target_region_for_transaction(
@@ -1020,11 +1140,6 @@ impl<I: Clone + Eq> DocumentModel<I> {
         let mut net_delta = 0isize;
         for edit in transaction.edits() {
             let range = edit.range();
-            if self.text.clip_offset(range.start, Bias::Left) != range.start
-                || self.text.clip_offset(range.end, Bias::Right) != range.end
-            {
-                return Err(DocumentEditRejection::InvalidBoundary);
-            }
             net_delta += edit.replacement().len() as isize - range.len() as isize;
         }
         let regions = self
@@ -1045,18 +1160,30 @@ impl<I: Clone + Eq> DocumentModel<I> {
             .collect();
         let regions = DocumentRegions::new(regions, shift_offset(self.text.len(), net_delta))
             .map_err(|_| DocumentEditRejection::InvalidRegions)?;
+        let mut text = self.text.clone();
         for edit in transaction.edits() {
-            let range = edit.range();
-            let replacement_len = edit.replacement().len();
-            self.anchors.apply_edit(&range, replacement_len);
-            self.text.replace(range.clone(), edit.replacement());
+            text.replace(edit.range(), edit.replacement());
         }
-        self.projection = self
-            .projection
-            .transformed(transaction.edits(), self.text.len());
-        self.blocks = transform_blocks(&self.blocks, transaction.edits());
-        self.projection_map = ProjectionMap::new(&self.text, &self.projection);
-
+        let projection = self.projection.transformed(transaction.edits(), text.len());
+        let blocks = transform_blocks(&self.blocks, transaction.edits());
+        validate_projection(&projection, &regions, &text)
+            .map_err(|_| DocumentEditRejection::InvalidPresentation)?;
+        validate_blocks(&blocks, &regions, &projection, text.len())
+            .map_err(|_| DocumentEditRejection::InvalidPresentation)?;
+        let projection_map = ProjectionMap::new(&text, &projection);
+        let styles = self.styles.transformed(transaction.edits());
+        let resolved_styles = resolve_document_styles(&text, &regions, &projection_map, &styles)
+            .map_err(|_| DocumentEditRejection::InvalidPresentation)?;
+        for edit in transaction.edits() {
+            self.anchors
+                .apply_edit(&edit.range(), edit.replacement().len());
+        }
+        self.text = text;
+        self.projection = projection;
+        self.projection_map = projection_map;
+        self.blocks = blocks;
+        self.styles = styles;
+        self.resolved_styles = resolved_styles;
         self.regions = regions;
         self.reconcile_anchor_nodes();
         self.revision = self.revision.next();
@@ -1093,12 +1220,6 @@ impl<I: Clone + Eq> DocumentModel<I> {
             .as_slice()
             .iter()
             .position(|region| region.id() == id)
-    }
-
-    fn region_text(&self, index: usize) -> String {
-        self.text
-            .slice(self.regions.as_slice()[index].range())
-            .to_string()
     }
 
     fn capture_selection_in_region(
@@ -1279,6 +1400,67 @@ fn validate_style_ranges<I: Eq>(
     Ok(())
 }
 
+// Include the final caret as a real candidate. GPUI 0.3.5's closest-index
+// helper returns EOF for every x after the last glyph start; rounding an
+// absolute caret back into local coordinates can otherwise advance a column.
+fn closest_caret_index(
+    line: &gpui::WrappedLineLayout,
+    position: Point<Pixels>,
+    line_height: Pixels,
+) -> usize {
+    let row = ((position.y / line_height).max(0.) as usize).min(line.wrap_boundaries().len());
+    let boundary = |boundary: &gpui::WrapBoundary| {
+        let glyph = &line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix];
+        (glyph.index, glyph.position.x)
+    };
+    let (start, origin_x) = row
+        .checked_sub(1)
+        .and_then(|row| line.wrap_boundaries().get(row))
+        .map(boundary)
+        .unwrap_or((0, Pixels::ZERO));
+    let (end, end_x) = line
+        .wrap_boundaries()
+        .get(row)
+        .map(boundary)
+        .unwrap_or((line.len(), line.unwrapped_layout.width));
+    let mut closest = start;
+    let mut distance = position.x.abs();
+    for glyph in line.runs().iter().flat_map(|run| &run.glyphs) {
+        if glyph.index < start || glyph.index >= end {
+            continue;
+        }
+        let delta = (glyph.position.x - origin_x - position.x).abs();
+        if delta < distance {
+            closest = glyph.index;
+            distance = delta;
+        }
+    }
+    if (end_x - origin_x - position.x).abs() < distance {
+        end
+    } else {
+        closest
+    }
+}
+
+fn valid_source_range(source: &Rope, range: &Range<usize>) -> bool {
+    range.start <= range.end
+        && range.end <= source.len()
+        && source.clip_offset(range.start, Bias::Left) == range.start
+        && source.clip_offset(range.end, Bias::Right) == range.end
+}
+
+fn validate_region_boundaries<I: Eq>(
+    regions: &DocumentRegions<I>,
+    source: &Rope,
+) -> Result<(), RegionError> {
+    for (index, region) in regions.as_slice().iter().enumerate() {
+        if !valid_source_range(source, &region.range()) {
+            return Err(RegionError::InvalidBoundary { index });
+        }
+    }
+    Ok(())
+}
+
 fn validate_projection<I: Eq>(
     projection: &DocumentProjection,
     regions: &DocumentRegions<I>,
@@ -1292,6 +1474,9 @@ fn validate_projection<I: Eq>(
     }
     for span in projection.spans() {
         let span_source = span.source();
+        if !valid_source_range(source, &span_source) {
+            return Err(ProjectionError::InvalidBoundary(span_source));
+        }
         if let Some(mapping) = span.mapping()
             && mapping.iter().any(|entry| {
                 let range = entry.source();
@@ -1334,6 +1519,7 @@ pub struct DocumentState<I> {
     layout_style: Option<(gpui::TextStyle, Pixels)>,
     auto_scroll: AutoScroll,
     undo: DocumentUndoManager<I>,
+    preferred_x: Option<Pixels>,
     pending_viewport_anchor: Option<PendingViewportAnchor>,
     viewport_restore_scheduled: bool,
     dynamic_trailer: bool,
@@ -1435,6 +1621,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             layout_style: None,
             auto_scroll: AutoScroll::default(),
             undo: DocumentUndoManager::default(),
+            preferred_x: None,
             pending_viewport_anchor: None,
             viewport_restore_scheduled: false,
             dynamic_trailer: false,
@@ -1511,8 +1698,10 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.model = model;
         self.auto_scroll.stop();
         self.undo = DocumentUndoManager::default();
+        self.preferred_x = None;
         self.pending_viewport_anchor = None;
         self.scroll_pin = None;
+        self.scrollbar_input_pending.set(false);
         self.caret_reveal_pending = false;
         self.text_layouts.clear();
         self.block_layouts.clear();
@@ -1786,6 +1975,8 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) -> Result<(), PositionError> {
         self.model.replace_selection_positions(anchor, head)?;
+        self.undo.break_coalescing();
+        self.preferred_x = None;
         self.auto_scroll.stop();
         cx.emit(DocumentEvent::SelectionChanged);
         cx.notify();
@@ -1793,6 +1984,8 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     pub fn set_selection(&mut self, range: Range<usize>, reversed: bool, cx: &mut Context<Self>) {
+        self.undo.break_coalescing();
+        self.preferred_x = None;
         self.auto_scroll.stop();
         let start = self.model.text.clip_offset(range.start, Bias::Left);
         let end = self.model.text.clip_offset(range.end, Bias::Right);
@@ -1809,47 +2002,144 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.replace_text_in_range(None, text, window, cx);
     }
 
+    /// Commit a User, Paste or Composition edit, including undo and selection.
+    /// Composition commits end the marked range; platform refinements use the
+    /// input handler. Host changes must use the validating host transaction API.
+    /// Rejected and routed edits leave all retained input state unchanged.
     pub fn apply_transaction(
         &mut self,
         transaction: EditTransaction,
         cx: &mut Context<Self>,
     ) -> EditDecision<I> {
-        self.apply_transaction_in_region(transaction, None, cx)
+        self.commit_user_transaction(transaction, None, cx)
     }
 
-    fn apply_transaction_in_region(
+    fn commit_user_transaction(
         &mut self,
         transaction: EditTransaction,
-        node_id: Option<&I>,
+        composition_selection: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) -> EditDecision<I> {
+        let origin = transaction.origin();
+        if !matches!(
+            origin,
+            EditOrigin::User | EditOrigin::Paste | EditOrigin::Composition
+        ) {
+            cx.emit(DocumentEvent::Rejected(
+                DocumentEditRejection::InvalidOrigin,
+            ));
+            return EditDecision::Reject;
+        }
+        if let Err(reason) = self.model.validate_transaction(&transaction) {
+            cx.emit(DocumentEvent::Rejected(reason));
+            return EditDecision::Reject;
+        }
+        let target = self
+            .model
+            .target_region_for_transaction(&transaction, None)
+            .ok();
+        let undo_seed = target
+            .filter(|index| self.model.regions.as_slice()[*index].policy() == EditPolicy::Editable)
+            .map(|index| {
+                (
+                    self.model.regions.as_slice()[index].id().clone(),
+                    transaction
+                        .edits()
+                        .iter()
+                        .map(|edit| {
+                            let range = edit.range();
+                            let start = self.model.regions.as_slice()[index].range().start;
+                            UndoChange {
+                                removed: self.model.text.slice(range.clone()).to_string(),
+                                inserted: edit.replacement().to_owned(),
+                                range: range.start - start..range.end - start,
+                            }
+                        })
+                        .collect(),
+                    self.selected_positions().ok(),
+                )
+            });
+        let first = &transaction.edits()[0];
+        let mut caret = first.range().start + first.replacement().len();
+        for edit in &transaction.edits()[1..] {
+            caret = transform_offset(
+                caret,
+                AnchorBias::Right,
+                &edit.range(),
+                edit.replacement().len(),
+            );
+        }
+        let composition = composition_selection.map(|selected| {
+            debug_assert_eq!(transaction.edits().len(), 1);
+            let start = first.range().start;
+            let replacement = Rope::from(first.replacement());
+            (
+                start..start + replacement.len(),
+                start + replacement.offset_utf16_to_offset(selected.start)
+                    ..start + replacement.offset_utf16_to_offset(selected.end),
+            )
+        });
         let first_changed_item = transaction
             .edits()
             .iter()
             .map(|edit| self.layout_item_for_source(edit.range().start))
             .min()
             .unwrap_or(0);
-        match self.model.route_and_apply(&transaction, node_id) {
-            RoutingOutcome::Applied => {
-                self.reconcile_layout_items_from(first_changed_item);
-                let revision = self.model.revision;
-                let origin = transaction.origin();
-                cx.emit(DocumentEvent::Changed { revision, origin });
-                cx.notify();
-                EditDecision::Apply
-            }
+        match self.model.route_and_apply(&transaction, None) {
+            RoutingOutcome::Applied => self.reconcile_layout_items_from(first_changed_item),
             RoutingOutcome::Routed(region_id) => {
                 cx.emit(DocumentEvent::Routed(RoutedEdit {
                     region_id: region_id.clone(),
                     transaction,
                 }));
-                EditDecision::Route(region_id)
+                return EditDecision::Route(region_id);
             }
             RoutingOutcome::Rejected(reason) => {
                 cx.emit(DocumentEvent::Rejected(reason));
-                EditDecision::Reject
+                return EditDecision::Reject;
             }
         }
+
+        let index = target.expect("applied edits have a target region");
+        let start = self.model.regions.as_slice()[index].range().start;
+        let selected = composition
+            .as_ref()
+            .map_or(caret..caret, |(_, selected)| selected.clone());
+        self.model
+            .select_in_region(index, selected.start - start, selected.end - start);
+        self.model.set_marked_range(
+            composition
+                .as_ref()
+                .map(|(marked, _)| marked.clone())
+                .filter(|marked| !marked.is_empty()),
+        );
+        if let Some((region_id, changes, selection_before)) = undo_seed {
+            self.undo.record(
+                UndoRecord {
+                    region_id,
+                    changes,
+                    selection_before,
+                    selection_after: self.selected_positions().ok(),
+                },
+                origin,
+            );
+        }
+        if self.model.marked_range().is_none() {
+            self.undo.finish_composition();
+        }
+        self.finish_user_edit(origin, cx);
+        EditDecision::Apply
+    }
+
+    fn finish_user_edit(&mut self, origin: EditOrigin, cx: &mut Context<Self>) {
+        self.preferred_x = None;
+        self.request_caret_reveal(cx);
+        cx.emit(DocumentEvent::Changed {
+            revision: self.model.revision,
+            origin,
+        });
+        cx.emit(DocumentEvent::SelectionChanged);
+        cx.notify();
     }
 
     pub fn apply_host_transaction(
@@ -1933,6 +2223,11 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         if transaction.revision() != self.model.revision {
             return Err(HostTransactionError::StaleRevision);
         }
+        for edit in transaction.edits() {
+            if !valid_source_range(&self.model.text, &edit.range()) {
+                return Err(HostTransactionError::InvalidEditRange(edit.range()));
+            }
+        }
 
         let editable_regions: Vec<_> = self
             .model
@@ -1968,6 +2263,8 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             next_text.replace(edit.range(), edit.replacement());
         }
         let next_regions = DocumentRegions::new(regions, next_text.len())
+            .map_err(HostTransactionError::InvalidRegions)?;
+        validate_region_boundaries(&next_regions, &next_text)
             .map_err(HostTransactionError::InvalidRegions)?;
         let next_editable: Vec<_> = next_regions
             .as_slice()
@@ -2063,6 +2360,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         range: Range<usize>,
         text: &str,
         origin: EditOrigin,
+        composition_selection: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) -> EditDecision<I> {
         let transaction = match EditTransaction::new(
@@ -2084,63 +2382,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                 return EditDecision::Reject;
             }
         };
-        let undo_seed = if matches!(
-            origin,
-            EditOrigin::User | EditOrigin::Paste | EditOrigin::Composition
-        ) {
-            self.model
-                .target_region_for_transaction(&transaction, None)
-                .ok()
-                .filter(|index| {
-                    self.model.regions.as_slice()[*index].policy() == EditPolicy::Editable
-                })
-                .and_then(|index| {
-                    self.model
-                        .capture_selection_in_region(self.model.selection, index)
-                        .map(|selection| {
-                            (
-                                self.model.regions.as_slice()[index].id().clone(),
-                                self.model.region_text(index),
-                                selection,
-                            )
-                        })
-                })
-        } else {
-            None
-        };
-
-        let target = self
-            .model
-            .target_region_for_transaction(&transaction, None)
-            .ok();
-        let decision = self.apply_transaction(transaction, cx);
-        if decision == EditDecision::Apply {
-            let index = target.expect("applied edits have a target region");
-            let offset =
-                range.start + text.len() - self.model.regions.as_slice()[index].range().start;
-            self.model.select_in_region(index, offset, offset);
-            if let Some((region_id, before, selection_before)) = undo_seed
-                && let Some(index) = self.model.region_index(&region_id)
-                && let Some(selection_after) = self
-                    .model
-                    .capture_selection_in_region(self.model.selection, index)
-            {
-                self.undo.record(
-                    UndoRecord {
-                        region_id,
-                        before,
-                        after: self.model.region_text(index),
-                        selection_before,
-                        selection_after,
-                    },
-                    origin,
-                );
-            }
-            self.request_caret_reveal(cx);
-            cx.emit(DocumentEvent::SelectionChanged);
-            cx.notify();
-        }
-        decision
+        self.commit_user_transaction(transaction, composition_selection, cx)
     }
 
     fn restore_undo_record(
@@ -2149,55 +2391,75 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         undo: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(index) = self.model.region_index(&record.region_id) else {
-            return false;
-        };
-        let region = &self.model.regions.as_slice()[index];
-        if region.policy() != EditPolicy::Editable {
-            return false;
-        }
-        let (expected, replacement, selection) = if undo {
-            (&record.after, &record.before, record.selection_before)
+        // Replay into a tentative model, so a missing node, changed source or
+        // invalid presentation rejects the whole record before any live write.
+        let mut model = self.model.clone();
+        let origin = if undo {
+            EditOrigin::Undo
         } else {
-            (&record.before, &record.after, record.selection_after)
+            EditOrigin::Redo
         };
-        if self.model.region_text(index) != *expected {
-            return false;
-        }
-        let range = region.range();
-        let transaction = EditTransaction::new(
-            self.model.revision,
-            if undo {
-                EditOrigin::Undo
+        let changes: Box<dyn Iterator<Item = &UndoChange>> = if undo {
+            Box::new(record.changes.iter().rev())
+        } else {
+            Box::new(record.changes.iter())
+        };
+        let mut first_changed = self.model.text.len();
+        for change in changes {
+            let Some(index) = model.region_index(&record.region_id) else {
+                return false;
+            };
+            let region = &model.regions.as_slice()[index];
+            if region.policy() != EditPolicy::Editable {
+                return false;
+            }
+            let (expected, replacement) = if undo {
+                (&change.inserted, &change.removed)
             } else {
-                EditOrigin::Redo
-            },
-            vec![TextEdit::new(range.clone(), replacement)],
-            self.model.text.len(),
-        )
-        .expect("an editable region replacement is a valid transaction");
-        if self.apply_transaction_in_region(transaction, Some(&record.region_id), cx)
-            != EditDecision::Apply
-        {
-            return false;
+                (&change.removed, &change.inserted)
+            };
+            let start = region.range().start + change.range.start;
+            let range = start..start + expected.len();
+            if range.end > region.range().end
+                || !valid_source_range(&model.text, &range)
+                || model.text.slice(range.clone()) != expected.as_str()
+            {
+                return false;
+            }
+            let transaction = EditTransaction::new(
+                model.revision,
+                origin,
+                vec![TextEdit::new(range, replacement)],
+                model.text.len(),
+            )
+            .unwrap();
+            if !matches!(
+                model.route_and_apply(&transaction, Some(&record.region_id)),
+                RoutingOutcome::Applied
+            ) {
+                return false;
+            }
+            first_changed = first_changed.min(start);
         }
-        let Some(index) = self.model.region_index(&record.region_id) else {
-            return false;
+        let selection = if undo {
+            &record.selection_before
+        } else {
+            &record.selection_after
         };
-        self.model.select_in_region(
-            index,
-            selection.anchor.min(replacement.len()),
-            selection.head.min(replacement.len()),
-        );
-        self.model.set_marked_range(None);
-        self.request_caret_reveal(cx);
-        cx.emit(DocumentEvent::SelectionChanged);
-        cx.notify();
+        if let Some((anchor, head)) = selection {
+            let _ = model.replace_selection_positions(anchor.clone(), head.clone());
+        }
+        model.set_marked_range(None);
+        model.revision = self.model.revision.next();
+        let first_item = self.layout_item_for_source(first_changed);
+        self.model = model;
+        self.reconcile_layout_items_from(first_item);
+        self.finish_user_edit(origin, cx);
         true
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        self.undo.finish_composition();
+        self.undo.break_coalescing();
         let Some(record) = self.undo.undo.pop() else {
             return;
         };
@@ -2209,7 +2471,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        self.undo.finish_composition();
+        self.undo.break_coalescing();
         let Some(record) = self.undo.redo.pop() else {
             return;
         };
@@ -2348,6 +2610,8 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         extend: bool,
         cx: &mut Context<Self>,
     ) {
+        self.undo.break_coalescing();
+        self.preferred_x = None;
         if extend {
             let Ok(anchor) = self
                 .model
@@ -2368,7 +2632,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         cx.notify();
     }
 
-    fn vertical_position(&self, down: bool, page: bool) -> Option<DocumentPosition<I>> {
+    fn vertical_position(&mut self, down: bool, page: bool) -> Option<DocumentPosition<I>> {
         let range = self.model.selected_range();
         let cursor = if range.is_empty() {
             self.model.cursor()
@@ -2389,6 +2653,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         else {
             return Some(cursor);
         };
+        let x = *self.preferred_x.get_or_insert(position.x);
         let distance = if page {
             self.list_state
                 .viewport_bounds()
@@ -2418,15 +2683,17 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                 } else {
                     record.bounds.bottom() - record.layout.line_height() / 2.
                 };
-                return self.position_for_point(point(position.x, y));
+                return self.position_for_point(point(x, y));
             }
         }
-        self.position_for_point(point(position.x, y))
+        self.position_for_point(point(x, y))
     }
 
     fn move_vertical(&mut self, down: bool, page: bool, extend: bool, cx: &mut Context<Self>) {
         if let Some(position) = self.vertical_position(down, page) {
+            let preferred_x = self.preferred_x;
             self.move_selection_to_position(position, extend, cx);
+            self.preferred_x = preferred_x;
         }
     }
 
@@ -2588,7 +2855,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             range
         };
         if !range.is_empty() {
-            self.replace(range, "", EditOrigin::User, cx);
+            self.replace(range, "", EditOrigin::User, None, cx);
         }
     }
 
@@ -2599,7 +2866,13 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) {
         let cursor = self.model.cursor();
-        self.replace(self.start_of_line(cursor)..cursor, "", EditOrigin::User, cx);
+        self.replace(
+            self.start_of_line(cursor)..cursor,
+            "",
+            EditOrigin::User,
+            None,
+            cx,
+        );
     }
 
     fn delete_to_end_of_line(
@@ -2609,7 +2882,13 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) {
         let cursor = self.model.cursor();
-        self.replace(cursor..self.end_of_line(cursor), "", EditOrigin::User, cx);
+        self.replace(
+            cursor..self.end_of_line(cursor),
+            "",
+            EditOrigin::User,
+            None,
+            cx,
+        );
     }
 
     fn delete_previous_word(
@@ -2623,6 +2902,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             self.previous_word_boundary(cursor)..cursor,
             "",
             EditOrigin::User,
+            None,
             cx,
         );
     }
@@ -2638,6 +2918,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             cursor..self.next_word_boundary(cursor),
             "",
             EditOrigin::User,
+            None,
             cx,
         );
     }
@@ -2650,15 +2931,23 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             range
         };
         if !range.is_empty() {
-            self.replace(range, "", EditOrigin::User, cx);
+            self.replace(range, "", EditOrigin::User, None, cx);
         }
     }
 
     fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
-        self.replace(self.model.selected_range(), "\n", EditOrigin::User, cx);
+        self.replace(
+            self.model.selected_range(),
+            "\n",
+            EditOrigin::User,
+            None,
+            cx,
+        );
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.undo.break_coalescing();
+        self.preferred_x = None;
         self.model.replace_selection(0, self.model.text.len());
         cx.emit(DocumentEvent::SelectionChanged);
         cx.notify();
@@ -2679,7 +2968,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             return;
         }
         let text = self.model.text.slice(range.clone()).to_string();
-        if self.replace(range, "", EditOrigin::User, cx) == EditDecision::Apply {
+        if self.replace(range, "", EditOrigin::User, None, cx) == EditDecision::Apply {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
@@ -2688,7 +2977,13 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        self.replace(self.model.selected_range(), &text, EditOrigin::Paste, cx);
+        self.replace(
+            self.model.selected_range(),
+            &text,
+            EditOrigin::Paste,
+            None,
+            cx,
+        );
     }
 
     fn offset_for_point(&self, point: Point<Pixels>) -> usize {
@@ -2778,11 +3073,11 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             // boundary, not the containing glyph; Err also carries a valid
             // index at either edge of the actual soft-wrapped row.
             record.layout.line_layout_for_index(0).map_or(0, |line| {
-                line.closest_index_for_position(
+                closest_caret_index(
+                    &line,
                     point - record.bounds.origin,
                     record.layout.line_height(),
                 )
-                .unwrap_or_else(|index| index)
             })
         };
         let affinity = if local == record.display.len() && local > 0 {
@@ -2807,6 +3102,8 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.undo.break_coalescing();
+        self.preferred_x = None;
         if self
             .block_layouts
             .iter()
@@ -3333,6 +3630,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             .last_bounds
             .is_some_and(|previous| previous.size.width != bounds.size.width);
         if style_changed || width_changed {
+            self.preferred_x = None;
             self.capture_viewport_anchor();
         }
         if style_changed {
@@ -3535,7 +3833,6 @@ impl<I: Clone + Eq + 'static> EntityInputHandler for DocumentState<I> {
             .map(|range| self.range_from_utf16(range))
             .or_else(|| self.model.marked_range())
             .unwrap_or_else(|| self.model.selected_range());
-        self.model.set_marked_range(None);
         self.replace(
             range,
             text,
@@ -3544,11 +3841,9 @@ impl<I: Clone + Eq + 'static> EntityInputHandler for DocumentState<I> {
             } else {
                 EditOrigin::User
             },
+            None,
             cx,
         );
-        if committing_composition {
-            self.undo.finish_composition();
-        }
     }
 
     fn replace_and_mark_text_in_range(
@@ -3564,37 +3859,11 @@ impl<I: Clone + Eq + 'static> EntityInputHandler for DocumentState<I> {
             .map(|range| self.range_from_utf16(range))
             .or_else(|| self.model.marked_range())
             .unwrap_or_else(|| self.model.selected_range());
-        self.model.set_marked_range(None);
-        if self.replace(range.clone(), text, EditOrigin::Composition, cx) != EditDecision::Apply {
-            return;
-        }
-
-        if text.is_empty() {
-            return;
-        }
-        let marked = range.start..range.start + text.len();
-        self.model.set_marked_range(Some(marked.clone()));
-        let selected = if let Some(selected) = new_selected_range_utf16 {
-            let replacement = Rope::from(text);
-            range.start + replacement.offset_utf16_to_offset(selected.start)
-                ..range.start + replacement.offset_utf16_to_offset(selected.end)
-        } else {
-            marked.end..marked.end
-        };
-        let node = self
-            .model
-            .position_for_anchor(self.model.selection.head())
-            .ok();
-        if let Some(index) = node
-            .as_ref()
-            .and_then(|position| self.model.region_index(position.node_id()))
-        {
-            let start = self.model.regions.as_slice()[index].range().start;
-            self.model
-                .select_in_region(index, selected.start - start, selected.end - start);
-        }
-        cx.emit(DocumentEvent::SelectionChanged);
-        cx.notify();
+        let selected = new_selected_range_utf16.unwrap_or_else(|| {
+            let end = text.encode_utf16().count();
+            end..end
+        });
+        self.replace(range, text, EditOrigin::Composition, Some(selected), cx);
     }
 
     fn bounds_for_range(
@@ -3624,16 +3893,24 @@ impl<I: Clone + Eq + 'static> EntityInputHandler for DocumentState<I> {
             .or_else(|| {
                 self.text_position_for_display_in_item(start_display, start_affinity, start_item)
             })?;
-        let (mut end, _, _, _) = self
+        let (end, _, _, _) = self
             .input_position_for_offset(source.end, Affinity::After)
             .and_then(|position| self.text_position_for_position(&position))
             .or_else(|| {
                 self.text_position_for_display_in_item(end_display, Affinity::After, end_item)
             })?;
-        end.y = start.y;
+        // The platform accepts one rectangle, not a multiline union. For a
+        // spanning range use the first caret, including soft-wrapped lines.
+        let width = if source.is_empty() {
+            Pixels::ZERO
+        } else if end.y == start.y {
+            (end.x - start.x).max(Pixels::ZERO)
+        } else {
+            px(1.)
+        };
         Some(Bounds::from_corners(
             start,
-            Point::new(end.x, end.y + line_height),
+            point(start.x + width, start.y + line_height),
         ))
     }
 
@@ -3656,6 +3933,8 @@ impl<I: Clone + Eq + 'static> EntityInputHandler for DocumentState<I> {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.undo.break_coalescing();
+        self.preferred_x = None;
         let range = self.range_from_utf16(&range_utf16);
         if let (Some(anchor), Some(head)) = (
             self.input_position_for_offset(range.start, Affinity::After),
@@ -4098,6 +4377,518 @@ mod tests {
                 document.replace_text_in_range(None, "X", window, cx);
                 assert_eq!(document.text(), "historydraft");
                 assert_eq!(document.selected_range(), 6..8);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn rejected_and_routed_ime_edits_preserve_composition_and_undo(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        for policy in [EditPolicy::Readonly, EditPolicy::Routed] {
+            for refining in [false, true] {
+                cx.update(|window, cx| {
+                    document.update(cx, |document, cx| {
+                        document
+                            .reset(
+                                DocumentSnapshot::new(
+                                    "history",
+                                    vec![
+                                        DocumentRegion::new("history", 0..7, policy),
+                                        DocumentRegion::new("draft", 7..7, EditPolicy::Editable),
+                                    ],
+                                    DocumentProjection::identity(7),
+                                    vec![],
+                                    DocumentStyles::default(),
+                                ),
+                                cx,
+                            )
+                            .unwrap();
+                        document.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, cx);
+                        let revision = document.revision();
+                        let selection = document.selected_positions().unwrap();
+                        if refining {
+                            document.replace_and_mark_text_in_range(
+                                Some(0..1),
+                                "x",
+                                Some(1..1),
+                                window,
+                                cx,
+                            );
+                        } else {
+                            document.replace_text_in_range(Some(0..1), "x", window, cx);
+                        }
+                        assert_eq!(document.revision(), revision);
+                        assert_eq!(document.selected_positions().unwrap(), selection);
+                        assert_eq!(document.marked_text_range(window, cx), Some(7..9));
+                        document.replace_text_in_range(None, "你", window, cx);
+                        assert_eq!(document.text(), "history你");
+                        document.undo(&Undo, window, cx);
+                        assert_eq!(document.text(), "history");
+                        document.redo(&Redo, window, cx);
+                        assert_eq!(document.text(), "history你");
+                    })
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn public_user_transactions_record_undo_and_reject_internal_origins(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.replace_text_in_range(None, "abcdef", window, cx);
+                // Public transactions also work when the selection is in another node.
+                document.set_selection(0..2, false, cx);
+                let selection = document.selected_positions().unwrap();
+                let transaction = EditTransaction::new(
+                    document.revision(),
+                    EditOrigin::User,
+                    vec![TextEdit::new(8..9, "中"), TextEdit::new(11..12, "🙂")],
+                    document.text().len(),
+                )
+                .unwrap();
+                assert_eq!(
+                    document.apply_transaction(transaction, cx),
+                    EditDecision::Apply
+                );
+                assert_eq!(document.text(), "historya中cd🙂f");
+                assert_eq!(document.selected_range(), 17..17);
+                assert!(document.caret_reveal_pending);
+                document.undo(&Undo, window, cx);
+                assert_eq!(document.text(), "historyabcdef");
+                assert_eq!(document.selected_positions().unwrap(), selection);
+                document.redo(&Redo, window, cx);
+                assert_eq!(document.text(), "historya中cd🙂f");
+                for origin in [EditOrigin::Host, EditOrigin::Undo, EditOrigin::Redo] {
+                    let revision = document.revision();
+                    let transaction = EditTransaction::new(
+                        revision,
+                        origin,
+                        vec![TextEdit::new(7..8, "x")],
+                        document.text().len(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        document.apply_transaction(transaction, cx),
+                        EditDecision::Reject
+                    );
+                    assert_eq!(document.revision(), revision);
+                    assert_eq!(document.text(), "historya中cd🙂f");
+                }
+                document.undo(&Undo, window, cx);
+                document.undo(&Undo, window, cx);
+                assert_eq!(document.text(), "history");
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn reset_drops_old_pins_and_rejects_old_transactions(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        cx.update(|_, cx| {
+            document.update(cx, |document, cx| {
+                let stale = EditTransaction::new(
+                    document.revision(),
+                    EditOrigin::User,
+                    vec![TextEdit::new(0..3, "STALE")],
+                    document.text().len(),
+                )
+                .unwrap();
+                document
+                    .pin_scroll(
+                        "pin",
+                        &DocumentPosition::new("draft", 0, Affinity::After),
+                        0.5,
+                        cx,
+                    )
+                    .unwrap();
+                document.scrollbar_input_pending.set(true);
+                document
+                    .reset(
+                        DocumentSnapshot::new(
+                            "new",
+                            vec![DocumentRegion::new("new", 0..3, EditPolicy::Editable)],
+                            DocumentProjection::identity(3),
+                            vec![],
+                            DocumentStyles::default(),
+                        )
+                        .selection(DocumentPosition::new(
+                            "new",
+                            2,
+                            Affinity::After,
+                        )),
+                        cx,
+                    )
+                    .unwrap();
+                assert!(!document.unpin_scroll(&"pin", cx));
+                assert_eq!(document.selected_range(), 2..2);
+                document
+                    .pin_scroll(
+                        "new-pin",
+                        &DocumentPosition::new("new", 1, Affinity::After),
+                        0.5,
+                        cx,
+                    )
+                    .unwrap();
+                assert_eq!(document.selected_range(), 2..2);
+                document.apply_scrollbar_input(cx);
+                assert_eq!(document.pinned_scroll_id(), Some(&"new-pin"));
+                assert_eq!(document.apply_transaction(stale, cx), EditDecision::Reject);
+                assert_eq!(document.text(), "new");
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn undo_retains_only_changes_in_a_large_draft(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                let initial = 1024 * 1024;
+                document
+                    .reset(
+                        DocumentSnapshot::new(
+                            "a".repeat(initial),
+                            vec![DocumentRegion::new(
+                                "draft",
+                                0..initial,
+                                EditPolicy::Editable,
+                            )],
+                            DocumentProjection::identity(initial),
+                            vec![],
+                            DocumentStyles::default(),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+                document.set_selection(initial..initial, false, cx);
+                for _ in 0..500 {
+                    document.replace_text_in_range(None, "x", window, cx);
+                }
+                assert_eq!(document.undo.undo.len(), 1);
+                assert_eq!(document.undo.undo[0].bytes(), 500);
+                document.undo(&Undo, window, cx);
+                assert_eq!(document.model.text.len(), initial);
+                assert_eq!(document.selected_range(), initial..initial);
+                document.redo(&Redo, window, cx);
+                assert_eq!(document.model.text.len(), initial + 500);
+
+                // An explicit selection boundary and a deletion burst stay separate.
+                document.set_selection(initial + 500..initial + 500, false, cx);
+                document.backspace(&Backspace, window, cx);
+                document.backspace(&Backspace, window, cx);
+                document.undo(&Undo, window, cx);
+                assert_eq!(document.model.text.len(), initial + 500);
+                document.undo(&Undo, window, cx);
+                assert_eq!(document.model.text.len(), initial);
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn composition_range_changes_undo_as_one_atomic_record(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.replace_text_in_range(None, "ab", window, cx);
+                document.set_selection(8..8, false, cx);
+                document.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, cx);
+                document.replace_and_mark_text_in_range(Some(7..10), "hao", Some(3..3), window, cx);
+                document.replace_text_in_range(None, "好", window, cx);
+                assert_eq!(document.text(), "history好b");
+                document.undo(&Undo, window, cx);
+                assert_eq!(document.text(), "historyab");
+                assert_eq!(document.selected_range(), 8..8);
+                document.redo(&Redo, window, cx);
+                assert_eq!(document.text(), "history好b");
+                document.undo(&Undo, window, cx);
+                document.undo(&Undo, window, cx);
+                assert_eq!(document.text(), "history");
+            })
+        });
+    }
+
+    #[test]
+    fn undo_budget_evicts_oldest_records_and_keeps_recent_edits() {
+        let mut history = DocumentUndoManager::default();
+        for text in ["a", "bb", "ccc", "dddd"] {
+            history.break_coalescing();
+            history.record(
+                UndoRecord {
+                    region_id: "draft",
+                    changes: vec![UndoChange {
+                        range: 0..0,
+                        removed: String::new(),
+                        inserted: text.into(),
+                    }],
+                    selection_before: None,
+                    selection_after: None,
+                },
+                EditOrigin::Paste,
+            );
+        }
+        history.trim(3, 7);
+        assert_eq!(
+            history
+                .undo
+                .iter()
+                .map(UndoRecord::bytes)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        history.trim(1, 7);
+        assert_eq!(history.undo[0].changes[0].inserted, "dddd");
+        history.trim(1, 3);
+        assert!(history.undo.is_empty());
+        let mut reserved = String::with_capacity(1024);
+        reserved.push('x');
+        history.record(
+            UndoRecord {
+                region_id: "draft",
+                changes: vec![UndoChange {
+                    range: 0..0,
+                    removed: String::new(),
+                    inserted: reserved,
+                }],
+                selection_before: None,
+                selection_after: None,
+            },
+            EditOrigin::Paste,
+        );
+        history.trim(1, 16);
+        assert!(
+            history.undo.is_empty(),
+            "the budget must include reserved string capacity"
+        );
+    }
+
+    #[gpui::test]
+    fn invalid_utf8_ranges_are_rejected_without_changing_document_state(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        cx.update(|_, cx| {
+            document.update(cx, |document, cx| {
+                let regions = || {
+                    vec![
+                        DocumentRegion::new("history", 0..3, EditPolicy::Readonly),
+                        DocumentRegion::new("draft", 3..7, EditPolicy::Editable),
+                    ]
+                };
+                document
+                    .reset(
+                        DocumentSnapshot::new(
+                            "中🙂",
+                            regions(),
+                            DocumentProjection::identity(7),
+                            vec![],
+                            DocumentStyles::default(),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+                let revision = document.revision();
+                let selection = document.selected_positions().unwrap();
+                assert!(matches!(
+                    document.set_projection(
+                        DocumentProjection::new(7, vec![ProjectionSpan::hide(1..2)]).unwrap(),
+                        cx
+                    ),
+                    Err(ProjectionError::InvalidBoundary(_))
+                ));
+                let invalid = DocumentPosition::new("draft", 1, Affinity::After);
+                assert!(matches!(
+                    document.set_selection_positions(invalid.clone(), invalid, cx),
+                    Err(PositionError::InvalidBoundary { .. })
+                ));
+                assert!(matches!(
+                    document.position_for_offset(1, Affinity::After),
+                    Err(PositionError::InvalidBoundary { .. })
+                ));
+                let user = EditTransaction::new(
+                    revision,
+                    EditOrigin::User,
+                    vec![TextEdit::new(4..5, "x")],
+                    7,
+                )
+                .unwrap();
+                assert_eq!(document.apply_transaction(user, cx), EditDecision::Reject);
+                let host = EditTransaction::new(
+                    revision,
+                    EditOrigin::Host,
+                    vec![TextEdit::new(0..1, "x")],
+                    7,
+                )
+                .unwrap();
+                assert!(matches!(
+                    document.apply_host_transaction(host, regions(), cx),
+                    Err(HostTransactionError::InvalidEditRange(_))
+                ));
+                let host = EditTransaction::new(
+                    revision,
+                    EditOrigin::Host,
+                    vec![TextEdit::new(0..0, "!")],
+                    7,
+                )
+                .unwrap();
+                assert!(matches!(
+                    document.apply_host_transaction(
+                        host,
+                        vec![
+                            DocumentRegion::new("history", 0..5, EditPolicy::Readonly),
+                            DocumentRegion::new("draft", 5..8, EditPolicy::Editable)
+                        ],
+                        cx
+                    ),
+                    Err(HostTransactionError::InvalidRegions(
+                        RegionError::InvalidBoundary { .. }
+                    ))
+                ));
+                assert!(matches!(
+                    DocumentModel::new(
+                        "中",
+                        vec![DocumentRegion::new("bad", 1..3, EditPolicy::Editable)]
+                    ),
+                    Err(RegionError::InvalidBoundary { .. })
+                ));
+                assert_eq!(document.revision(), revision);
+                assert_eq!(document.text(), "中🙂");
+                assert_eq!(document.selected_positions().unwrap(), selection);
+                assert!(document.undo.undo.is_empty());
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn styles_follow_edits_and_undo_before_readonly_text(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document
+                    .reset(
+                        DocumentSnapshot::new(
+                            "x\nHead\n",
+                            vec![
+                                DocumentRegion::new("draft", 0..2, EditPolicy::Editable),
+                                DocumentRegion::new("history", 2..7, EditPolicy::Readonly),
+                            ],
+                            DocumentProjection::identity(7),
+                            vec![],
+                            DocumentStyles::new(
+                                vec![super::super::DocumentParagraphStyle::new(
+                                    2..7,
+                                    TextStyleRefinement::default(),
+                                )],
+                                vec![super::super::DocumentInlineStyle::new(
+                                    2..6,
+                                    HighlightStyle {
+                                        font_weight: Some(FontWeight::BOLD),
+                                        ..Default::default()
+                                    },
+                                )],
+                            ),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+                document.replace_text_in_range(None, "zz\n", window, cx);
+                assert_eq!(document.model.styles.inline()[0].source(), 5..9);
+                assert_eq!(document.model.resolved_styles.inline[0].display, 5..9);
+                assert_eq!(document.model.styles.paragraphs()[0].source(), 5..10);
+                document.undo(&Undo, window, cx);
+                assert_eq!(document.text(), "x\nHead\n");
+                assert_eq!(document.model.styles.inline()[0].source(), 2..6);
+                document.redo(&Redo, window, cx);
+                assert_eq!(document.model.styles.inline()[0].source(), 5..9);
+                let revision = document.revision();
+                // Removing the paragraph boundary cannot leave partially updated styles.
+                document.replace_text_in_range(Some(4..5), "", window, cx);
+                assert_eq!(document.text(), "zz\nx\nHead\n");
+                assert_eq!(document.revision(), revision);
+                assert_eq!(document.model.styles.inline()[0].source(), 5..9);
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn vertical_navigation_keeps_the_column_across_short_lines(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document
+                    .reset(
+                        DocumentSnapshot::new(
+                            "abcdef\nx\nabcdef",
+                            vec![DocumentRegion::new("draft", 0..15, EditPolicy::Editable)],
+                            DocumentProjection::identity(15),
+                            vec![],
+                            DocumentStyles::default(),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+                document.set_selection(5..5, false, cx);
+                document.focus_handle(cx).focus(window, cx);
+            });
+            let _ = window.draw(cx);
+        });
+        for (keys, expected) in [
+            ("down down", 14..14),
+            ("up up", 5..5),
+            ("down left down", 9..9),
+        ] {
+            cx.simulate_keystrokes(keys);
+            document.read_with(&cx, |document, _| {
+                assert_eq!(document.selected_range(), expected)
+            });
+        }
+        document.update(&mut cx, |document, cx| {
+            document.set_selection(5..5, false, cx);
+            let cursor = document.selected_positions().unwrap().1;
+            let (position, _, _, _) = document.text_position_for_position(&cursor).unwrap();
+            // Native glyph positions are fractional; converting absolute x back
+            // to local coordinates may put it just past the final glyph start.
+            document.preferred_x = Some(position.x + px(0.01));
+        });
+        cx.simulate_keystrokes("down down");
+        document.read_with(&cx, |document, _| {
+            assert_eq!(document.selected_range(), 14..14)
+        });
+        document.update(&mut cx, |document, cx| {
+            document.set_selection(5..5, false, cx)
+        });
+        cx.simulate_keystrokes("shift-down shift-down");
+        document.read_with(&cx, |document, _| {
+            assert_eq!(document.selected_range(), 5..14)
+        });
+    }
+
+    #[gpui::test]
+    fn multiline_ime_bounds_return_a_valid_first_caret(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document
+                    .reset(
+                        DocumentSnapshot::new(
+                            "abcdef\nx",
+                            vec![DocumentRegion::new("draft", 0..8, EditPolicy::Editable)],
+                            DocumentProjection::identity(8),
+                            vec![],
+                            DocumentStyles::default(),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            });
+            let _ = window.draw(cx);
+            document.update(cx, |document, cx| {
+                let bounds = document.last_bounds.unwrap();
+                let caret = document.bounds_for_range(4..4, bounds, window, cx).unwrap();
+                let spanning = document.bounds_for_range(4..8, bounds, window, cx).unwrap();
+                assert_eq!(spanning.origin, caret.origin);
+                assert_eq!(spanning.size.height, caret.size.height);
+                assert!(spanning.size.width > Pixels::ZERO);
+                assert!(spanning.size.height > Pixels::ZERO);
             });
         });
     }

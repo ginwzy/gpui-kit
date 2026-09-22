@@ -147,42 +147,15 @@ impl DocumentProjection {
             .spans
             .iter()
             .map(|span| {
-                let mut source = span.source.clone();
-                for edit in edits {
-                    let edit_range = edit.range();
-                    source.start = transform_offset(
-                        source.start,
-                        Affinity::After,
-                        &edit_range,
-                        edit.replacement().len(),
-                    );
-                    source.end = transform_offset(
-                        source.end,
-                        Affinity::Before,
-                        &edit_range,
-                        edit.replacement().len(),
-                    );
-                }
+                let source = super::position::transform_source_range(span.source.clone(), edits);
                 let mapping = span.mapping.as_ref().map(|mapping| {
                     mapping
                         .iter()
                         .map(|entry| {
-                            let mut source = entry.source.clone();
-                            for edit in edits {
-                                let edit_range = edit.range();
-                                source.start = transform_offset(
-                                    source.start,
-                                    Affinity::After,
-                                    &edit_range,
-                                    edit.replacement().len(),
-                                );
-                                source.end = transform_offset(
-                                    source.end,
-                                    Affinity::Before,
-                                    &edit_range,
-                                    edit.replacement().len(),
-                                );
-                            }
+                            let source = super::position::transform_source_range(
+                                entry.source.clone(),
+                                edits,
+                            );
                             ProjectionMapping::new(entry.display.clone(), source)
                         })
                         .collect()
@@ -203,6 +176,7 @@ impl DocumentProjection {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectionError {
+    InvalidBoundary(Range<usize>),
     SourceLength {
         expected: usize,
         actual: usize,
@@ -221,6 +195,10 @@ pub enum ProjectionError {
 impl fmt::Display for ProjectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidBoundary(range) => write!(
+                formatter,
+                "projection range {range:?} is not on UTF-8 boundaries"
+            ),
             Self::SourceLength { expected, actual } => write!(
                 formatter,
                 "projection source length {actual} does not match document length {expected}"
@@ -453,31 +431,6 @@ fn mapped_display_to_source(
         Some(entry.source.start)
     } else {
         Some(entry.source.end)
-    }
-}
-
-fn transform_offset(
-    offset: usize,
-    affinity: Affinity,
-    range: &Range<usize>,
-    replacement_len: usize,
-) -> usize {
-    if offset < range.start {
-        offset
-    } else if offset > range.end {
-        shift_offset(offset, replacement_len as isize - range.len() as isize)
-    } else if offset == range.start && affinity == Affinity::Before {
-        range.start
-    } else {
-        range.start + replacement_len
-    }
-}
-
-fn shift_offset(offset: usize, delta: isize) -> usize {
-    if delta >= 0 {
-        offset.saturating_add(delta as usize)
-    } else {
-        offset.saturating_sub(delta.unsigned_abs())
     }
 }
 
