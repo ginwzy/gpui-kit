@@ -357,11 +357,16 @@ impl ProjectionMap {
         if offset == self.display.len() {
             return Some(self.source_len);
         }
-        let run = self.runs.iter().find(|run| {
+        let mut runs = self.runs.iter().filter(|run| {
             run.display.start <= offset
                 && (offset < run.display.end
                     || (run.display.is_empty() && offset == run.display.start))
-        })?;
+        });
+        let run = if affinity == Affinity::Before {
+            runs.next()
+        } else {
+            runs.next_back()
+        }?;
         match &run.kind {
             ProjectionRunKind::Identity => Some(run.source.start + offset - run.display.start),
             ProjectionRunKind::Replacement(None) => {
@@ -477,6 +482,19 @@ fn shift_offset(offset: usize, delta: isize) -> usize {
 mod tests {
     use super::*;
     use crate::document::TextEdit;
+
+    #[test]
+    fn after_affinity_skips_all_hidden_objects_at_a_text_boundary() {
+        let source = Rope::from("\u{fffc}\u{fffc}text");
+        let projection = DocumentProjection::new(
+            source.len(),
+            vec![ProjectionSpan::hide(0..3), ProjectionSpan::hide(3..6)],
+        )
+        .unwrap();
+        let map = ProjectionMap::new(&source, &projection);
+        assert_eq!(map.display_to_source(0, Affinity::Before), Some(0));
+        assert_eq!(map.display_to_source(0, Affinity::After), Some(6));
+    }
 
     #[test]
     fn replacement_maps_source_and_display_edges_with_affinity() {

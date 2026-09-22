@@ -560,9 +560,11 @@ impl<I: Clone + Eq> DocumentModel<I> {
     ) {
         let mut start = range.start;
         for newline in display_text[range.clone()].match_indices('\n') {
-            let end = range.start + newline.0 + 1;
+            // The line terminator separates layout items. Passing it to StyledText
+            // creates another visual row inside each item and doubles line spacing.
+            let end = range.start + newline.0;
             items.push(self.text_layout_item(display_text, start..end));
-            start = end;
+            start = end + 1;
         }
         if start < range.end || (include_empty_tail && start == range.end) {
             items.push(self.text_layout_item(display_text, start..range.end));
@@ -2860,7 +2862,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             } => {
                 let source_start = self
                     .model
-                    .display_to_source(display.start, Affinity::Before)
+                    .display_to_source(display.start, Affinity::After)
                     .unwrap_or(0);
                 let source_end = self
                     .model
@@ -3416,6 +3418,11 @@ mod tests {
                 });
                 let _ = window.draw(cx);
                 document.update(cx, |document, cx| {
+                    if text == "# title\nbody\n" {
+                        for record in &document.text_layouts {
+                            assert_eq!(record.bounds.size.height, record.layout.line_height());
+                        }
+                    }
                     let offsets = document
                         .text_layouts
                         .iter()
