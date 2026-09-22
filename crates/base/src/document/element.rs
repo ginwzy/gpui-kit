@@ -429,13 +429,24 @@ impl<I: Clone + Eq + 'static> Element for DocumentBlockElement<I> {
         &mut self,
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
         self.content.paint(window, cx);
+        let selection = self.state.read(cx).selected_range();
+        if selection.start <= self.source.start && self.source.end <= selection.end {
+            // Objects participate in the same document selection as text.
+            // Tint after painting so opaque embedded surfaces remain legible.
+            let color = crate::Theme::global(cx)
+                .tokens
+                .colors
+                .selection
+                .opacity(0.35);
+            window.paint_quad(fill(bounds, color));
+        }
     }
 }
 
