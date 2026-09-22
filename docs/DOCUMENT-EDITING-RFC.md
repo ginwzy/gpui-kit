@@ -281,6 +281,18 @@ height before measurement. `DocumentState` and its `ListState` remain the sole
 owners of layout and scroll geometry; the application does not maintain a second
 height estimate.
 
+Pointer selection uses the nearest shaped caret boundary, including the left
+and right edges of soft-wrapped rows. Vertical gaps introduced by paragraph
+styles or host wrappers resolve to the nearest text/object boundary. Only the
+actual trailing area resolves to EOF; a virtualized viewport edge must not
+jump to an unseen document endpoint. Atomic blocks retain input ownership on
+press, while a drag started in text can extend across their boundaries.
+Selection drags use the existing tracked selection anchor through host edits,
+receive moves/releases outside the viewport, and reuse `AutoScroll` at viewport
+edges. Hit testing after scrolling runs after the new visible layout is ready.
+Applications may scope the existing SelectAll action to a domain text region
+by setting the one document selection; Base's default remains document-wide.
+
 Application render callbacks are side-effect-free. Model changes and block
 measurement feedback occur through explicit update paths, never by mutating
 the document during paint.

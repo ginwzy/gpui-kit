@@ -107,6 +107,9 @@ impl<I: Clone + Eq + 'static> Element for DocumentElement<I> {
             state.prepare_layout(bounds, window, cx);
         });
         self.content.prepaint(window, cx);
+        self.state.update(cx, |state, cx| {
+            state.extend_pointer_selection(cx);
+        });
         hitbox
     }
 
@@ -128,6 +131,20 @@ impl<I: Clone + Eq + 'static> Element for DocumentElement<I> {
             cx,
         );
         self.content.paint(window, cx);
+        // A selection drag belongs to the document that received the press,
+        // including moves/releases over embedded controls or outside its bounds.
+        let state = self.state.clone();
+        window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, window, cx| {
+            if !phase.bubble() {
+                state.update(cx, |state, cx| state.mouse_move(event, window, cx));
+            }
+        });
+        let state = self.state.clone();
+        window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, window, cx| {
+            if !phase.bubble() {
+                state.update(cx, |state, cx| state.mouse_up(event, window, cx));
+            }
+        });
     }
 }
 

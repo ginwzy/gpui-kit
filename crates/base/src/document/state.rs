@@ -11,7 +11,7 @@ use ropey::{LineType, Rope};
 use sum_tree::Bias;
 
 use crate::{
-    Scrollbar, ScrollbarHandle,
+    AutoScroll, Scrollbar, ScrollbarHandle,
     actions::{SelectDown, SelectLeft, SelectRight, SelectUp},
     input::{
         Backspace, Copy, Cut, Delete, DeleteToBeginningOfLine, DeleteToEndOfLine,
@@ -1021,7 +1021,7 @@ pub struct DocumentState<I> {
     trailer_layout: Option<(usize, Bounds<Pixels>)>,
     last_bounds: Option<Bounds<Pixels>>,
     layout_style: Option<(gpui::TextStyle, Pixels)>,
-    drag_anchor: Option<usize>,
+    auto_scroll: AutoScroll,
     undo: DocumentUndoManager<I>,
     pending_viewport_anchor: Option<PendingViewportAnchor>,
     viewport_restore_scheduled: bool,
@@ -1122,7 +1122,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             trailer_layout: None,
             last_bounds: None,
             layout_style: None,
-            drag_anchor: None,
+            auto_scroll: AutoScroll::default(),
             undo: DocumentUndoManager::default(),
             pending_viewport_anchor: None,
             viewport_restore_scheduled: false,
@@ -1213,6 +1213,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             model.selection = DocumentSelection::new(cursor, cursor);
         }
         self.model = model;
+        self.auto_scroll.stop();
         self.undo = DocumentUndoManager::default();
         self.pending_viewport_anchor = None;
         self.text_layouts.clear();
@@ -1514,6 +1515,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     pub fn set_selection(&mut self, range: Range<usize>, reversed: bool, cx: &mut Context<Self>) {
+        self.auto_scroll.stop();
         let start = self.model.text.clip_offset(range.start, Bias::Left);
         let end = self.model.text.clip_offset(range.end, Bias::Right);
         if reversed {
@@ -2025,7 +2027,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         let Some(display) = self.model.source_to_display(cursor, Affinity::After) else {
             return cursor;
         };
-        let Some((position, line_height, _, _)) =
+        let Some((position, line_height, item_ix, bounds)) =
             self.text_position_for_display(display, Affinity::After)
         else {
             return cursor;
@@ -2039,14 +2041,30 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         } else {
             line_height
         };
-        self.offset_for_point(point(
-            position.x,
-            if down {
-                position.y + distance
+        let y = position.y + line_height / 2. + if down { distance } else { -distance };
+        if !page && (y < bounds.top() || y >= bounds.bottom()) {
+            // Paragraph gaps and mixed font sizes are not keyboard rows. Move
+            // to the adjacent layout item instead of landing back in this gap.
+            let adjacent = if down {
+                self.text_layouts
+                    .iter()
+                    .find(|record| record.item_ix > item_ix)
             } else {
-                position.y - distance
-            },
-        ))
+                self.text_layouts
+                    .iter()
+                    .rev()
+                    .find(|record| record.item_ix < item_ix)
+            };
+            if let Some(record) = adjacent {
+                let y = if down {
+                    record.bounds.top() + record.layout.line_height() / 2.
+                } else {
+                    record.bounds.bottom() - record.layout.line_height() / 2.
+                };
+                return self.offset_for_point(point(position.x, y));
+            }
+        }
+        self.offset_for_point(point(position.x, y))
     }
 
     fn move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -2301,39 +2319,74 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     fn offset_for_point(&self, point: Point<Pixels>) -> usize {
-        if let Some(record) = self
+        if self
+            .trailer_layout
+            .is_some_and(|(_, bounds)| point.y >= bounds.top())
+        {
+            return self.model.text.len();
+        }
+
+        // Typography and host wrappers leave gaps between text layouts. Those
+        // gaps belong to the nearest content boundary, never implicitly to EOF.
+        // Include blocks even in their horizontal gutter so dragging across an
+        // object resolves to its before/after boundary without entering it.
+        let distance = |bounds: Bounds<Pixels>| {
+            (bounds.top() - point.y)
+                .max(point.y - bounds.bottom())
+                .max(Pixels::ZERO)
+        };
+        let nearest = self
             .text_layouts
             .iter()
-            .find(|record| record.bounds.top() <= point.y && point.y <= record.bounds.bottom())
-        {
-            let local = record
-                .layout
-                .index_for_position(point)
-                .unwrap_or_else(|_| record.display.len());
-            return self
-                .model
-                .display_to_source(record.display.start + local, Affinity::After)
-                .unwrap_or(self.model.text.len());
+            .map(|record| (record.bounds, record.item_ix, Some(record), None))
+            .chain(
+                self.block_layouts
+                    .iter()
+                    .map(|record| (record.bounds, record.item_ix, None, Some(record))),
+            )
+            .min_by(|a, b| {
+                f32::from(distance(a.0))
+                    .total_cmp(&f32::from(distance(b.0)))
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+        match nearest {
+            Some((_, _, Some(record), _)) => self.text_offset_for_point(record, point),
+            Some((_, _, _, Some(record))) => {
+                if point.y < record.bounds.center().y {
+                    record.source.start
+                } else {
+                    record.source.end
+                }
+            }
+            _ => self.model.cursor(),
         }
-        if let Some(record) = self
-            .block_layouts
-            .iter()
-            .find(|record| record.bounds.contains(&point))
-        {
-            return if point.y < record.bounds.center().y {
-                record.source.start
-            } else {
-                record.source.end
-            };
-        }
-        if self
-            .last_bounds
-            .is_some_and(|bounds| point.y < bounds.top())
-        {
+    }
+
+    fn text_offset_for_point(&self, record: &TextLayoutRecord, point: Point<Pixels>) -> usize {
+        let local = if point.y < record.bounds.top() {
             0
+        } else if point.y >= record.bounds.bottom() {
+            record.display.len()
         } else {
-            self.model.text.len()
-        }
+            // Each document item is one logical line. Choose the nearest caret
+            // boundary, not the containing glyph; Err also carries a valid
+            // index at either edge of the actual soft-wrapped row.
+            record.layout.line_layout_for_index(0).map_or(0, |line| {
+                line.closest_index_for_position(
+                    point - record.bounds.origin,
+                    record.layout.line_height(),
+                )
+                .unwrap_or_else(|index| index)
+            })
+        };
+        let affinity = if local == record.display.len() && local > 0 {
+            Affinity::Before
+        } else {
+            Affinity::After
+        };
+        self.model
+            .display_to_source(record.display.start + local, affinity)
+            .expect("laid out display positions map to source")
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2342,9 +2395,13 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             .iter()
             .any(|block| block.bounds.contains(&event.position))
         {
-            self.drag_anchor = None;
+            self.auto_scroll.stop();
             return;
         }
+        self.auto_scroll.stop();
+        self.stop_following(cx);
+        self.clear_pending_viewport_anchor();
+        self.caret_reveal_pending = false;
         self.focus_handle.focus(window, cx);
         let offset = self.offset_for_point(event.position);
         let anchor = if event.modifiers.shift {
@@ -2352,27 +2409,57 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         } else {
             offset
         };
-        self.drag_anchor = Some(anchor);
+        self.auto_scroll.last_drag_position = Some(event.position);
         self.model.replace_selection(anchor, offset);
         cx.emit(DocumentEvent::SelectionChanged);
         cx.notify();
     }
 
-    fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if event.pressed_button != Some(gpui::MouseButton::Left) {
+            self.auto_scroll.stop();
             return;
         }
-        let Some(anchor) = self.drag_anchor else {
+        if self.auto_scroll.last_drag_position.is_none() {
             return;
-        };
-        self.model
-            .replace_selection(anchor, self.offset_for_point(event.position));
-        cx.emit(DocumentEvent::SelectionChanged);
-        cx.notify();
+        }
+        self.auto_scroll.last_drag_position = Some(event.position);
+        self.extend_pointer_selection(cx);
+        let delta = AutoScroll::compute_delta(event.position.y, self.list_state.viewport_bounds());
+        self.auto_scroll.set(delta, cx, |delta, state, cx| {
+            state.list_state.scroll_by(delta);
+            // Resolve the pointer again after prepaint supplies the newly
+            // visible rows, not against the previous frame's text geometry.
+            cx.notify();
+        });
     }
 
-    fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        self.drag_anchor = None;
+    pub(super) fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        if event.button == gpui::MouseButton::Left {
+            self.auto_scroll.stop();
+        }
+    }
+
+    pub(super) fn extend_pointer_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(mut point) = self.auto_scroll.last_drag_position else {
+            return;
+        };
+        let viewport = self.list_state.viewport_bounds();
+        point.y = point.y.clamp(viewport.top(), viewport.bottom());
+        let head = self.offset_for_point(point);
+        // The selection anchor is already tracked through host transactions.
+        // Keeping another raw byte offset here would drift during streaming.
+        let (anchor, previous_head) = self.model.selection_offsets();
+        if head != previous_head {
+            self.model.replace_selection(anchor, head);
+            cx.emit(DocumentEvent::SelectionChanged);
+            cx.notify();
+        }
     }
 
     fn capture_viewport_anchor(&mut self) {
@@ -3124,11 +3211,6 @@ impl<I: Clone + Eq + 'static> Render for DocumentState<I> {
                 gpui::MouseButton::Left,
                 window.listener_for(&interaction_entity, Self::mouse_down),
             )
-            .on_mouse_up(
-                gpui::MouseButton::Left,
-                window.listener_for(&interaction_entity, Self::mouse_up),
-            )
-            .on_mouse_move(window.listener_for(&interaction_entity, Self::mouse_move))
             .cursor_text();
         div()
             .id("document-state")
@@ -4123,6 +4205,293 @@ mod tests {
             assert!(document.list_state.logical_scroll_top().item_ix > 0);
         });
         assert_eq!(stopped.get(), 2);
+    }
+
+    #[gpui::test]
+    fn drag_scroll_keeps_a_tracked_anchor_and_stops_on_release_outside(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        let history = "history line\n".repeat(200);
+        let history_len = history.len();
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document
+                    .reset(
+                        DocumentSnapshot::new(
+                            history,
+                            vec![
+                                DocumentRegion::new(
+                                    "history",
+                                    0..history_len,
+                                    EditPolicy::Readonly,
+                                ),
+                                DocumentRegion::new(
+                                    "draft",
+                                    history_len..history_len,
+                                    EditPolicy::Editable,
+                                ),
+                            ],
+                            DocumentProjection::identity(history_len),
+                            vec![],
+                            DocumentStyles::default(),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+                document.list_state.scroll_to(ListOffset {
+                    item_ix: 100,
+                    offset_in_item: Pixels::ZERO,
+                });
+            });
+            let _ = window.draw(cx);
+        });
+        let (start, outside, initial_top) = document.read_with(&cx, |document, _| {
+            let viewport = document.list_state.viewport_bounds();
+            (
+                viewport.center(),
+                point(viewport.left() + px(30.), viewport.bottom() + px(20.)),
+                document.list_state.logical_scroll_top(),
+            )
+        });
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        let anchor = document.read_with(&cx, |document, _| document.model.selection_offsets().0);
+        assert!(anchor > 0);
+        cx.simulate_mouse_move(outside, Some(MouseButton::Left), Modifiers::default());
+        let initial_head = document.read_with(&cx, |document, _| {
+            assert!(document.auto_scroll.is_active());
+            assert!(document.selected_range().end < history_len);
+            document.model.cursor()
+        });
+        cx.run_until_parked();
+        for _ in 0..5 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(20));
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
+        document.read_with(&cx, |document, _| {
+            let top = document.list_state.logical_scroll_top();
+            assert!(
+                top.item_ix > initial_top.item_ix
+                    || top.offset_in_item > initial_top.offset_in_item
+            );
+            assert!(document.model.cursor() > initial_head);
+            assert_eq!(document.model.selection_offsets().0, anchor);
+        });
+
+        // Host insertion moves the real selection anchor while dragging.
+        document.update(&mut cx, |document, cx| {
+            let insertion = "new line\n";
+            let transaction = EditTransaction::new(
+                document.revision(),
+                EditOrigin::Host,
+                vec![TextEdit::new(0..0, insertion)],
+                document.text().len(),
+            )
+            .unwrap();
+            let end = history_len + insertion.len();
+            document
+                .apply_host_transaction(
+                    transaction,
+                    vec![
+                        DocumentRegion::new("history", 0..end, EditPolicy::Readonly),
+                        DocumentRegion::new("draft", end..end, EditPolicy::Editable),
+                    ],
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_move(outside, Some(MouseButton::Left), Modifiers::default());
+        document.read_with(&cx, |document, _| {
+            assert_eq!(
+                document.model.selection_offsets().0,
+                anchor + "new line\n".len()
+            )
+        });
+        cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::default());
+        let stopped = document.read_with(&cx, |document, _| {
+            assert!(!document.auto_scroll.is_active());
+            assert!(document.auto_scroll.last_drag_position.is_none());
+            (
+                document.list_state.logical_scroll_top(),
+                document.selected_range(),
+            )
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        document.read_with(&cx, |document, _| {
+            assert_eq!(document.selected_range(), stopped.1)
+        });
+        document.read_with(&cx, |document, _| {
+            let top = document.list_state.logical_scroll_top();
+            assert_eq!(
+                (top.item_ix, top.offset_in_item),
+                (stopped.0.item_ix, stopped.0.offset_in_item)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn pointer_selection_covers_rich_text_gaps_wrapping_blocks_and_trailer(
+        cx: &mut TestAppContext,
+    ) {
+        let (document, mut cx) = document_view(cx);
+        let heading = "# Heading\n";
+        let body = format!("{}\n", "中文🙂 words ".repeat(12));
+        let block_start = heading.len() + body.len();
+        let draft_start = block_start + '\u{fffc}'.len_utf8();
+        let source = format!("{heading}{body}\u{fffc}draft");
+        let end = source.len();
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.set_block_renderer(
+                    |_, _, _| div().h(px(80.)).w(px(120.)).into_any_element(),
+                    cx,
+                );
+                document.set_text_renderer(
+                    |_, text, _, _| {
+                        div()
+                            .w(px(260.))
+                            .pt(px(24.))
+                            .pl(px(30.))
+                            .child(text)
+                            .into_any_element()
+                    },
+                    cx,
+                );
+                document
+                    .reset(
+                        DocumentSnapshot::new(
+                            source,
+                            vec![
+                                DocumentRegion::new(
+                                    "history",
+                                    0..block_start,
+                                    EditPolicy::Readonly,
+                                ),
+                                DocumentRegion::new(
+                                    "object",
+                                    block_start..draft_start,
+                                    EditPolicy::Atomic,
+                                ),
+                                DocumentRegion::new(
+                                    "draft",
+                                    draft_start..end,
+                                    EditPolicy::Editable,
+                                ),
+                            ],
+                            DocumentProjection::new(
+                                end,
+                                vec![
+                                    ProjectionSpan::hide(0..2),
+                                    ProjectionSpan::hide(block_start..draft_start),
+                                ],
+                            )
+                            .unwrap(),
+                            vec![DocumentBlock::new("object", block_start..draft_start)],
+                            DocumentStyles::new(
+                                vec![super::super::DocumentParagraphStyle::new(
+                                    0..heading.len(),
+                                    TextStyleRefinement {
+                                        font_size: Some(px(24.).into()),
+                                        ..Default::default()
+                                    },
+                                )],
+                                vec![],
+                            ),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+                document.set_dynamic_trailer(true, cx);
+                document.focus_handle.focus(window, cx);
+            });
+            let _ = window.draw(cx);
+        });
+        let (start, lower_gap, left, upper_gap, wrap_left, wrap_source) =
+            document.read_with(&cx, |document, _| {
+                let title = &document.text_layouts[0];
+                let body = &document.text_layouts[1];
+                let origin = title.layout.position_for_index(1).unwrap();
+                let start = point(origin.x, origin.y + title.layout.line_height() / 2.);
+                let line = body.layout.line_layout_for_index(0).unwrap();
+                let boundary = line.wrap_boundaries[0];
+                let wrap = line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+                let wrap_y = body.bounds.top() + body.layout.line_height();
+                (
+                    start,
+                    point(start.x, title.bounds.bottom() + px(1.)),
+                    point(title.bounds.left() - px(10.), start.y),
+                    point(start.x, body.bounds.top() - px(1.)),
+                    point(
+                        body.bounds.left() - px(10.),
+                        wrap_y + body.layout.line_height() / 2.,
+                    ),
+                    heading.len() + wrap,
+                )
+            });
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(lower_gap, Some(MouseButton::Left), Modifiers::default());
+        document.read_with(&cx, |document, _| {
+            assert_eq!(document.selected_range(), 3..heading.len() - 1)
+        });
+        cx.simulate_mouse_move(left, Some(MouseButton::Left), Modifiers::default());
+        document.read_with(&cx, |document, _| {
+            assert_eq!(document.model.selection_offsets(), (3, 2))
+        });
+        cx.simulate_mouse_move(upper_gap, Some(MouseButton::Left), Modifiers::default());
+        document.read_with(&cx, |document, _| {
+            assert_eq!(document.model.selection_offsets(), (3, heading.len()))
+        });
+        cx.simulate_mouse_move(wrap_left, Some(MouseButton::Left), Modifiers::default());
+        document.read_with(&cx, |document, _| {
+            assert_eq!(document.model.selection_offsets(), (3, wrap_source))
+        });
+        cx.simulate_mouse_up(wrap_left, MouseButton::Left, Modifiers::default());
+
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_keystrokes("shift-down");
+        document.read_with(&cx, |document, _| {
+            assert!(document.selected_range().end >= heading.len());
+            assert!(document.selected_range().end < block_start);
+            let block = &document.block_layouts[0];
+            assert_eq!(
+                document.offset_for_point(point(
+                    block.bounds.right() + px(20.),
+                    block.bounds.top() + px(1.)
+                )),
+                block_start
+            );
+            assert_eq!(
+                document.offset_for_point(point(
+                    block.bounds.right() + px(20.),
+                    block.bounds.bottom() - px(1.)
+                )),
+                draft_start
+            );
+            let (_, trailer) = document.trailer_layout.unwrap();
+            assert_eq!(document.offset_for_point(trailer.center()), end);
+        });
+        let (block_center, selected) = document.read_with(&cx, |document, _| {
+            (
+                document.block_layouts[0].bounds.center(),
+                document.selected_range(),
+            )
+        });
+        cx.simulate_mouse_down(block_center, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(block_center, MouseButton::Left, Modifiers::default());
+        document.read_with(&cx, |document, _| {
+            assert_eq!(document.selected_range(), selected)
+        });
     }
 
     #[gpui::test]
