@@ -2506,11 +2506,17 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     fn move_to_start(&mut self, _: &MoveToStart, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selection_head(0, false, cx);
+        // Document-wide jumps choose the endpoint node even when it shares an
+        // offset with the current node.
+        if let Ok(position) = self.position_for_offset(0, Affinity::Before) {
+            self.move_selection_to_position(position, false, cx);
+        }
     }
 
     fn move_to_end(&mut self, _: &MoveToEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selection_head(self.model.text.len(), false, cx);
+        if let Ok(position) = self.position_for_offset(self.model.text.len(), Affinity::After) {
+            self.move_selection_to_position(position, false, cx);
+        }
     }
 
     fn move_to_previous_word(
@@ -2545,11 +2551,15 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     fn select_to_start(&mut self, _: &SelectToStart, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selection_head(0, true, cx);
+        if let Ok(position) = self.position_for_offset(0, Affinity::Before) {
+            self.move_selection_to_position(position, true, cx);
+        }
     }
 
     fn select_to_end(&mut self, _: &SelectToEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selection_head(self.model.text.len(), true, cx);
+        if let Ok(position) = self.position_for_offset(self.model.text.len(), Affinity::After) {
+            self.move_selection_to_position(position, true, cx);
+        }
     }
 
     fn select_to_previous_word(
@@ -4268,12 +4278,69 @@ mod tests {
             document.read(cx).focus_handle(cx).focus(window, cx);
         });
 
-        cx.simulate_keystrokes("ctrl-end shift-left ctrl-shift-home");
+        let keys = if cfg!(target_os = "macos") {
+            "cmd-down shift-left cmd-shift-up"
+        } else {
+            "ctrl-end shift-left ctrl-shift-home"
+        };
+        cx.simulate_keystrokes(keys);
 
         document.read_with(&cx, |document, _| {
             assert_eq!(document.selected_range(), 0..7);
             assert_eq!(document.model.selection_offsets(), (7, 0));
         });
+    }
+
+    #[gpui::test]
+    fn document_boundary_navigation_reaches_empty_text_regions(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        let keys = if cfg!(target_os = "macos") {
+            ["cmd-down", "cmd-shift-down", "cmd-up", "cmd-shift-up"]
+        } else {
+            ["ctrl-end", "ctrl-shift-end", "ctrl-home", "ctrl-shift-home"]
+        };
+        for (key, (target, extend, expected)) in keys.into_iter().zip([
+            ("after", false, "historyx"),
+            ("after", true, "history"),
+            ("before", false, "xhistory"),
+            ("before", true, "history"),
+        ]) {
+            let initial = DocumentPosition::new("history", 3, Affinity::After);
+            cx.update(|window, cx| {
+                document.update(cx, |document, cx| {
+                    document
+                        .reset(
+                            DocumentSnapshot::new(
+                                "history",
+                                vec![
+                                    DocumentRegion::new("before", 0..0, EditPolicy::Editable),
+                                    DocumentRegion::new("history", 0..7, EditPolicy::Readonly),
+                                    DocumentRegion::new("after", 7..7, EditPolicy::Editable),
+                                ],
+                                DocumentProjection::identity(7),
+                                Vec::new(),
+                                DocumentStyles::default(),
+                            )
+                            .selection(initial.clone()),
+                            cx,
+                        )
+                        .unwrap();
+                    document.focus_handle(cx).focus(window, cx);
+                });
+                let _ = window.draw(cx);
+            });
+            cx.simulate_keystrokes(key);
+            document.read_with(&cx, |document, _| {
+                let (anchor, head) = document.selected_positions().unwrap();
+                assert_eq!(head.node_id(), &target, "{key}");
+                assert_eq!(head.offset(), 0, "{key}");
+                assert_eq!(anchor, if extend { initial } else { head }, "{key}");
+            });
+            cx.simulate_keystrokes("x");
+            document.read_with(&cx, |document, _| {
+                assert_eq!(document.text(), expected, "{key}");
+            });
+        }
     }
 
     #[gpui::test]
