@@ -783,23 +783,6 @@ impl<I: Clone + Eq> DocumentModel<I> {
         (region.policy() == EditPolicy::Editable).then(|| region.range())
     }
 
-    fn editable_group_start_for_cursor(&self) -> Option<usize> {
-        let cursor = self.cursor();
-        let mut index = self.region_for_range(&(cursor..cursor))?;
-        if self.regions.as_slice()[index].policy() != EditPolicy::Editable {
-            return None;
-        }
-        while index > 0
-            && matches!(
-                self.regions.as_slice()[index - 1].policy(),
-                EditPolicy::Editable | EditPolicy::Atomic
-            )
-        {
-            index -= 1;
-        }
-        Some(self.regions.as_slice()[index].range().start)
-    }
-
     fn region_index(&self, id: &I) -> Option<usize> {
         self.regions
             .as_slice()
@@ -1445,30 +1428,6 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                     source <= end
                 }
                 DocumentLayoutItem::Block { source: block, .. } => source <= block.end,
-                DocumentLayoutItem::Trailer => true,
-            })
-            .unwrap_or(self.layout_items.len())
-    }
-
-    fn layout_item_for_source_after(&self, source: usize) -> usize {
-        self.layout_items
-            .iter()
-            .position(|item| match item {
-                DocumentLayoutItem::Text { display, .. } => {
-                    let start = self
-                        .model
-                        .display_to_source(display.start, Affinity::After)
-                        .unwrap_or(0);
-                    let end = self
-                        .model
-                        .display_to_source(display.end, Affinity::After)
-                        .unwrap_or(self.model.text.len());
-                    (start <= source && source < end) || (start == end && source == start)
-                }
-                DocumentLayoutItem::Block { source: block, .. } => {
-                    (block.start <= source && source < block.end)
-                        || (block.is_empty() && source == block.start)
-                }
                 DocumentLayoutItem::Trailer => true,
             })
             .unwrap_or(self.layout_items.len())
@@ -2613,19 +2572,14 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             self.text_position_for_display(display, Affinity::After)
         else {
             if let Some(item_ix) = self.text_item_for_display(display, Affinity::After) {
-                let viewport_lines = (self.list_state.viewport_bounds().size.height / px(21.))
-                    .max(1.)
-                    .floor() as usize;
-                let coarse_item_ix = self
-                    .model
-                    .editable_group_start_for_cursor()
-                    .map(|start| self.layout_item_for_source_after(start))
-                    .filter(|start| item_ix.saturating_sub(*start) + 2 <= viewport_lines)
-                    .unwrap_or(item_ix);
-                self.list_state.scroll_to(ListOffset {
-                    item_ix: coarse_item_ix,
-                    offset_in_item: Pixels::ZERO,
-                });
+                if self.list_state.bounds_for_item(item_ix).is_some() {
+                    self.list_state.scroll_to_reveal_item(item_ix);
+                } else {
+                    self.list_state.scroll_to(ListOffset {
+                        item_ix,
+                        offset_in_item: Pixels::ZERO,
+                    });
+                }
                 cx.notify();
             }
             return;
@@ -2709,6 +2663,18 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         let target_y = viewport.top() + viewport.size.height * viewport_fraction;
         let delta = position.y - target_y;
         if delta.abs() < px(0.5) {
+            return;
+        }
+        let top = self.list_state.logical_scroll_top();
+        if delta < Pixels::ZERO && top.item_ix == 0 && top.offset_in_item <= Pixels::ZERO {
+            return;
+        }
+        if delta > Pixels::ZERO
+            && self
+                .list_state
+                .bounds_for_item(self.layout_items.len().saturating_sub(1))
+                .is_some_and(|bounds| bounds.bottom() <= viewport.bottom())
+        {
             return;
         }
         self.list_state.scroll_by(delta);
@@ -3285,24 +3251,6 @@ mod tests {
         assert_eq!(model.regions.as_slice()[0].range(), 0..7);
         assert_eq!(model.regions.as_slice()[1].range(), 7..13);
         assert_eq!(model.revision.value(), 1);
-    }
-
-    #[test]
-    fn editable_group_crosses_atomic_blocks_but_stops_at_readonly_history() {
-        let mut model = DocumentModel::new(
-            "history\ntext\u{fffc}",
-            vec![
-                DocumentRegion::new("history", 0..7, EditPolicy::Readonly),
-                DocumentRegion::new("separator", 7..8, EditPolicy::Readonly),
-                DocumentRegion::new("draft-1", 8..12, EditPolicy::Editable),
-                DocumentRegion::new("terminal", 12..15, EditPolicy::Atomic),
-                DocumentRegion::new("draft-2", 15..15, EditPolicy::Editable),
-            ],
-        )
-        .unwrap();
-        model.replace_selection(15, 15);
-
-        assert_eq!(model.editable_group_start_for_cursor(), Some(8));
     }
 
     #[test]
@@ -3972,6 +3920,26 @@ mod tests {
                 "newline moved the draft to the top"
             );
         });
+        let mut previous_y = before;
+        for _ in 0..45 {
+            cx.simulate_keystrokes("enter");
+            cx.update(|window, cx| {
+                for _ in 0..3 {
+                    let _ = window.draw(cx);
+                }
+            });
+            let y = document.read_with(&cx, |document, _| {
+                document
+                    .screen_position_for_source(document.model.cursor(), Affinity::After)
+                    .unwrap()
+                    .y
+            });
+            assert!(
+                y >= previous_y - px(1.),
+                "caret jumped upward at the viewport edge: {previous_y:?} -> {y:?}"
+            );
+            previous_y = y;
+        }
     }
 
     #[gpui::test]
@@ -4119,7 +4087,7 @@ mod tests {
                     .pin_scroll(
                         "turn-4",
                         &DocumentPosition::new("history", 0, Affinity::After),
-                        0.,
+                        0.381_966,
                         cx,
                     )
                     .unwrap();
