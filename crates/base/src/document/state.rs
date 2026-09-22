@@ -2446,15 +2446,11 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         display: usize,
         affinity: Affinity,
     ) -> Option<(Point<Pixels>, Pixels, usize, Bounds<Pixels>)> {
-        let mut matches = self
+        let item_ix = self.text_item_for_display(display, affinity)?;
+        let record = self
             .text_layouts
             .iter()
-            .filter(|record| record.display.start <= display && display <= record.display.end);
-        let record = if affinity == Affinity::Before {
-            matches.next()
-        } else {
-            matches.next_back()
-        }?;
+            .find(|record| record.item_ix == item_ix)?;
         record
             .layout
             .position_for_index(display.saturating_sub(record.display.start))
@@ -2466,6 +2462,28 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                     record.bounds,
                 )
             })
+    }
+
+    // Resolve against the whole layout, so virtualization cannot transfer a boundary
+    // caret to a preceding item when its actual owner is just outside the viewport.
+    fn text_item_for_display(&self, offset: usize, affinity: Affinity) -> Option<usize> {
+        let mut matches =
+            self.layout_items
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, item)| match item {
+                    DocumentLayoutItem::Text { display, .. }
+                        if display.start <= offset && offset <= display.end =>
+                    {
+                        Some(ix)
+                    }
+                    _ => None,
+                });
+        if affinity == Affinity::Before {
+            matches.next()
+        } else {
+            matches.next_back()
+        }
     }
 
     fn text_position_for_display_in_item(
@@ -2557,14 +2575,17 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.stop_following(cx);
         self.caret_reveal_pending = true;
         let cursor = self.model.cursor();
-        let item_ix = self.layout_item_for_source(cursor);
+        let item_ix = self
+            .model
+            .source_to_display(cursor, Affinity::After)
+            .and_then(|display| self.text_item_for_display(display, Affinity::After))
+            .unwrap_or_else(|| self.layout_item_for_source(cursor));
         let is_laid_out = self
             .model
             .source_to_display(cursor, Affinity::After)
             .is_some_and(|display| {
-                self.text_layouts
-                    .iter()
-                    .any(|record| record.display.contains_inclusive(display))
+                self.text_position_for_display(display, Affinity::After)
+                    .is_some()
             })
             || self
                 .block_layouts
@@ -2797,6 +2818,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
 
     pub(super) fn segment_paint_snapshot(
         &self,
+        item_ix: usize,
         display: &Range<usize>,
     ) -> (FocusHandle, Option<Range<usize>>, Option<usize>) {
         let selection = self.display_selection_range();
@@ -2814,7 +2836,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         let cursor = self
             .model
             .source_to_display(self.model.cursor(), Affinity::After)
-            .filter(|cursor| display.start <= *cursor && *cursor <= display.end)
+            .filter(|cursor| self.text_item_for_display(*cursor, Affinity::After) == Some(item_ix))
             .map(|cursor| cursor - display.start);
         (self.focus_handle.clone(), selected_range, cursor)
     }
@@ -3002,14 +3024,21 @@ impl<I: Clone + Eq + 'static> EntityInputHandler for DocumentState<I> {
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let source = self.range_from_utf16(&range_utf16);
-        let start_display = self
-            .model
-            .source_to_display(source.start, Affinity::Before)?;
+        let start_affinity = if source.is_empty() {
+            Affinity::After
+        } else {
+            Affinity::Before
+        };
+        let start_display = self.model.source_to_display(source.start, start_affinity)?;
         let end_display = self.model.source_to_display(source.end, Affinity::After)?;
-        let start_item = self.layout_item_for_source(source.start);
-        let end_item = self.layout_item_for_source(source.end);
+        let start_item = self
+            .text_item_for_display(start_display, start_affinity)
+            .unwrap_or_else(|| self.layout_item_for_source(source.start));
+        let end_item = self
+            .text_item_for_display(end_display, Affinity::After)
+            .unwrap_or_else(|| self.layout_item_for_source(source.end));
         let (start, line_height, _, _) =
-            self.text_position_for_display_in_item(start_display, Affinity::Before, start_item)?;
+            self.text_position_for_display_in_item(start_display, start_affinity, start_item)?;
         let (mut end, _, _, _) =
             self.text_position_for_display_in_item(end_display, Affinity::After, end_item)?;
         end.y = start.y;
@@ -3164,7 +3193,7 @@ mod tests {
         ScrollWheelEvent, TestAppContext, VisualTestContext, point, px,
     };
 
-    use crate::Theme;
+    use crate::{Theme, document::ProjectionSpan};
 
     struct DocumentRoot(Entity<DocumentState<&'static str>>);
 
@@ -3350,6 +3379,106 @@ mod tests {
                 assert_eq!(document.text_input_editable_range(window, cx), Some(7..8));
             });
         });
+    }
+
+    #[gpui::test]
+    fn boundary_caret_has_one_owner_and_matching_ime_geometry(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        for text in [
+            String::new(),
+            "history".into(),
+            "# title\nbody\n".into(),
+            format!("{}\ndraft", "wrapped text ".repeat(100)),
+        ] {
+            cx.update(|window, cx| {
+                document.update(cx, |document, cx| {
+                    let end = text.len();
+                    let spans = if text.starts_with('#') {
+                        vec![ProjectionSpan::hide(0..2)]
+                    } else {
+                        vec![]
+                    };
+                    document
+                        .reset(
+                            DocumentSnapshot::new(
+                                text.clone(),
+                                vec![
+                                    DocumentRegion::new("history", 0..end, EditPolicy::Readonly),
+                                    DocumentRegion::new("draft", end..end, EditPolicy::Editable),
+                                ],
+                                DocumentProjection::new(end, spans).unwrap(),
+                                vec![],
+                                DocumentStyles::default(),
+                            ),
+                            cx,
+                        )
+                        .unwrap();
+                });
+                let _ = window.draw(cx);
+                document.update(cx, |document, cx| {
+                    let offsets = document
+                        .text_layouts
+                        .iter()
+                        .flat_map(|record| [record.display.start, record.display.end])
+                        .collect::<Vec<_>>();
+                    for display in offsets {
+                        let source = document
+                            .model
+                            .display_to_source(display, Affinity::After)
+                            .unwrap();
+                        document.set_selection(source..source, false, cx);
+                        let painted = document
+                            .text_layouts
+                            .iter()
+                            .filter_map(|record| {
+                                document
+                                    .segment_paint_snapshot(record.item_ix, &record.display)
+                                    .2
+                                    .map(|cursor| (record, cursor))
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(painted.len(), 1, "display boundary {display} in {text:?}");
+                        let (record, cursor) = painted[0];
+                        let position = record.layout.position_for_index(cursor).unwrap();
+                        let utf16 = document.model.text.offset_to_offset_utf16(source);
+                        let bounds = document
+                            .bounds_for_range(
+                                utf16..utf16,
+                                document.last_bounds.unwrap(),
+                                window,
+                                cx,
+                            )
+                            .unwrap();
+                        assert_eq!(bounds.origin, position);
+                        assert_eq!(bounds.size.width, Pixels::ZERO);
+                    }
+                    // Soft wraps live inside one text layout; they use the same glyph
+                    // position for both caret paint and the platform input rectangle.
+                    if text.starts_with("wrapped") {
+                        let record = &document.text_layouts[0];
+                        let origin = record.layout.position_for_index(0).unwrap();
+                        let wrap = (1..record.display.end)
+                            .find(|ix| {
+                                record
+                                    .layout
+                                    .position_for_index(*ix)
+                                    .is_some_and(|p| p.y > origin.y)
+                            })
+                            .expect("the long paragraph should wrap");
+                        let position = record.layout.position_for_index(wrap).unwrap();
+                        document.set_selection(wrap..wrap, false, cx);
+                        assert_eq!(
+                            document.segment_paint_snapshot(0, &(0..text.len())).2,
+                            Some(wrap)
+                        );
+                        let bounds = document
+                            .bounds_for_range(wrap..wrap, document.last_bounds.unwrap(), window, cx)
+                            .unwrap();
+                        assert_eq!(bounds.origin, position);
+                    }
+                });
+            });
+        }
     }
 
     #[gpui::test]
@@ -3953,7 +4082,7 @@ mod tests {
                 document.replace_text_in_range(None, "x", window, cx);
                 assert_eq!(document.text(), "historyx");
                 assert_eq!(document.display_text(), "toryx");
-                assert_eq!(document.segment_paint_snapshot(&(0..5)).2, Some(5));
+                assert_eq!(document.segment_paint_snapshot(0, &(0..5)).2, Some(5));
             });
         });
     }

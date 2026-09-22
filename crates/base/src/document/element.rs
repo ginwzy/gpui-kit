@@ -299,8 +299,10 @@ impl<I: Clone + Eq + 'static> Element for DocumentTextElement<I> {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (focus_handle, selected_range, cursor) =
-            self.state.read(cx).segment_paint_snapshot(&self.display);
+        let (focus_handle, selected_range, cursor) = self
+            .state
+            .read(cx)
+            .segment_paint_snapshot(self.item_ix, &self.display);
         let layout = self.text.layout().clone();
         if let Some(selected_range) = selected_range.filter(|range| !range.is_empty()) {
             let selection_color = crate::Theme::global(cx).tokens.colors.selection;
