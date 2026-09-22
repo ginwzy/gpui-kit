@@ -1080,6 +1080,7 @@ struct PendingViewportAnchor {
 struct ScrollPin<I> {
     id: I,
     anchor: DocumentAnchor,
+    affinity: Affinity,
     viewport_fraction: f32,
 }
 
@@ -1359,12 +1360,11 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.scroll_pin = Some(ScrollPin {
             id: pin_id,
             anchor,
+            affinity: position.affinity(),
             viewport_fraction,
         });
-        self.list_state.scroll_to(ListOffset {
-            item_ix: self.layout_item_for_source(offset),
-            offset_in_item: Pixels::ZERO,
-        });
+        self.caret_reveal_pending = false;
+        self.clear_pending_viewport_anchor();
         cx.notify();
         Ok(())
     }
@@ -2412,7 +2412,10 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     fn capture_viewport_anchor(&mut self) {
-        if self.pending_viewport_anchor.is_some() {
+        if self.pending_viewport_anchor.is_some()
+            || self.scroll_pin.is_some()
+            || self.caret_reveal_pending
+        {
             return;
         }
         if self.text_layouts.is_empty() && self.block_layouts.is_empty() {
@@ -2525,8 +2528,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         let Some(display) = self.model.source_to_display(offset, Affinity::After) else {
             return;
         };
-        let Some((position, _, item_ix, item_bounds)) =
-            self.text_position_for_display(display, Affinity::After)
+        let Some((position, _, _, _)) = self.text_position_for_display(display, Affinity::After)
         else {
             return;
         };
@@ -2534,13 +2536,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             .pending_viewport_anchor
             .take()
             .expect("pending viewport anchor was present");
-        let viewport = self.list_state.viewport_bounds();
-        let offset_in_item = (position.y - item_bounds.top() + viewport.top() - pending.viewport_y)
-            .max(Pixels::ZERO);
-        self.list_state.scroll_to(ListOffset {
-            item_ix,
-            offset_in_item,
-        });
+        self.list_state.scroll_by(position.y - pending.viewport_y);
         self.model.anchors.remove(pending.anchor);
         cx.notify();
     }
@@ -2575,42 +2571,18 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
 
     fn request_caret_reveal(&mut self, cx: &mut Context<Self>) {
         self.stop_following(cx);
+        self.clear_pending_viewport_anchor();
         self.caret_reveal_pending = true;
-        let cursor = self.model.cursor();
-        let item_ix = self
-            .model
-            .source_to_display(cursor, Affinity::After)
-            .and_then(|display| self.text_item_for_display(display, Affinity::After))
-            .unwrap_or_else(|| self.layout_item_for_source(cursor));
-        let is_laid_out = self
-            .model
-            .source_to_display(cursor, Affinity::After)
-            .is_some_and(|display| {
-                self.text_position_for_display(display, Affinity::After)
-                    .is_some()
-            })
-            || self
-                .block_layouts
-                .iter()
-                .any(|record| record.source.contains_inclusive(cursor));
-        let item_is_in_viewport = self.list_state.item_is_above_viewport(item_ix) == Some(false)
-            && self.list_state.item_is_below_viewport(item_ix) == Some(false);
-        if !is_laid_out && !item_is_in_viewport {
-            let viewport_lines = (self.list_state.viewport_bounds().size.height / px(21.))
-                .max(1.)
-                .floor() as usize;
-            let coarse_item_ix = self
-                .model
-                .editable_group_start_for_cursor()
-                .map(|start| self.layout_item_for_source_after(start))
-                .filter(|start| item_ix.saturating_sub(*start) + 2 <= viewport_lines)
-                .unwrap_or(item_ix);
-            self.list_state.scroll_to(ListOffset {
-                item_ix: coarse_item_ix,
-                offset_in_item: Pixels::ZERO,
-            });
+        // Edits invalidate the current line's measurement. Decide whether to
+        // scroll only after the new layout, otherwise every insertion at EOF
+        // looks like a caret outside the viewport.
+        cx.notify();
+    }
+
+    fn clear_pending_viewport_anchor(&mut self) {
+        if let Some(pending) = self.pending_viewport_anchor.take() {
+            self.model.anchors.remove(pending.anchor);
         }
-        self.schedule_caret_reveal(cx);
     }
 
     fn schedule_caret_reveal(&mut self, cx: &mut Context<Self>) {
@@ -2640,6 +2612,22 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         let Some((position, line_height, _, _)) =
             self.text_position_for_display(display, Affinity::After)
         else {
+            if let Some(item_ix) = self.text_item_for_display(display, Affinity::After) {
+                let viewport_lines = (self.list_state.viewport_bounds().size.height / px(21.))
+                    .max(1.)
+                    .floor() as usize;
+                let coarse_item_ix = self
+                    .model
+                    .editable_group_start_for_cursor()
+                    .map(|start| self.layout_item_for_source_after(start))
+                    .filter(|start| item_ix.saturating_sub(*start) + 2 <= viewport_lines)
+                    .unwrap_or(item_ix);
+                self.list_state.scroll_to(ListOffset {
+                    item_ix: coarse_item_ix,
+                    offset_in_item: Pixels::ZERO,
+                });
+                cx.notify();
+            }
             return;
         };
         let viewport = self.list_state.viewport_bounds();
@@ -2664,21 +2652,54 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
 
     fn enforce_scroll_pin(&mut self, cx: &mut Context<Self>) {
         self.apply_scrollbar_input(cx);
-        let Some((anchor, viewport_fraction)) = self
+        let Some((anchor, affinity, viewport_fraction)) = self
             .scroll_pin
             .as_ref()
-            .map(|pin| (pin.anchor, pin.viewport_fraction))
+            .map(|pin| (pin.anchor, pin.affinity, pin.viewport_fraction))
         else {
             return;
         };
         let Some(offset) = self.model.anchors.resolve(anchor) else {
             return;
         };
-        let Some(display) = self.model.source_to_display(offset, Affinity::After) else {
+        let Some(display) = self.model.source_to_display(offset, affinity) else {
             return;
         };
-        let Some((position, _, _, _)) = self.text_position_for_display(display, Affinity::After)
-        else {
+        let position = self
+            .block_layouts
+            .iter()
+            .find(|record| {
+                if affinity == Affinity::Before {
+                    record.source.start < offset && offset <= record.source.end
+                } else {
+                    record.source.start <= offset && offset < record.source.end
+                }
+            })
+            .map(|record| {
+                point(
+                    record.bounds.left(),
+                    if offset == record.source.end {
+                        record.bounds.bottom()
+                    } else {
+                        record.bounds.top()
+                    },
+                )
+            })
+            .or_else(|| {
+                self.text_position_for_display(display, affinity)
+                    .map(|(position, _, _, _)| position)
+            });
+        let Some(position) = position else {
+            let item_ix = self
+                .text_item_for_display(display, affinity)
+                .unwrap_or_else(|| self.layout_item_for_source(offset));
+            if self.list_state.logical_scroll_top().item_ix != item_ix {
+                self.list_state.scroll_to(ListOffset {
+                    item_ix,
+                    offset_in_item: Pixels::ZERO,
+                });
+                cx.notify();
+            }
             return;
         };
         let viewport = self.list_state.viewport_bounds();
@@ -3887,6 +3908,73 @@ mod tests {
     }
 
     #[gpui::test]
+    fn typing_in_a_visible_draft_preserves_its_screen_position(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        let history = "history\n".repeat(12);
+        let end = history.len();
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document
+                    .reset(
+                        DocumentSnapshot::new(
+                            history,
+                            vec![
+                                DocumentRegion::new("history", 0..end, EditPolicy::Readonly),
+                                DocumentRegion::new("draft", end..end, EditPolicy::Editable),
+                            ],
+                            DocumentProjection::identity(end),
+                            vec![],
+                            DocumentStyles::default(),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+                document.set_dynamic_trailer(true, cx);
+                document.set_selection(end..end, false, cx);
+                document.focus_handle.focus(window, cx);
+            });
+            for _ in 0..3 {
+                let _ = window.draw(cx);
+            }
+        });
+        let before = document.read_with(&cx, |document, _| {
+            document
+                .screen_position_for_source(end, Affinity::After)
+                .unwrap()
+                .y
+        });
+        for keys in ["x", "y", "backspace", "backspace"] {
+            cx.simulate_keystrokes(keys);
+            cx.update(|window, cx| {
+                for _ in 0..3 {
+                    let _ = window.draw(cx);
+                }
+            });
+            document.read_with(&cx, |document, _| {
+                let after = document
+                    .screen_position_for_source(document.model.cursor(), Affinity::After)
+                    .unwrap()
+                    .y;
+                assert!(
+                    (after - before).abs() < px(1.),
+                    "visible draft moved from {before:?} to {after:?}"
+                );
+            });
+        }
+        cx.simulate_keystrokes("x enter y");
+        document.read_with(&cx, |document, _| {
+            let after = document
+                .screen_position_for_source(end, Affinity::After)
+                .unwrap()
+                .y;
+            assert!(
+                (after - before).abs() < px(1.),
+                "newline moved the draft to the top"
+            );
+        });
+    }
+
+    #[gpui::test]
     fn scroll_pin_tracks_a_document_anchor_and_user_scroll_stops_following(
         cx: &mut TestAppContext,
     ) {
@@ -3947,6 +4035,26 @@ mod tests {
             let target = viewport.top() + viewport.size.height * 0.381_966;
             assert!((position.y - target).abs() < px(1.));
             assert_eq!(document.pinned_scroll_id(), Some(&"turn-1"));
+        });
+
+        // A stream refresh must not first jump the anchor to the top and then
+        // correct it in a later frame.
+        let scroll =
+            document.read_with(&cx, |document, _| document.list_state.logical_scroll_top());
+        cx.update(|_, cx| {
+            document.update(cx, |document, cx| {
+                document
+                    .pin_scroll(
+                        "turn-1",
+                        &DocumentPosition::new("history", anchor_offset, Affinity::After),
+                        0.381_966,
+                        cx,
+                    )
+                    .unwrap();
+                let after = document.list_state.logical_scroll_top();
+                assert_eq!(after.item_ix, scroll.item_ix);
+                assert_eq!(after.offset_in_item, scroll.offset_in_item);
+            });
         });
 
         cx.update(|_, cx| {
