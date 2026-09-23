@@ -134,6 +134,35 @@ impl fmt::Display for PresentationError {
 impl Error for PresentationError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StructureError {
+    InvalidBoundary,
+    PrefixChanged,
+    StaleReplay,
+    MarkedText,
+    Presentation(PresentationError),
+}
+
+impl fmt::Display for StructureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBoundary => {
+                formatter.write_str("structure edit must start at a region boundary")
+            }
+            Self::PrefixChanged => {
+                formatter.write_str("structure edit must preserve the preceding document")
+            }
+            Self::StaleReplay => {
+                formatter.write_str("structure replay no longer matches the document")
+            }
+            Self::MarkedText => formatter.write_str("structure edit cannot interrupt marked text"),
+            Self::Presentation(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for StructureError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScrollPinError {
     InvalidViewportFraction,
     InvalidPosition(PositionError),
@@ -175,6 +204,7 @@ pub enum DocumentEvent<I> {
         origin: EditOrigin,
     },
     Routed(RoutedEdit<I>),
+    StructureReplayRequested(StructureReplay<I>),
     Rejected(DocumentEditRejection),
     SelectionChanged,
     ProjectionChanged,
@@ -212,10 +242,10 @@ pub struct DocumentSnapshot<I> {
     blocks: Vec<DocumentBlock<I>>,
     anchored_blocks: Vec<AnchoredBlock<I>>,
     styles: DocumentStyles,
-    selection: Option<DocumentPosition<I>>,
+    selection: Option<(DocumentPosition<I>, DocumentPosition<I>)>,
 }
 
-impl<I> DocumentSnapshot<I> {
+impl<I: Clone> DocumentSnapshot<I> {
     pub fn new(
         text: impl Into<String>,
         regions: Vec<DocumentRegion<I>>,
@@ -235,13 +265,113 @@ impl<I> DocumentSnapshot<I> {
     }
 
     pub fn selection(mut self, selection: DocumentPosition<I>) -> Self {
-        self.selection = Some(selection);
+        self.selection = Some((selection.clone(), selection));
+        self
+    }
+
+    pub fn selection_range(
+        mut self,
+        anchor: DocumentPosition<I>,
+        head: DocumentPosition<I>,
+    ) -> Self {
+        self.selection = Some((anchor, head));
         self
     }
 
     pub fn anchored_blocks(mut self, blocks: Vec<AnchoredBlock<I>>) -> Self {
         self.anchored_blocks = blocks;
         self
+    }
+}
+
+/// The document suffix owned by an application editor, relative to its start.
+/// Host-owned history is never stored in an undo record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentStructure<I> {
+    text: String,
+    regions: Vec<DocumentRegion<I>>,
+}
+
+impl<I> DocumentStructure<I> {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn regions(&self) -> &[DocumentRegion<I>] {
+        &self.regions
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.text.capacity() + self.regions.capacity() * std::mem::size_of::<DocumentRegion<I>>()
+    }
+}
+
+impl<I: Clone + Eq> DocumentStructure<I> {
+    fn suffix(model: &DocumentModel<I>, start: usize) -> Option<Self> {
+        if start > model.text.len() || model.text.clip_offset(start, Bias::Left) != start {
+            return None;
+        }
+        if model.regions.as_slice().iter().any(|region| {
+            let range = region.range();
+            range.start < start && range.end > start
+        }) {
+            return None;
+        }
+        let regions = model
+            .regions
+            .as_slice()
+            .iter()
+            .filter(|region| {
+                region.range().start >= start
+                    && matches!(region.policy(), EditPolicy::Editable | EditPolicy::Atomic)
+            })
+            .map(|region| {
+                let range = region.range();
+                DocumentRegion::new(
+                    region.id().clone(),
+                    range.start - start..range.end - start,
+                    region.policy(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut end = start;
+        for region in &regions {
+            let range = region.range();
+            if range.start != end - start {
+                return None;
+            }
+            end = start + range.end;
+        }
+        (!regions.is_empty() && end == model.text.len()).then(|| Self {
+            text: model.text.slice(start..model.text.len()).to_string(),
+            regions,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructureReplay<I> {
+    target: DocumentStructure<I>,
+    selection: Option<(DocumentPosition<I>, DocumentPosition<I>)>,
+    undo: bool,
+    start_node: I,
+}
+
+impl<I> StructureReplay<I> {
+    pub fn target(&self) -> &DocumentStructure<I> {
+        &self.target
+    }
+
+    pub fn selection(&self) -> Option<&(DocumentPosition<I>, DocumentPosition<I>)> {
+        self.selection.as_ref()
+    }
+
+    pub fn is_undo(&self) -> bool {
+        self.undo
+    }
+
+    pub fn start_node(&self) -> &I {
+        &self.start_node
     }
 }
 
@@ -333,26 +463,47 @@ struct UndoChange {
 }
 
 #[derive(Clone, Debug)]
+enum UndoKind<I> {
+    Text {
+        region_id: I,
+        changes: Vec<UndoChange>,
+    },
+    Structure {
+        before: DocumentStructure<I>,
+        after: DocumentStructure<I>,
+    },
+}
+
+#[derive(Clone, Debug)]
 struct UndoRecord<I> {
-    region_id: I,
-    changes: Vec<UndoChange>,
+    sequence: u64,
+    kind: UndoKind<I>,
     selection_before: Option<(DocumentPosition<I>, DocumentPosition<I>)>,
     selection_after: Option<(DocumentPosition<I>, DocumentPosition<I>)>,
 }
 
 impl<I> UndoRecord<I> {
+    #[cfg(test)]
     fn bytes(&self) -> usize {
-        self.changes
-            .iter()
-            .map(|change| change.removed.len() + change.inserted.len())
-            .sum()
+        match &self.kind {
+            UndoKind::Text { changes, .. } => changes
+                .iter()
+                .map(|change| change.removed.len() + change.inserted.len())
+                .sum(),
+            UndoKind::Structure { before, after } => before.text.len() + after.text.len(),
+        }
     }
 
     fn allocated_bytes(&self) -> usize {
-        self.changes
-            .iter()
-            .map(|change| change.removed.capacity() + change.inserted.capacity())
-            .sum()
+        match &self.kind {
+            UndoKind::Text { changes, .. } => changes
+                .iter()
+                .map(|change| change.removed.capacity() + change.inserted.capacity())
+                .sum(),
+            UndoKind::Structure { before, after } => {
+                before.allocated_bytes() + after.allocated_bytes()
+            }
+        }
     }
 }
 
@@ -365,7 +516,11 @@ struct DocumentUndoManager<I> {
     undo: Vec<UndoRecord<I>>,
     redo: Vec<UndoRecord<I>>,
     coalescing: Option<EditOrigin>,
+    next_sequence: u64,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UndoCheckpoint(u64);
 
 impl<I> Default for DocumentUndoManager<I> {
     fn default() -> Self {
@@ -373,41 +528,68 @@ impl<I> Default for DocumentUndoManager<I> {
             undo: Vec::new(),
             redo: Vec::new(),
             coalescing: None,
+            next_sequence: 0,
         }
     }
 }
 
 impl<I: Clone + Eq> DocumentUndoManager<I> {
+    fn checkpoint(&mut self) -> UndoCheckpoint {
+        self.break_coalescing();
+        UndoCheckpoint(self.next_sequence)
+    }
+
+    fn retire_before(&mut self, checkpoint: UndoCheckpoint) {
+        self.break_coalescing();
+        self.undo.retain(|record| record.sequence >= checkpoint.0);
+        self.redo.retain(|record| record.sequence >= checkpoint.0);
+    }
+
     fn record(&mut self, mut record: UndoRecord<I>, origin: EditOrigin) {
         self.redo.clear();
+        record.sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
         let previous = self.undo.last_mut().filter(|previous| {
             self.coalescing == Some(origin)
-                && previous.region_id == record.region_id
+                && matches!(
+                    (&previous.kind, &record.kind),
+                    (UndoKind::Text { region_id: left, .. }, UndoKind::Text { region_id: right, .. })
+                        if left == right
+                )
                 && previous.selection_after == record.selection_before
         });
         let merged = previous.is_some_and(|previous| {
+            let (UndoKind::Text { changes: left, .. }, UndoKind::Text { changes: right, .. }) =
+                (&mut previous.kind, &mut record.kind)
+            else {
+                unreachable!("only text records coalesce")
+            };
             if origin == EditOrigin::Composition {
-                if let ([left], [right]) =
-                    (previous.changes.as_mut_slice(), record.changes.as_slice())
-                    && right.range == (left.range.start..left.range.start + left.inserted.len())
-                    && right.removed == left.inserted
+                if let ([change], [next]) = (left.as_mut_slice(), right.as_slice())
+                    && next.range
+                        == (change.range.start..change.range.start + change.inserted.len())
+                    && next.removed == change.inserted
                 {
-                    if left.removed.len() + right.inserted.len() > MAX_UNDO_BYTES {
+                    if change.removed.len() + next.inserted.len() > MAX_UNDO_BYTES {
                         return false;
                     }
-                    left.inserted = right.inserted.clone();
-                } else if previous.changes.len() + record.changes.len() <= MAX_UNDO_CHANGES {
-                    if previous.bytes() + record.bytes() > MAX_UNDO_BYTES {
+                    change.inserted = next.inserted.clone();
+                } else if left.len() + right.len() <= MAX_UNDO_CHANGES {
+                    if left
+                        .iter()
+                        .chain(right.iter())
+                        .map(|change| change.removed.len() + change.inserted.len())
+                        .sum::<usize>()
+                        > MAX_UNDO_BYTES
+                    {
                         return false;
                     }
-                    previous.changes.append(&mut record.changes);
+                    left.append(right);
                 } else {
                     return false;
                 }
             } else if origin == EditOrigin::User {
-                let ([left], [right]) =
-                    (previous.changes.as_mut_slice(), record.changes.as_slice())
-                else {
+                let ([left], [right]) = (left.as_mut_slice(), right.as_slice()) else {
                     return false;
                 };
                 if left.removed.len()
@@ -451,12 +633,8 @@ impl<I: Clone + Eq> DocumentUndoManager<I> {
         }
         // A canceled composition contributes no text change and must not hide
         // the previous undo entry.
-        if self.undo.last().is_some_and(|record| {
-            record
-                .changes
-                .iter()
-                .all(|change| change.removed == change.inserted)
-        }) {
+        if self.undo.last().is_some_and(|record| matches!(&record.kind,
+            UndoKind::Text { changes, .. } if changes.iter().all(|change| change.removed == change.inserted))) {
             self.undo.pop();
             self.break_coalescing();
         } else {
@@ -467,11 +645,10 @@ impl<I: Clone + Eq> DocumentUndoManager<I> {
     }
 
     fn trim(&mut self, records: usize, bytes: usize) {
-        if self
-            .undo
-            .last()
-            .is_some_and(|record| record.changes.len() > MAX_UNDO_CHANGES)
-        {
+        if self.undo.last().is_some_and(|record| {
+            matches!(&record.kind,
+            UndoKind::Text { changes, .. } if changes.len() > MAX_UNDO_CHANGES)
+        }) {
             self.undo.clear();
         }
         let mut retained: usize = self.undo.iter().map(UndoRecord::allocated_bytes).sum();
@@ -1837,9 +2014,9 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             snapshot.anchored_blocks,
             snapshot.styles,
         )?;
-        if let Some(selection) = snapshot.selection {
+        if let Some((anchor, head)) = snapshot.selection {
             model
-                .replace_selection_positions(selection.clone(), selection)
+                .replace_selection_positions(anchor, head)
                 .map_err(PresentationError::Position)?;
         }
         model.revision = self.model.revision.next();
@@ -1933,6 +2110,53 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
 
     pub fn regions(&self) -> &[DocumentRegion<I>] {
         self.model.regions.as_slice()
+    }
+
+    /// Mark the first undo record belonging to the next editable draft.
+    /// Retire older records only after the submitted version is accepted.
+    pub fn undo_checkpoint(&mut self) -> UndoCheckpoint {
+        self.undo.checkpoint()
+    }
+
+    pub fn retire_undo_before(&mut self, checkpoint: UndoCheckpoint) {
+        self.undo.retire_before(checkpoint);
+    }
+
+    /// Change only edit permissions without replacing selection, anchors or
+    /// the user's undo history. A disabled draft cannot replay undo until it
+    /// becomes editable again.
+    pub fn set_region_policies(
+        &mut self,
+        regions: Vec<DocumentRegion<I>>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), StructureError> {
+        let regions = DocumentRegions::new(regions, self.model.text.len())
+            .map_err(|error| StructureError::Presentation(PresentationError::Regions(error)))?;
+        if !self
+            .model
+            .regions
+            .as_slice()
+            .iter()
+            .zip(regions.as_slice())
+            .all(|(old, new)| {
+                old.id() == new.id()
+                    && old.range() == new.range()
+                    && (old.policy() == new.policy()
+                        || matches!(
+                            (old.policy(), new.policy()),
+                            (EditPolicy::Editable, EditPolicy::Readonly)
+                                | (EditPolicy::Readonly, EditPolicy::Editable)
+                        ))
+            })
+            || regions.as_slice().len() != self.model.regions.as_slice().len()
+        {
+            return Err(StructureError::PrefixChanged);
+        }
+        self.model.regions = regions;
+        self.undo.break_coalescing();
+        cx.emit(DocumentEvent::PresentationChanged);
+        cx.notify();
+        Ok(())
     }
 
     pub fn selected_range(&self) -> Range<usize> {
@@ -2194,6 +2418,199 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.commit_user_transaction(transaction, None, cx)
     }
 
+    /// Replace a consumer-owned suffix as one user edit. Its inverse stays in
+    /// the same stack as text edits; the consumer supplies current presentation
+    /// when replay is requested, so host-owned history is never snapshotted.
+    pub fn apply_structure_transaction(
+        &mut self,
+        snapshot: DocumentSnapshot<I>,
+        start: usize,
+        cx: &mut Context<Self>,
+    ) -> Result<(), StructureError> {
+        let selection_before = self.selected_positions().ok();
+        let (next, before, after, selection_after) =
+            self.prepare_structure(snapshot, start, None, None)?;
+        self.undo.record(
+            UndoRecord {
+                sequence: 0,
+                kind: UndoKind::Structure { before, after },
+                selection_before,
+                selection_after: selection_after.clone(),
+            },
+            EditOrigin::User,
+        );
+        self.commit_structure(next, start, selection_after, EditOrigin::User, cx);
+        Ok(())
+    }
+
+    /// Complete the top pending structure replay only after its full next
+    /// presentation has been validated. Failure leaves both stacks unchanged.
+    pub fn apply_structure_replay(
+        &mut self,
+        snapshot: DocumentSnapshot<I>,
+        start: usize,
+        undo: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), StructureError> {
+        let record = if undo {
+            self.undo.undo.last()
+        } else {
+            self.undo.redo.last()
+        };
+        let Some(UndoRecord {
+            kind: UndoKind::Structure { before, after },
+            ..
+        }) = record
+        else {
+            return Err(StructureError::StaleReplay);
+        };
+        let (current, target) = if undo {
+            (after, before)
+        } else {
+            (before, after)
+        };
+        let (next, _, _, selection) =
+            self.prepare_structure(snapshot, start, Some(current), Some(target))?;
+        let record = if undo {
+            self.undo.undo.pop()
+        } else {
+            self.undo.redo.pop()
+        }
+        .expect("validated replay record is present");
+        if undo {
+            self.undo.redo.push(record);
+        } else {
+            self.undo.undo.push(record);
+        }
+        self.undo.break_coalescing();
+        self.commit_structure(
+            next,
+            start,
+            selection,
+            if undo {
+                EditOrigin::Undo
+            } else {
+                EditOrigin::Redo
+            },
+            cx,
+        );
+        Ok(())
+    }
+
+    /// IDs referenced by reversible suffix edits, for consumer-owned object
+    /// snapshots which should be discarded when undo records are evicted.
+    pub fn retained_structure_ids(&self) -> Vec<I> {
+        self.undo
+            .undo
+            .iter()
+            .chain(&self.undo.redo)
+            .flat_map(|record| match &record.kind {
+                UndoKind::Structure { before, after } => before
+                    .regions
+                    .iter()
+                    .chain(&after.regions)
+                    .map(|region| region.id().clone())
+                    .collect::<Vec<_>>(),
+                UndoKind::Text { .. } => Vec::new(),
+            })
+            .collect()
+    }
+
+    fn prepare_structure(
+        &self,
+        snapshot: DocumentSnapshot<I>,
+        start: usize,
+        expected_current: Option<&DocumentStructure<I>>,
+        expected_target: Option<&DocumentStructure<I>>,
+    ) -> Result<
+        (
+            DocumentModel<I>,
+            DocumentStructure<I>,
+            DocumentStructure<I>,
+            Option<(DocumentPosition<I>, DocumentPosition<I>)>,
+        ),
+        StructureError,
+    > {
+        if self.model.marked.is_some() {
+            return Err(StructureError::MarkedText);
+        }
+        let before =
+            DocumentStructure::suffix(&self.model, start).ok_or(StructureError::InvalidBoundary)?;
+        if expected_current.is_some_and(|expected| expected != &before) {
+            return Err(StructureError::StaleReplay);
+        }
+        let DocumentSnapshot {
+            text,
+            regions,
+            projection,
+            blocks,
+            anchored_blocks,
+            styles,
+            selection,
+        } = snapshot;
+        if text.get(..start) != self.model.text.to_string().get(..start) {
+            return Err(StructureError::PrefixChanged);
+        }
+        let mut next = DocumentModel::new(text, regions)
+            .map_err(|error| StructureError::Presentation(PresentationError::Regions(error)))?;
+        if self
+            .model
+            .regions
+            .as_slice()
+            .iter()
+            .filter(|region| region.range().start < start)
+            .ne(next
+                .regions
+                .as_slice()
+                .iter()
+                .filter(|region| region.range().start < start))
+        {
+            return Err(StructureError::PrefixChanged);
+        }
+        next.set_rich_presentation_with_anchors(projection, blocks, anchored_blocks, styles)
+            .map_err(StructureError::Presentation)?;
+        let after =
+            DocumentStructure::suffix(&next, start).ok_or(StructureError::InvalidBoundary)?;
+        if expected_target.is_some_and(|expected| expected != &after) {
+            return Err(StructureError::StaleReplay);
+        }
+        let selection = selection.or_else(|| self.selected_positions().ok());
+        if let Some((anchor, head)) = &selection {
+            next.resolve_position(anchor).map_err(|error| {
+                StructureError::Presentation(PresentationError::Position(error))
+            })?;
+            next.resolve_position(head).map_err(|error| {
+                StructureError::Presentation(PresentationError::Position(error))
+            })?;
+        }
+        next.revision = self.model.revision.next();
+        Ok((next, before, after, selection))
+    }
+
+    fn commit_structure(
+        &mut self,
+        mut next: DocumentModel<I>,
+        start: usize,
+        selection: Option<(DocumentPosition<I>, DocumentPosition<I>)>,
+        origin: EditOrigin,
+        cx: &mut Context<Self>,
+    ) {
+        let first_item = self.layout_item_for_source(start);
+        self.capture_viewport_anchor();
+        next.anchors = self.model.anchors.clone();
+        next.selection = self.model.selection;
+        next.anchors
+            .apply_edit(&(start..self.model.text.len()), next.text.len() - start);
+        next.reconcile_anchor_nodes();
+        if let Some((anchor, head)) = selection {
+            next.replace_selection_positions(anchor, head)
+                .expect("validated structure selection resolves");
+        }
+        self.model = next;
+        self.reconcile_layout_items_from(first_item);
+        self.finish_user_edit(origin, cx);
+    }
+
     fn commit_user_transaction(
         &mut self,
         transaction: EditTransaction,
@@ -2296,8 +2713,8 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         if let Some((region_id, changes, selection_before)) = undo_seed {
             self.undo.record(
                 UndoRecord {
-                    region_id,
-                    changes,
+                    sequence: 0,
+                    kind: UndoKind::Text { region_id, changes },
                     selection_before,
                     selection_after: self.selected_positions().ok(),
                 },
@@ -2631,6 +3048,9 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         undo: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        let UndoKind::Text { region_id, changes } = &record.kind else {
+            return false;
+        };
         // Replay into a tentative model, so a missing node, changed source or
         // invalid presentation rejects the whole record before any live write.
         let mut model = self.model.clone();
@@ -2640,13 +3060,13 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             EditOrigin::Redo
         };
         let changes: Box<dyn Iterator<Item = &UndoChange>> = if undo {
-            Box::new(record.changes.iter().rev())
+            Box::new(changes.iter().rev())
         } else {
-            Box::new(record.changes.iter())
+            Box::new(changes.iter())
         };
         let mut first_changed = self.model.text.len();
         for change in changes {
-            let Some(index) = model.region_index(&record.region_id) else {
+            let Some(index) = model.region_index(region_id) else {
                 return false;
             };
             let region = &model.regions.as_slice()[index];
@@ -2674,7 +3094,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             )
             .unwrap();
             if !matches!(
-                model.route_and_apply(&transaction, Some(&record.region_id)),
+                model.route_and_apply(&transaction, Some(region_id)),
                 RoutingOutcome::Applied
             ) {
                 return false;
@@ -2700,6 +3120,26 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
         self.undo.break_coalescing();
+        if self.model.marked.is_some() {
+            return;
+        }
+        if let Some(UndoRecord {
+            kind: UndoKind::Structure { before, .. },
+            selection_before,
+            ..
+        }) = self.undo.undo.last()
+        {
+            let UndoKind::Structure { after, .. } = &self.undo.undo.last().unwrap().kind else {
+                unreachable!()
+            };
+            cx.emit(DocumentEvent::StructureReplayRequested(StructureReplay {
+                target: before.clone(),
+                selection: selection_before.clone(),
+                undo: true,
+                start_node: after.regions[0].id().clone(),
+            }));
+            return;
+        }
         let Some(record) = self.undo.undo.pop() else {
             return;
         };
@@ -2712,6 +3152,26 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
         self.undo.break_coalescing();
+        if self.model.marked.is_some() {
+            return;
+        }
+        if let Some(UndoRecord {
+            kind: UndoKind::Structure { after, .. },
+            selection_after,
+            ..
+        }) = self.undo.redo.last()
+        {
+            let UndoKind::Structure { before, .. } = &self.undo.redo.last().unwrap().kind else {
+                unreachable!()
+            };
+            cx.emit(DocumentEvent::StructureReplayRequested(StructureReplay {
+                target: after.clone(),
+                selection: selection_after.clone(),
+                undo: false,
+                start_node: before.regions[0].id().clone(),
+            }));
+            return;
+        }
         let Some(record) = self.undo.redo.pop() else {
             return;
         };
@@ -4972,6 +5432,39 @@ mod tests {
     }
 
     #[gpui::test]
+    fn structural_transaction_rejects_history_changes_without_touching_undo(
+        cx: &mut TestAppContext,
+    ) {
+        let (document, mut cx) = document_view(cx);
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.replace_text_in_range(None, "alpha", window, cx);
+                let revision = document.revision();
+                let original = document.selected_positions().unwrap();
+                let malformed = DocumentSnapshot::new(
+                    "changedalpha",
+                    vec![
+                        DocumentRegion::new("history", 0..7, EditPolicy::Readonly),
+                        DocumentRegion::new("draft", 7..12, EditPolicy::Editable),
+                    ],
+                    DocumentProjection::identity(12),
+                    vec![],
+                    DocumentStyles::default(),
+                );
+                assert!(matches!(
+                    document.apply_structure_transaction(malformed, 7, cx),
+                    Err(StructureError::PrefixChanged)
+                ));
+                assert_eq!(document.revision(), revision);
+                assert_eq!(document.selected_positions().unwrap(), original);
+                assert_eq!(document.text(), "historyalpha");
+                document.undo(&Undo, window, cx);
+                assert_eq!(document.text(), "history");
+            });
+        });
+    }
+
+    #[gpui::test]
     fn reset_drops_old_pins_and_rejects_old_transactions(cx: &mut TestAppContext) {
         let (document, mut cx) = document_view(cx);
         cx.update(|_, cx| {
@@ -5104,12 +5597,15 @@ mod tests {
             history.break_coalescing();
             history.record(
                 UndoRecord {
-                    region_id: "draft",
-                    changes: vec![UndoChange {
-                        range: 0..0,
-                        removed: String::new(),
-                        inserted: text.into(),
-                    }],
+                    sequence: 0,
+                    kind: UndoKind::Text {
+                        region_id: "draft",
+                        changes: vec![UndoChange {
+                            range: 0..0,
+                            removed: String::new(),
+                            inserted: text.into(),
+                        }],
+                    },
                     selection_before: None,
                     selection_after: None,
                 },
@@ -5126,19 +5622,24 @@ mod tests {
             vec![3, 4]
         );
         history.trim(1, 7);
-        assert_eq!(history.undo[0].changes[0].inserted, "dddd");
+        assert!(
+            matches!(&history.undo[0].kind, UndoKind::Text { changes, .. } if changes[0].inserted == "dddd")
+        );
         history.trim(1, 3);
         assert!(history.undo.is_empty());
         let mut reserved = String::with_capacity(1024);
         reserved.push('x');
         history.record(
             UndoRecord {
-                region_id: "draft",
-                changes: vec![UndoChange {
-                    range: 0..0,
-                    removed: String::new(),
-                    inserted: reserved,
-                }],
+                sequence: 0,
+                kind: UndoKind::Text {
+                    region_id: "draft",
+                    changes: vec![UndoChange {
+                        range: 0..0,
+                        removed: String::new(),
+                        inserted: reserved,
+                    }],
+                },
                 selection_before: None,
                 selection_after: None,
             },

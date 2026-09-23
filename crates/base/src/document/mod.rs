@@ -23,8 +23,9 @@ pub use position::{
 pub use projection::{DocumentProjection, ProjectionError, ProjectionMapping, ProjectionSpan};
 pub use region::{DocumentRegion, DocumentRegions, EditPolicy, RegionError};
 pub use state::{
-    DocumentEditRejection, DocumentEvent, DocumentSnapshot, DocumentState, DocumentTextContext,
-    HostTransactionError, PresentationError, RoutedEdit, ScrollPinError,
+    DocumentEditRejection, DocumentEvent, DocumentSnapshot, DocumentState, DocumentStructure,
+    DocumentTextContext, HostTransactionError, PresentationError, RoutedEdit, ScrollPinError,
+    StructureError, StructureReplay, UndoCheckpoint,
 };
 pub use style::{DocumentInlineStyle, DocumentParagraphStyle, DocumentStyleError, DocumentStyles};
 pub use transaction::{EditDecision, EditOrigin, EditTransaction, TextEdit, TransactionError};
