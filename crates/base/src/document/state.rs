@@ -24,10 +24,12 @@ use crate::{
 };
 
 use super::{
-    Affinity, AnchorBias, BlockError, DocumentAnchor, DocumentBlock, DocumentElement,
-    DocumentPosition, DocumentProjection, DocumentRegion, DocumentRegions, DocumentRevision,
-    DocumentSelection, DocumentStyleError, DocumentStyles, EditDecision, EditOrigin, EditPolicy,
-    EditTransaction, PositionError, ProjectionError, RegionError, TextEdit, TransactionError,
+    Affinity, AnchorBias, AnchoredBlock, AnchoredBlockError, BlockError, DocumentAnchor,
+    DocumentBlock, DocumentElement, DocumentPosition, DocumentProjection, DocumentRegion,
+    DocumentRegions, DocumentRevision, DocumentSelection, DocumentStyleError, DocumentStyles,
+    EditDecision, EditOrigin, EditPolicy, EditTransaction, PositionError, ProjectionError,
+    RegionError, TextEdit, TransactionError,
+    anchored_block::display_offset as anchored_display_offset,
     block::{transform_blocks, validate_blocks},
     element::DocumentChild,
     position::{shift_offset, transform_offset},
@@ -61,6 +63,8 @@ pub enum HostTransactionError {
     InvalidProjection(ProjectionError),
     BlocksRequired,
     InvalidBlocks(BlockError),
+    AnchoredBlocksRequired,
+    InvalidAnchoredBlocks(AnchoredBlockError),
     StylesRequired,
     InvalidStyles(DocumentStyleError),
 }
@@ -89,6 +93,12 @@ impl fmt::Display for HostTransactionError {
             Self::BlocksRequired => formatter
                 .write_str("host transaction must provide the next inline block descriptors"),
             Self::InvalidBlocks(error) => write!(formatter, "invalid inline blocks: {error}"),
+            Self::AnchoredBlocksRequired => {
+                formatter.write_str("host transaction must provide the next anchored blocks")
+            }
+            Self::InvalidAnchoredBlocks(error) => {
+                write!(formatter, "invalid anchored blocks: {error}")
+            }
             Self::StylesRequired => formatter
                 .write_str("host transaction must provide the next document style descriptors"),
             Self::InvalidStyles(error) => write!(formatter, "invalid document styles: {error}"),
@@ -103,6 +113,7 @@ pub enum PresentationError {
     Regions(RegionError),
     Projection(ProjectionError),
     Blocks(BlockError),
+    AnchoredBlocks(AnchoredBlockError),
     Styles(DocumentStyleError),
     Position(PositionError),
 }
@@ -113,6 +124,7 @@ impl fmt::Display for PresentationError {
             Self::Regions(error) => error.fmt(formatter),
             Self::Projection(error) => error.fmt(formatter),
             Self::Blocks(error) => error.fmt(formatter),
+            Self::AnchoredBlocks(error) => error.fmt(formatter),
             Self::Styles(error) => error.fmt(formatter),
             Self::Position(error) => error.fmt(formatter),
         }
@@ -198,6 +210,7 @@ pub struct DocumentSnapshot<I> {
     regions: Vec<DocumentRegion<I>>,
     projection: DocumentProjection,
     blocks: Vec<DocumentBlock<I>>,
+    anchored_blocks: Vec<AnchoredBlock<I>>,
     styles: DocumentStyles,
     selection: Option<DocumentPosition<I>>,
 }
@@ -215,6 +228,7 @@ impl<I> DocumentSnapshot<I> {
             regions,
             projection,
             blocks,
+            anchored_blocks: Vec::new(),
             styles,
             selection: None,
         }
@@ -222,6 +236,11 @@ impl<I> DocumentSnapshot<I> {
 
     pub fn selection(mut self, selection: DocumentPosition<I>) -> Self {
         self.selection = Some(selection);
+        self
+    }
+
+    pub fn anchored_blocks(mut self, blocks: Vec<AnchoredBlock<I>>) -> Self {
+        self.anchored_blocks = blocks;
         self
     }
 }
@@ -487,6 +506,7 @@ struct DocumentModel<I> {
     projection: DocumentProjection,
     projection_map: ProjectionMap,
     blocks: Vec<DocumentBlock<I>>,
+    anchored_blocks: Vec<AnchoredBlock<I>>,
     styles: DocumentStyles,
     resolved_styles: ResolvedDocumentStyles,
 }
@@ -524,6 +544,10 @@ enum DocumentLayoutItem<I> {
         id: I,
         source: Range<usize>,
     },
+    AnchoredBlock {
+        id: I,
+        source: usize,
+    },
     Trailer,
 }
 
@@ -547,6 +571,18 @@ impl<I: Eq> DocumentLayoutItem<I> {
                 left_node == right_node && left == right && left_presentation == right_presentation
             }
             (Self::Block { id: left, .. }, Self::Block { id: right, .. }) => left == right,
+            (
+                Self::AnchoredBlock {
+                    id: left,
+                    source: left_source,
+                    ..
+                },
+                Self::AnchoredBlock {
+                    id: right,
+                    source: right_source,
+                    ..
+                },
+            ) => left == right && left_source == right_source,
             (Self::Trailer, Self::Trailer) => true,
             _ => false,
         }
@@ -584,6 +620,7 @@ impl<I: Clone + Eq> DocumentModel<I> {
             projection,
             projection_map,
             blocks: Vec::new(),
+            anchored_blocks: Vec::new(),
             styles: DocumentStyles::default(),
             resolved_styles: ResolvedDocumentStyles::default(),
         })
@@ -598,7 +635,7 @@ impl<I: Clone + Eq> DocumentModel<I> {
     }
 
     fn set_projection(&mut self, projection: DocumentProjection) -> Result<(), ProjectionError> {
-        if !self.blocks.is_empty() {
+        if !self.blocks.is_empty() || !self.anchored_blocks.is_empty() {
             return Err(ProjectionError::BlocksRequirePresentation);
         }
         validate_projection(&projection, &self.regions, &self.text)?;
@@ -620,7 +657,17 @@ impl<I: Clone + Eq> DocumentModel<I> {
     fn set_rich_presentation(
         &mut self,
         projection: DocumentProjection,
+        blocks: Vec<DocumentBlock<I>>,
+        styles: DocumentStyles,
+    ) -> Result<(), PresentationError> {
+        self.set_rich_presentation_with_anchors(projection, blocks, Vec::new(), styles)
+    }
+
+    fn set_rich_presentation_with_anchors(
+        &mut self,
+        projection: DocumentProjection,
         mut blocks: Vec<DocumentBlock<I>>,
+        anchored_blocks: Vec<AnchoredBlock<I>>,
         styles: DocumentStyles,
     ) -> Result<(), PresentationError> {
         blocks.sort_by_key(|block| {
@@ -632,14 +679,72 @@ impl<I: Clone + Eq> DocumentModel<I> {
         validate_blocks(&blocks, &self.regions, &projection, self.text.len())
             .map_err(PresentationError::Blocks)?;
         let projection_map = ProjectionMap::new(&self.text, &projection);
+        Self::validate_anchored_blocks(
+            &anchored_blocks,
+            &blocks,
+            &projection_map,
+            &self.regions,
+            &self.text,
+        )
+        .map_err(PresentationError::AnchoredBlocks)?;
         let resolved_styles =
             resolve_document_styles(&self.text, &self.regions, &projection_map, &styles)
                 .map_err(PresentationError::Styles)?;
         self.projection_map = projection_map;
         self.projection = projection;
         self.blocks = blocks;
+        self.anchored_blocks = anchored_blocks;
         self.styles = styles;
         self.resolved_styles = resolved_styles;
+        Ok(())
+    }
+
+    fn validate_anchored_blocks(
+        anchored: &[AnchoredBlock<I>],
+        blocks: &[DocumentBlock<I>],
+        projection: &ProjectionMap,
+        regions: &DocumentRegions<I>,
+        text: &Rope,
+    ) -> Result<(), AnchoredBlockError> {
+        for (ix, block) in anchored.iter().enumerate() {
+            if regions
+                .as_slice()
+                .iter()
+                .any(|region| region.id() == block.id())
+                || blocks.iter().any(|other| other.id() == block.id())
+                || anchored[..ix].iter().any(|other| other.id() == block.id())
+            {
+                return Err(AnchoredBlockError::DuplicateId);
+            }
+            let region = regions
+                .as_slice()
+                .iter()
+                .find(|region| region.id() == block.position().node_id())
+                .ok_or(AnchoredBlockError::InvalidPosition(
+                    PositionError::NodeNotFound,
+                ))?;
+            if matches!(region.policy(), EditPolicy::Editable | EditPolicy::Atomic) {
+                return Err(AnchoredBlockError::EditableRegion);
+            }
+            let (source, _) = anchored_display_offset(
+                block,
+                |position| {
+                    let range = region.range();
+                    if position.offset() > range.len() {
+                        return Err(PositionError::NodeOffsetOutOfBounds {
+                            offset: position.offset(),
+                            node_len: range.len(),
+                        });
+                    }
+                    Ok(range.start + position.offset())
+                },
+                |offset, affinity| projection.source_to_display(offset, affinity),
+                projection.display_text(),
+            )?;
+            if text.clip_offset(source, Bias::Left) != source {
+                return Err(AnchoredBlockError::NotLineBoundary);
+            }
+        }
         Ok(())
     }
 
@@ -709,6 +814,37 @@ impl<I: Clone + Eq> DocumentModel<I> {
             source_cursor..self.text.len(),
             true,
         );
+        for block in &self.anchored_blocks {
+            let (source, display) = anchored_display_offset(
+                block,
+                |position| self.resolve_position(position),
+                |offset, affinity| self.source_to_display(offset, affinity),
+                display_text,
+            )
+            .expect("validated anchored block must map to a line boundary");
+            let index = items
+                .iter()
+                .position(|item| match item {
+                    DocumentLayoutItem::Text {
+                        display: range,
+                        source: text,
+                        ..
+                    } => range.start >= display && text.start >= source,
+                    DocumentLayoutItem::Block { source: range, .. } => range.start >= source,
+                    DocumentLayoutItem::AnchoredBlock {
+                        source: previous, ..
+                    } => *previous > source,
+                    DocumentLayoutItem::Trailer => true,
+                })
+                .unwrap_or(items.len());
+            items.insert(
+                index,
+                DocumentLayoutItem::AnchoredBlock {
+                    id: block.id().clone(),
+                    source,
+                },
+            );
+        }
         items
     }
 
@@ -1683,12 +1819,24 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         snapshot: DocumentSnapshot<I>,
         cx: &mut Context<Self>,
     ) -> Result<(), PresentationError> {
-        if !snapshot.blocks.is_empty() && self.block_renderer.is_none() {
-            return Err(PresentationError::Blocks(BlockError::MissingRenderer));
+        if self.block_renderer.is_none() {
+            if !snapshot.blocks.is_empty() {
+                return Err(PresentationError::Blocks(BlockError::MissingRenderer));
+            }
+            if !snapshot.anchored_blocks.is_empty() {
+                return Err(PresentationError::AnchoredBlocks(
+                    AnchoredBlockError::MissingRenderer,
+                ));
+            }
         }
         let mut model = DocumentModel::new(snapshot.text, snapshot.regions)
             .map_err(PresentationError::Regions)?;
-        model.set_rich_presentation(snapshot.projection, snapshot.blocks, snapshot.styles)?;
+        model.set_rich_presentation_with_anchors(
+            snapshot.projection,
+            snapshot.blocks,
+            snapshot.anchored_blocks,
+            snapshot.styles,
+        )?;
         if let Some(selection) = snapshot.selection {
             model
                 .replace_selection_positions(selection.clone(), selection)
@@ -1742,6 +1890,37 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         }
         self.model
             .set_rich_presentation(projection, blocks, styles)?;
+        self.reconcile_layout_items_from(0);
+        cx.emit(DocumentEvent::PresentationChanged);
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn set_rich_presentation_with_anchors(
+        &mut self,
+        projection: DocumentProjection,
+        blocks: Vec<DocumentBlock<I>>,
+        anchored_blocks: Vec<AnchoredBlock<I>>,
+        styles: DocumentStyles,
+        cx: &mut Context<Self>,
+    ) -> Result<(), PresentationError> {
+        if self.block_renderer.is_none() {
+            if !blocks.is_empty() {
+                return Err(PresentationError::Blocks(BlockError::MissingRenderer));
+            }
+            if !anchored_blocks.is_empty() {
+                return Err(PresentationError::AnchoredBlocks(
+                    AnchoredBlockError::MissingRenderer,
+                ));
+            }
+        }
+        self.capture_viewport_anchor();
+        self.model.set_rich_presentation_with_anchors(
+            projection,
+            blocks,
+            anchored_blocks,
+            styles,
+        )?;
         self.reconcile_layout_items_from(0);
         cx.emit(DocumentEvent::PresentationChanged);
         cx.notify();
@@ -1896,7 +2075,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
 
     pub fn remeasure_block(&mut self, id: &I, cx: &mut Context<Self>) -> bool {
         let Some(index) = self.layout_items.iter().position(
-            |item| matches!(item, DocumentLayoutItem::Block { id: block_id, .. } if block_id == id),
+            |item| matches!(item, DocumentLayoutItem::Block { id: block_id, .. } | DocumentLayoutItem::AnchoredBlock { id: block_id, .. } if block_id == id),
         ) else {
             return false;
         };
@@ -1912,6 +2091,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             .position(|item| match item {
                 DocumentLayoutItem::Text { source: text, .. } => source <= text.end,
                 DocumentLayoutItem::Block { source: block, .. } => source <= block.end,
+                DocumentLayoutItem::AnchoredBlock { source: block, .. } => source <= *block,
                 DocumentLayoutItem::Trailer => true,
             })
             .unwrap_or(self.layout_items.len())
@@ -2148,7 +2328,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         regions: Vec<DocumentRegion<I>>,
         cx: &mut Context<Self>,
     ) -> Result<(), HostTransactionError> {
-        self.apply_host_transaction_inner(transaction, regions, None, None, None, cx)
+        self.apply_host_transaction_inner(transaction, regions, None, None, None, None, cx)
     }
 
     pub fn apply_host_transaction_with_projection(
@@ -2158,7 +2338,15 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         projection: DocumentProjection,
         cx: &mut Context<Self>,
     ) -> Result<(), HostTransactionError> {
-        self.apply_host_transaction_inner(transaction, regions, Some(projection), None, None, cx)
+        self.apply_host_transaction_inner(
+            transaction,
+            regions,
+            Some(projection),
+            None,
+            None,
+            None,
+            cx,
+        )
     }
 
     pub fn apply_host_transaction_with_presentation(
@@ -2179,6 +2367,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             regions,
             Some(projection),
             Some(blocks),
+            None,
             None,
             cx,
         )
@@ -2203,17 +2392,54 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             regions,
             Some(projection),
             Some(blocks),
+            None,
             Some(styles),
             cx,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_host_transaction_with_anchored_blocks(
+        &mut self,
+        transaction: EditTransaction,
+        regions: Vec<DocumentRegion<I>>,
+        projection: DocumentProjection,
+        blocks: Vec<DocumentBlock<I>>,
+        anchored_blocks: Vec<AnchoredBlock<I>>,
+        styles: DocumentStyles,
+        cx: &mut Context<Self>,
+    ) -> Result<(), HostTransactionError> {
+        if self.block_renderer.is_none() {
+            if !blocks.is_empty() {
+                return Err(HostTransactionError::InvalidBlocks(
+                    BlockError::MissingRenderer,
+                ));
+            }
+            if !anchored_blocks.is_empty() {
+                return Err(HostTransactionError::InvalidAnchoredBlocks(
+                    AnchoredBlockError::MissingRenderer,
+                ));
+            }
+        }
+        self.apply_host_transaction_inner(
+            transaction,
+            regions,
+            Some(projection),
+            Some(blocks),
+            Some(anchored_blocks),
+            Some(styles),
+            cx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn apply_host_transaction_inner(
         &mut self,
         transaction: EditTransaction,
         regions: Vec<DocumentRegion<I>>,
         projection: Option<DocumentProjection>,
         blocks: Option<Vec<DocumentBlock<I>>>,
+        anchored_blocks: Option<Vec<AnchoredBlock<I>>>,
         styles: Option<DocumentStyles>,
         cx: &mut Context<Self>,
     ) -> Result<(), HostTransactionError> {
@@ -2308,6 +2534,19 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         )
         .map_err(HostTransactionError::InvalidBlocks)?;
         let next_projection_map = ProjectionMap::new(&next_text, &next_projection);
+        let next_anchored = match anchored_blocks {
+            Some(anchored) => anchored,
+            None if self.model.anchored_blocks.is_empty() => Vec::new(),
+            None => return Err(HostTransactionError::AnchoredBlocksRequired),
+        };
+        DocumentModel::validate_anchored_blocks(
+            &next_anchored,
+            &next_blocks,
+            &next_projection_map,
+            &next_regions,
+            &next_text,
+        )
+        .map_err(HostTransactionError::InvalidAnchoredBlocks)?;
         let next_styles = match styles {
             Some(styles) => styles,
             None if self.model.styles.is_empty() => DocumentStyles::default(),
@@ -2339,6 +2578,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.model.projection = next_projection;
         self.model.projection_map = next_projection_map;
         self.model.blocks = next_blocks;
+        self.model.anchored_blocks = next_anchored;
         self.model.styles = next_styles;
         self.model.resolved_styles = next_resolved_styles;
         self.model.revision = self.model.revision.next();
@@ -3761,6 +4001,18 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                     element: renderer(id, window, cx),
                 }
             }
+            DocumentLayoutItem::AnchoredBlock { id, source } => {
+                let renderer = self
+                    .block_renderer
+                    .as_ref()
+                    .expect("validated anchored blocks require a renderer");
+                DocumentChild::Block {
+                    item_ix,
+                    id: id.clone(),
+                    source: *source..*source,
+                    element: renderer(id, window, cx),
+                }
+            }
             DocumentLayoutItem::Trailer => DocumentChild::Trailer {
                 item_ix,
                 height: self
@@ -4179,6 +4431,242 @@ mod tests {
         let range = 4..4;
         assert_eq!(transform_offset(4, AnchorBias::Left, &range, 3), 4);
         assert_eq!(transform_offset(4, AnchorBias::Right, &range, 3), 7);
+    }
+
+    #[test]
+    fn anchored_row_keeps_one_history_region_and_separates_display_lines() {
+        let mut model = DocumentModel::new(
+            "first\nsecond",
+            vec![DocumentRegion::new("history", 0..12, EditPolicy::Readonly)],
+        )
+        .unwrap();
+        let row = AnchoredBlock::new(
+            "comment",
+            DocumentPosition::new("history", 6, Affinity::Before),
+        );
+        model
+            .set_rich_presentation_with_anchors(
+                DocumentProjection::identity(12),
+                Vec::new(),
+                vec![row.clone()],
+                DocumentStyles::default(),
+            )
+            .unwrap();
+        assert_eq!(model.text(), "first\nsecond");
+        assert!(matches!(
+            model.layout_items()[1],
+            DocumentLayoutItem::AnchoredBlock {
+                id: "comment",
+                source: 6
+            }
+        ));
+        assert!(matches!(
+            model.layout_items()[2],
+            DocumentLayoutItem::Text { .. }
+        ));
+        model
+            .replace_selection_positions(
+                DocumentPosition::new("history", 1, Affinity::After),
+                DocumentPosition::new("history", 9, Affinity::Before),
+            )
+            .unwrap();
+        assert_eq!(model.selected_range(), 1..9);
+        assert_eq!(
+            model
+                .position_for_anchor(model.selection.head())
+                .unwrap()
+                .node_id(),
+            &"history"
+        );
+        assert_eq!(
+            model.set_rich_presentation_with_anchors(
+                DocumentProjection::identity(12),
+                Vec::new(),
+                vec![AnchoredBlock::new(
+                    "comment",
+                    DocumentPosition::new("history", 2, Affinity::Before)
+                )],
+                DocumentStyles::default(),
+            ),
+            Err(PresentationError::AnchoredBlocks(
+                AnchoredBlockError::NotLineBoundary
+            ))
+        );
+        assert_eq!(model.anchored_blocks, vec![row]);
+    }
+
+    #[test]
+    fn anchored_rows_follow_mapped_markdown_lines_in_stable_order() {
+        let mut model = DocumentModel::new(
+            "**A**\n\nB",
+            vec![DocumentRegion::new("history", 0..8, EditPolicy::Readonly)],
+        )
+        .unwrap();
+        let projection = DocumentProjection::new(
+            8,
+            vec![
+                ProjectionSpan::mapped(
+                    0..7,
+                    "A\n",
+                    vec![
+                        super::super::ProjectionMapping::new(0..1, 2..3),
+                        super::super::ProjectionMapping::new(1..2, 3..7),
+                    ],
+                ),
+                ProjectionSpan::mapped(
+                    7..8,
+                    "B\n",
+                    vec![
+                        super::super::ProjectionMapping::new(0..1, 7..8),
+                        super::super::ProjectionMapping::new(1..2, 7..8),
+                    ],
+                ),
+            ],
+        )
+        .unwrap();
+        model
+            .set_rich_presentation_with_anchors(
+                projection,
+                Vec::new(),
+                ["first", "second"]
+                    .map(|id| {
+                        AnchoredBlock::new(
+                            id,
+                            DocumentPosition::new("history", 7, Affinity::Before),
+                        )
+                    })
+                    .to_vec(),
+                DocumentStyles::default(),
+            )
+            .unwrap();
+        let items = model.layout_items();
+        assert!(
+            matches!(items[0], DocumentLayoutItem::Text { ref text, .. } if text.as_ref() == "A")
+        );
+        assert!(matches!(
+            items[1],
+            DocumentLayoutItem::AnchoredBlock { id: "first", .. }
+        ));
+        assert!(matches!(
+            items[2],
+            DocumentLayoutItem::AnchoredBlock { id: "second", .. }
+        ));
+        assert!(
+            matches!(items[3], DocumentLayoutItem::Text { ref text, .. } if text.as_ref() == "B")
+        );
+    }
+
+    #[gpui::test]
+    fn anchored_rows_require_a_renderer_before_reset(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        document.update(&mut cx, |document, cx| {
+            assert_eq!(
+                document.reset(
+                    DocumentSnapshot::new(
+                        "history",
+                        vec![DocumentRegion::new("history", 0..7, EditPolicy::Readonly)],
+                        DocumentProjection::identity(7),
+                        Vec::new(),
+                        DocumentStyles::default(),
+                    )
+                    .anchored_blocks(vec![AnchoredBlock::new(
+                        "note",
+                        DocumentPosition::new("history", 7, Affinity::Before),
+                    )]),
+                    cx,
+                ),
+                Err(PresentationError::AnchoredBlocks(
+                    AnchoredBlockError::MissingRenderer
+                ))
+            );
+            assert_eq!(document.text(), "history");
+        });
+    }
+
+    #[gpui::test]
+    fn anchored_row_survives_host_refresh_without_changing_draft_or_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (document, mut cx) = document_view(cx);
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.set_block_renderer(|_, _, _| div().h(px(45.)).into_any_element(), cx);
+                document
+                    .reset(
+                        DocumentSnapshot::new(
+                            "first\nsecond draft",
+                            vec![
+                                DocumentRegion::new("history", 0..12, EditPolicy::Readonly),
+                                DocumentRegion::new("draft", 12..18, EditPolicy::Editable),
+                            ],
+                            DocumentProjection::identity(18),
+                            Vec::new(),
+                            DocumentStyles::default(),
+                        )
+                        .anchored_blocks(vec![AnchoredBlock::new(
+                            "comment",
+                            DocumentPosition::new("history", 6, Affinity::Before),
+                        )]),
+                        cx,
+                    )
+                    .unwrap();
+                document
+                    .set_selection_positions(
+                        DocumentPosition::new("draft", 3, Affinity::After),
+                        DocumentPosition::new("draft", 3, Affinity::After),
+                        cx,
+                    )
+                    .unwrap();
+            });
+            let _ = window.draw(cx);
+            document.update(cx, |document, cx| {
+                assert!(
+                    document
+                        .block_layouts
+                        .iter()
+                        .any(|record| record.source == (6..6))
+                );
+                assert!(document.remeasure_block(&"comment", cx));
+                let transaction = EditTransaction::new(
+                    document.revision(),
+                    EditOrigin::Host,
+                    vec![TextEdit::new(0..0, "new\n")],
+                    document.text().len(),
+                )
+                .unwrap();
+                document
+                    .apply_host_transaction_with_anchored_blocks(
+                        transaction,
+                        vec![
+                            DocumentRegion::new("history", 0..16, EditPolicy::Readonly),
+                            DocumentRegion::new("draft", 16..22, EditPolicy::Editable),
+                        ],
+                        DocumentProjection::identity(22),
+                        Vec::new(),
+                        vec![AnchoredBlock::new(
+                            "comment",
+                            DocumentPosition::new("history", 10, Affinity::Before),
+                        )],
+                        DocumentStyles::default(),
+                        cx,
+                    )
+                    .unwrap();
+                assert_eq!(document.region_text(&"draft").as_deref(), Some(" draft"));
+                assert_eq!(
+                    document.selected_positions().unwrap().1,
+                    DocumentPosition::new("draft", 3, Affinity::After)
+                );
+                assert_eq!(
+                    document
+                        .model
+                        .layout_items()
+                        .iter()
+                        .filter(|item| matches!(item, DocumentLayoutItem::AnchoredBlock { .. }))
+                        .count(),
+                    1
+                );
+            });
+        });
     }
 
     #[gpui::test]

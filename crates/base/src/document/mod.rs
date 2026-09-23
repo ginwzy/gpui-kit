@@ -3,6 +3,7 @@
 //! The document module owns text interaction and source coordinates. Product
 //! concepts are represented by consumer-provided node and region identifiers.
 
+mod anchored_block;
 mod block;
 mod element;
 mod position;
@@ -12,6 +13,7 @@ mod state;
 mod style;
 mod transaction;
 
+pub use anchored_block::{AnchoredBlock, AnchoredBlockError};
 pub use block::{BlockError, DocumentBlock};
 pub use element::DocumentElement;
 pub use position::{
