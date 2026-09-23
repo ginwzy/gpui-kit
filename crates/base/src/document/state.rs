@@ -38,6 +38,8 @@ use super::{
 
 const DOCUMENT_INPUT_CONTEXT: &str = "Input";
 
+mod host;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentEditRejection {
     InvalidOrigin,
@@ -53,6 +55,8 @@ pub enum DocumentEditRejection {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostTransactionError {
+    FragmentBoundary,
+    InvalidFragment(PresentationError),
     InvalidOrigin,
     InvalidEditRange(Range<usize>),
     StaleRevision,
@@ -72,6 +76,10 @@ pub enum HostTransactionError {
 impl fmt::Display for HostTransactionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::FragmentBoundary => formatter.write_str(
+                "host fragment must replace complete readonly nodes at display line boundaries",
+            ),
+            Self::InvalidFragment(error) => write!(formatter, "invalid host fragment: {error}"),
             Self::InvalidEditRange(range) => write!(
                 formatter,
                 "host edit range {range:?} is outside the source or not on UTF-8 boundaries"
@@ -218,6 +226,7 @@ pub enum DocumentEvent<I> {
 pub struct DocumentTextContext<I> {
     node_id: I,
     source: Range<usize>,
+    node_start: usize,
     first_line: bool,
 }
 
@@ -230,11 +239,18 @@ impl<I> DocumentTextContext<I> {
         self.source.clone()
     }
 
+    /// Source coordinates relative to the owning node, independent of its document position.
+    pub fn source_in_node(&self) -> Range<usize> {
+        self.source.start.saturating_sub(self.node_start)
+            ..self.source.end.saturating_sub(self.node_start)
+    }
+
     pub fn is_first_line(&self) -> bool {
         self.first_line
     }
 }
 
+#[derive(Clone)]
 pub struct DocumentSnapshot<I> {
     text: String,
     regions: Vec<DocumentRegion<I>>,
@@ -2298,13 +2314,32 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     pub fn remeasure_block(&mut self, id: &I, cx: &mut Context<Self>) -> bool {
-        let Some(index) = self.layout_items.iter().position(
-            |item| matches!(item, DocumentLayoutItem::Block { id: block_id, .. } | DocumentLayoutItem::AnchoredBlock { id: block_id, .. } if block_id == id),
-        ) else {
+        self.remeasure_node(id, cx)
+    }
+
+    /// Invalidates measurements after the host changes a node's custom renderer geometry.
+    pub fn remeasure_node(&mut self, id: &I, cx: &mut Context<Self>) -> bool {
+        let indices: Vec<_> = self
+            .layout_items
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, item)| {
+                let owner = match item {
+                    DocumentLayoutItem::Text { node_id, .. } => node_id.as_ref(),
+                    DocumentLayoutItem::Block { id, .. }
+                    | DocumentLayoutItem::AnchoredBlock { id, .. } => Some(id),
+                    DocumentLayoutItem::Trailer => None,
+                };
+                (owner == Some(id)).then_some(ix)
+            })
+            .collect();
+        if indices.is_empty() {
             return false;
-        };
+        }
         self.capture_viewport_anchor();
-        self.list_state.remeasure_items(index..index + 1);
+        for ix in indices {
+            self.list_state.remeasure_items(ix..ix + 1);
+        }
         cx.notify();
         true
     }
@@ -4422,6 +4457,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                     text_context = Some(DocumentTextContext {
                         node_id: node_id.clone(),
                         source: source.clone(),
+                        node_start: region.as_ref().map_or(0, |region| region.start),
                         first_line: region.is_some_and(|region| source.start <= region.start),
                     });
                 }
@@ -6134,6 +6170,123 @@ mod tests {
         document.read_with(&cx, |document, _| {
             assert_eq!(document.text(), "historyx");
             assert_eq!(document.selected_range(), 8..8);
+        });
+    }
+
+    #[gpui::test]
+    fn local_host_splices_match_full_presentation_and_preserve_composition(
+        cx: &mut TestAppContext,
+    ) {
+        let (document, mut cx) = document_view(cx);
+        let fragment = |id, text: &str| {
+            DocumentSnapshot::new(
+                text,
+                vec![DocumentRegion::new(id, 0..text.len(), EditPolicy::Readonly)],
+                DocumentProjection::identity(text.len()),
+                vec![],
+                DocumentStyles::default(),
+            )
+        };
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document
+                    .reset(
+                        DocumentSnapshot::new(
+                            "first\nlast\n",
+                            vec![
+                                DocumentRegion::new("first", 0..6, EditPolicy::Readonly),
+                                DocumentRegion::new("last", 6..11, EditPolicy::Readonly),
+                                DocumentRegion::new("draft", 11..11, EditPolicy::Editable),
+                            ],
+                            DocumentProjection::identity(11),
+                            vec![],
+                            DocumentStyles::default(),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+                document.set_selection(11..11, false, cx);
+                document.replace_text_in_range(None, "draft", window, cx);
+                document.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, cx);
+                for (first, end, replacement) in [
+                    ("first", "last", fragment("first", "中文🙂\nfirst\n")),
+                    ("last", "last", fragment("middle", "middle\n")),
+                    (
+                        "middle",
+                        "last",
+                        DocumentSnapshot::new(
+                            "",
+                            vec![],
+                            DocumentProjection::identity(0),
+                            vec![],
+                            DocumentStyles::default(),
+                        ),
+                    ),
+                    ("last", "draft", fragment("last", "last & tail\n")),
+                ] {
+                    document
+                        .apply_host_splice(
+                            document.revision(),
+                            Some(&first),
+                            Some(&end),
+                            replacement,
+                            cx,
+                        )
+                        .unwrap();
+                    assert_eq!(document.layout_items, document.model.layout_items());
+                    let rebuilt =
+                        ProjectionMap::new(&document.model.text, &document.model.projection);
+                    assert_eq!(document.display_text(), rebuilt.display_text());
+                    let text = document.text();
+                    for (offset, _) in text.char_indices() {
+                        for affinity in [Affinity::Before, Affinity::After] {
+                            assert_eq!(
+                                document.model.source_to_display(offset, affinity),
+                                rebuilt.source_to_display(offset, affinity)
+                            );
+                        }
+                    }
+                    let end = text.len();
+                    let utf16_end = text.encode_utf16().count();
+                    assert_eq!(
+                        document.marked_text_range(window, cx),
+                        Some(utf16_end - 2..utf16_end)
+                    );
+                    assert_eq!(document.selected_range(), end..end);
+                }
+                document.replace_text_in_range(None, "你", window, cx);
+                document.undo(&Undo, window, cx);
+                assert!(document.text().ends_with("draft"));
+                document.undo(&Undo, window, cx);
+                assert!(document.text().ends_with("last & tail\n"));
+                document.redo(&Redo, window, cx);
+                document.redo(&Redo, window, cx);
+                assert!(document.text().ends_with("draft你"));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn local_host_splice_rejects_invalid_seams_without_publishing(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        document.update(&mut cx, |document, cx| {
+            let text = document.text();
+            let revision = document.revision();
+            let layout = document.layout_items.clone();
+            let snapshot = DocumentSnapshot::new(
+                "changed",
+                vec![DocumentRegion::new("history", 0..7, EditPolicy::Readonly)],
+                DocumentProjection::identity(7),
+                vec![],
+                DocumentStyles::default(),
+            );
+            assert_eq!(
+                document.apply_host_splice(revision, Some(&"draft"), Some(&"draft"), snapshot, cx),
+                Err(HostTransactionError::FragmentBoundary)
+            );
+            assert_eq!(document.text(), text);
+            assert_eq!(document.revision(), revision);
+            assert_eq!(document.layout_items, layout);
         });
     }
 

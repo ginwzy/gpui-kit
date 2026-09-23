@@ -12,6 +12,15 @@ pub struct ProjectionSpan {
 }
 
 impl ProjectionSpan {
+    fn shift_source(&mut self, delta: isize) {
+        self.source = shifted(self.source.clone(), delta);
+        if let Some(mapping) = &mut self.mapping {
+            for entry in mapping {
+                entry.source = shifted(entry.source.clone(), delta);
+            }
+        }
+    }
+
     pub fn replace(source: Range<usize>, replacement: impl Into<String>) -> Self {
         Self {
             source,
@@ -76,6 +85,24 @@ pub struct DocumentProjection {
 }
 
 impl DocumentProjection {
+    pub(super) fn splice(&mut self, range: Range<usize>, mut replacement: Self) {
+        let delta = replacement.source_len as isize - range.len() as isize;
+        let from = self
+            .spans
+            .partition_point(|span| span.source.end <= range.start);
+        let to = self
+            .spans
+            .partition_point(|span| span.source.start < range.end);
+        for span in &mut replacement.spans {
+            span.shift_source(range.start as isize);
+        }
+        for span in &mut self.spans[to..] {
+            span.shift_source(delta);
+        }
+        self.spans.splice(from..to, replacement.spans);
+        self.source_len = self.source_len.checked_add_signed(delta).unwrap();
+    }
+
     pub fn identity(source_len: usize) -> Self {
         Self {
             source_len,
@@ -247,6 +274,22 @@ struct ProjectionRun {
     kind: ProjectionRunKind,
 }
 
+fn shifted(range: Range<usize>, delta: isize) -> Range<usize> {
+    range.start.checked_add_signed(delta).unwrap()..range.end.checked_add_signed(delta).unwrap()
+}
+
+impl ProjectionRun {
+    fn shift(&mut self, source_delta: isize, display_delta: isize) {
+        self.source = shifted(self.source.clone(), source_delta);
+        self.display = shifted(self.display.clone(), display_delta);
+        if let ProjectionRunKind::Replacement(Some(mapping)) = &mut self.kind {
+            for entry in mapping {
+                entry.source = shifted(entry.source.clone(), source_delta);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProjectionMap {
     display: String,
@@ -255,6 +298,61 @@ pub(crate) struct ProjectionMap {
 }
 
 impl ProjectionMap {
+    /// The caller has checked that no replacement run straddles either source boundary.
+    pub(super) fn splice(
+        &mut self,
+        source: Range<usize>,
+        display: Range<usize>,
+        mut replacement: Self,
+    ) {
+        let source_delta = replacement.source_len as isize - source.len() as isize;
+        let display_delta = replacement.display.len() as isize - display.len() as isize;
+        let from = self
+            .runs
+            .partition_point(|run| run.source.end <= source.start && !run.source.is_empty());
+        let to = self
+            .runs
+            .partition_point(|run| run.source.start < source.end);
+        // Identity runs can include both a readonly region and the adjacent draft.
+        let mut inserted = Vec::new();
+        if let Some(run) = self
+            .runs
+            .get(from)
+            .filter(|run| run.source.start < source.start)
+        {
+            inserted.push(ProjectionRun {
+                source: run.source.start..source.start,
+                display: run.display.start..display.start,
+                kind: ProjectionRunKind::Identity,
+            });
+        }
+        for run in &mut replacement.runs {
+            run.shift(source.start as isize, display.start as isize);
+        }
+        inserted.extend(
+            replacement
+                .runs
+                .into_iter()
+                .filter(|run| !run.source.is_empty()),
+        );
+        if let Some(run) = self.runs[..to]
+            .last()
+            .filter(|run| run.source.end > source.end)
+        {
+            inserted.push(ProjectionRun {
+                source: shifted(source.end..run.source.end, source_delta),
+                display: shifted(display.end..run.display.end, display_delta),
+                kind: ProjectionRunKind::Identity,
+            });
+        }
+        for run in &mut self.runs[to..] {
+            run.shift(source_delta, display_delta);
+        }
+        self.runs.splice(from..to, inserted);
+        self.display.replace_range(display, &replacement.display);
+        self.source_len = self.source_len.checked_add_signed(source_delta).unwrap();
+    }
+
     pub(crate) fn new(source: &Rope, projection: &DocumentProjection) -> Self {
         debug_assert_eq!(source.len(), projection.source_len);
         let mut display = String::new();
@@ -312,7 +410,10 @@ impl ProjectionMap {
         if offset == self.source_len {
             return Some(self.display.len());
         }
-        let run = self.runs.iter().find(|run| {
+        let start = self
+            .runs
+            .partition_point(|run| run.source.end <= offset && !run.source.is_empty());
+        let run = self.runs[start..].iter().find(|run| {
             run.source.start <= offset
                 && (offset < run.source.end || (offset == run.source.end && run.source.is_empty()))
         })?;
@@ -338,7 +439,11 @@ impl ProjectionMap {
         if offset == self.display.len() {
             return Some(self.source_len);
         }
-        let mut runs = self.runs.iter().filter(|run| {
+        let start = self.runs.partition_point(|run| {
+            run.display.end < offset || (run.display.end == offset && !run.display.is_empty())
+        });
+        let end = self.runs.partition_point(|run| run.display.start <= offset);
+        let mut runs = self.runs[start..end].iter().filter(|run| {
             run.display.start <= offset
                 && (offset < run.display.end
                     || (run.display.is_empty() && offset == run.display.start))

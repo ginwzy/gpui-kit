@@ -9,7 +9,46 @@ pub struct DocumentStyles {
 }
 
 impl DocumentStyles {
-    pub fn new(paragraphs: Vec<DocumentParagraphStyle>, inline: Vec<DocumentInlineStyle>) -> Self {
+    pub(super) fn splice(&mut self, range: Range<usize>, length: usize, mut replacement: Self) {
+        let delta = length as isize - range.len() as isize;
+        let shift = |source: &mut Range<usize>, delta: isize| {
+            *source = source.start.checked_add_signed(delta).unwrap()
+                ..source.end.checked_add_signed(delta).unwrap();
+        };
+        for style in &mut replacement.paragraphs {
+            shift(&mut style.source, range.start as isize);
+        }
+        for style in &mut replacement.inline {
+            shift(&mut style.source, range.start as isize);
+        }
+        let from = self
+            .paragraphs
+            .partition_point(|style| style.source.end <= range.start);
+        let to = self
+            .paragraphs
+            .partition_point(|style| style.source.start < range.end);
+        for style in &mut self.paragraphs[to..] {
+            shift(&mut style.source, delta);
+        }
+        self.paragraphs.splice(from..to, replacement.paragraphs);
+        let from = self
+            .inline
+            .partition_point(|style| style.source.end <= range.start);
+        let to = self
+            .inline
+            .partition_point(|style| style.source.start < range.end);
+        for style in &mut self.inline[to..] {
+            shift(&mut style.source, delta);
+        }
+        self.inline.splice(from..to, replacement.inline);
+    }
+
+    pub fn new(
+        mut paragraphs: Vec<DocumentParagraphStyle>,
+        mut inline: Vec<DocumentInlineStyle>,
+    ) -> Self {
+        paragraphs.sort_by_key(|style| (style.source.start, style.source.end));
+        inline.sort_by_key(|style| (style.source.start, style.source.end));
         Self { paragraphs, inline }
     }
 

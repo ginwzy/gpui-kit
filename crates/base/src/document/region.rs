@@ -84,6 +84,23 @@ impl<I: Eq> DocumentRegions<I> {
     pub fn into_vec(self) -> Vec<DocumentRegion<I>> {
         self.regions
     }
+
+    pub(super) fn splice(
+        &mut self,
+        range: Range<usize>,
+        mut replacement: Self,
+        start: usize,
+        delta: isize,
+    ) {
+        for region in &mut replacement.regions {
+            region.range = region.range.start + start..region.range.end + start;
+        }
+        for region in &mut self.regions[range.end..] {
+            region.range = region.range.start.checked_add_signed(delta).unwrap()
+                ..region.range.end.checked_add_signed(delta).unwrap();
+        }
+        self.regions.splice(range, replacement.regions);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
