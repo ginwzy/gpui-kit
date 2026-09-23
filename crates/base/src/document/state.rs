@@ -334,15 +334,15 @@ impl<I: Clone + Eq> DocumentStructure<I> {
                 )
             })
             .collect::<Vec<_>>();
-        let mut end = start;
+        let mut end = 0;
         for region in &regions {
             let range = region.range();
-            if range.start != end - start {
+            if range.start != end {
                 return None;
             }
-            end = start + range.end;
+            end = range.end;
         }
-        (!regions.is_empty() && end == model.text.len()).then(|| Self {
+        (!regions.is_empty() && end == model.text.len() - start).then(|| Self {
             text: model.text.slice(start..model.text.len()).to_string(),
             regions,
         })
@@ -2471,29 +2471,17 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         };
         let (next, _, _, selection) =
             self.prepare_structure(snapshot, start, Some(current), Some(target))?;
-        let record = if undo {
-            self.undo.undo.pop()
+        let (source_stack, target_stack, origin) = if undo {
+            (&mut self.undo.undo, &mut self.undo.redo, EditOrigin::Undo)
         } else {
-            self.undo.redo.pop()
-        }
-        .expect("validated replay record is present");
-        if undo {
-            self.undo.redo.push(record);
-        } else {
-            self.undo.undo.push(record);
-        }
+            (&mut self.undo.redo, &mut self.undo.undo, EditOrigin::Redo)
+        };
+        let record = source_stack
+            .pop()
+            .expect("validated replay record is present");
+        target_stack.push(record);
         self.undo.break_coalescing();
-        self.commit_structure(
-            next,
-            start,
-            selection,
-            if undo {
-                EditOrigin::Undo
-            } else {
-                EditOrigin::Redo
-            },
-            cx,
-        );
+        self.commit_structure(next, start, selection, origin, cx);
         Ok(())
     }
 
@@ -2504,15 +2492,14 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             .undo
             .iter()
             .chain(&self.undo.redo)
-            .flat_map(|record| match &record.kind {
-                UndoKind::Structure { before, after } => before
-                    .regions
-                    .iter()
-                    .chain(&after.regions)
-                    .map(|region| region.id().clone())
-                    .collect::<Vec<_>>(),
-                UndoKind::Text { .. } => Vec::new(),
+            .filter_map(|record| match &record.kind {
+                UndoKind::Structure { before, after } => {
+                    Some(before.regions.iter().chain(&after.regions))
+                }
+                UndoKind::Text { .. } => None,
             })
+            .flatten()
+            .map(|region| region.id().clone())
             .collect()
     }
 
@@ -2548,7 +2535,10 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             styles,
             selection,
         } = snapshot;
-        if text.get(..start) != self.model.text.to_string().get(..start) {
+        if text
+            .get(..start)
+            .is_none_or(|prefix| self.model.text.slice(..start) != prefix)
+        {
             return Err(StructureError::PrefixChanged);
         }
         let mut next = DocumentModel::new(text, regions)
@@ -2576,12 +2566,11 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         }
         let selection = selection.or_else(|| self.selected_positions().ok());
         if let Some((anchor, head)) = &selection {
-            next.resolve_position(anchor).map_err(|error| {
-                StructureError::Presentation(PresentationError::Position(error))
-            })?;
-            next.resolve_position(head).map_err(|error| {
-                StructureError::Presentation(PresentationError::Position(error))
-            })?;
+            for position in [anchor, head] {
+                next.resolve_position(position).map_err(|error| {
+                    StructureError::Presentation(PresentationError::Position(error))
+                })?;
+            }
         }
         next.revision = self.model.revision.next();
         Ok((next, before, after, selection))
@@ -3124,14 +3113,11 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             return;
         }
         if let Some(UndoRecord {
-            kind: UndoKind::Structure { before, .. },
+            kind: UndoKind::Structure { before, after },
             selection_before,
             ..
         }) = self.undo.undo.last()
         {
-            let UndoKind::Structure { after, .. } = &self.undo.undo.last().unwrap().kind else {
-                unreachable!()
-            };
             cx.emit(DocumentEvent::StructureReplayRequested(StructureReplay {
                 target: before.clone(),
                 selection: selection_before.clone(),
@@ -3156,14 +3142,11 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             return;
         }
         if let Some(UndoRecord {
-            kind: UndoKind::Structure { after, .. },
+            kind: UndoKind::Structure { before, after },
             selection_after,
             ..
         }) = self.undo.redo.last()
         {
-            let UndoKind::Structure { before, .. } = &self.undo.redo.last().unwrap().kind else {
-                unreachable!()
-            };
             cx.emit(DocumentEvent::StructureReplayRequested(StructureReplay {
                 target: after.clone(),
                 selection: selection_after.clone(),
