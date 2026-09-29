@@ -1892,7 +1892,6 @@ struct PendingViewportAnchor {
 struct ScrollPin<I> {
     id: I,
     anchor: DocumentAnchor,
-    affinity: Affinity,
     viewport_fraction: f32,
 }
 
@@ -2266,7 +2265,6 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.scroll_pin = Some(ScrollPin {
             id: pin_id,
             anchor,
-            affinity: position.affinity(),
             viewport_fraction,
         });
         self.caret_reveal_pending = false;
@@ -4215,47 +4213,50 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
 
     fn enforce_scroll_pin(&mut self, cx: &mut Context<Self>) {
         self.apply_scrollbar_input(cx);
-        let Some((anchor, affinity, viewport_fraction)) = self
+        let Some((anchor, viewport_fraction)) = self
             .scroll_pin
             .as_ref()
-            .map(|pin| (pin.anchor, pin.affinity, pin.viewport_fraction))
+            .map(|pin| (pin.anchor, pin.viewport_fraction))
         else {
             return;
         };
-        let Some(offset) = self.model.anchors.resolve(anchor) else {
+        let Ok(anchor_position) = self.model.position_for_anchor(anchor) else {
             return;
         };
-        let Some(display) = self.model.source_to_display(offset, affinity) else {
-            return;
+        // Hidden atomic blocks can share a display offset with one another and
+        // with adjacent text. Resolve the owner before consulting visible layout,
+        // so an offscreen block cannot borrow a neighbouring text row's geometry.
+        let block_ix = self.layout_items.iter().position(|item| {
+            matches!(item, DocumentLayoutItem::Block { id, .. }
+                    if id == anchor_position.node_id())
+        });
+        let (item_ix, position) = if let Some(item_ix) = block_ix {
+            let position = self
+                .block_layouts
+                .iter()
+                .find(|record| record.item_ix == item_ix)
+                .map(|record| {
+                    point(
+                        record.bounds.left(),
+                        if anchor_position.offset() == record.source.len() {
+                            record.bounds.bottom()
+                        } else {
+                            record.bounds.top()
+                        },
+                    )
+                });
+            (item_ix, position)
+        } else {
+            let Some(item_ix) = self.text_item_for_position(&anchor_position) else {
+                return;
+            };
+            (
+                item_ix,
+                self.text_position_for_position(&anchor_position)
+                    .map(|(position, _, _, _)| position),
+            )
         };
-        let position = self
-            .block_layouts
-            .iter()
-            .find(|record| {
-                if affinity == Affinity::Before {
-                    record.source.start < offset && offset <= record.source.end
-                } else {
-                    record.source.start <= offset && offset < record.source.end
-                }
-            })
-            .map(|record| {
-                point(
-                    record.bounds.left(),
-                    if offset == record.source.end {
-                        record.bounds.bottom()
-                    } else {
-                        record.bounds.top()
-                    },
-                )
-            })
-            .or_else(|| {
-                self.text_position_for_display(display, affinity)
-                    .map(|(position, _, _, _)| position)
-            });
         let Some(position) = position else {
-            let item_ix = self
-                .text_item_for_display(display, affinity)
-                .unwrap_or_else(|| self.layout_item_for_source(offset));
             if self.list_state.logical_scroll_top().item_ix != item_ix {
                 self.list_state.scroll_to(ListOffset {
                     item_ix,
@@ -6874,6 +6875,96 @@ mod tests {
             assert!(document.list_state.logical_scroll_top().item_ix > 0);
         });
         assert_eq!(stopped.get(), 2);
+    }
+
+    #[gpui::test]
+    fn scroll_pin_reveals_the_owned_block_across_hidden_projection_boundaries(
+        cx: &mut TestAppContext,
+    ) {
+        let (document, mut cx) = document_view(cx);
+        cx.simulate_resize(gpui::size(px(600.), px(400.)));
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.set_block_renderer(
+                    |id, _, _| {
+                        div()
+                            .h(px(if *id == "target" { 60. } else { 800. }))
+                            .into_any_element()
+                    },
+                    cx,
+                );
+                document
+                    .reset(
+                        DocumentSnapshot::new(
+                            "\u{fffc}\u{fffc}\u{fffc}draft",
+                            vec![
+                                DocumentRegion::new("before", 0..3, EditPolicy::Atomic),
+                                DocumentRegion::new("target", 3..6, EditPolicy::Atomic),
+                                DocumentRegion::new("after", 6..9, EditPolicy::Atomic),
+                                DocumentRegion::new("draft", 9..14, EditPolicy::Editable),
+                            ],
+                            DocumentProjection::new(
+                                14,
+                                vec![
+                                    ProjectionSpan::hide(0..3),
+                                    ProjectionSpan::hide(3..6),
+                                    ProjectionSpan::hide(6..9),
+                                ],
+                            )
+                            .unwrap(),
+                            vec![
+                                DocumentBlock::new("before", 0..3),
+                                DocumentBlock::new("target", 3..6),
+                                DocumentBlock::new("after", 6..9),
+                            ],
+                            DocumentStyles::default(),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            });
+            let _ = window.draw(cx);
+        });
+        for (offset, affinity) in [(0, Affinity::After), (3, Affinity::Before)] {
+            cx.update(|window, cx| {
+                document.update(cx, |document, cx| {
+                    document.unpin_scroll(&"pin", cx);
+                    document.list_state.scroll_to(ListOffset::default());
+                });
+                let _ = window.draw(cx);
+                document.update(cx, |document, cx| {
+                    assert!(
+                        document
+                            .block_layouts
+                            .iter()
+                            .all(|record| record.item_ix != 1)
+                    );
+                    document
+                        .pin_scroll(
+                            "pin",
+                            &DocumentPosition::new("target", offset, affinity),
+                            0.5,
+                            cx,
+                        )
+                        .unwrap();
+                });
+                for _ in 0..3 {
+                    let _ = window.draw(cx);
+                }
+            });
+            document.read_with(&cx, |document, _| {
+                let bounds = document
+                    .list_state
+                    .bounds_for_item(1)
+                    .expect("pinned block");
+                let edge = if offset == 0 {
+                    bounds.top()
+                } else {
+                    bounds.bottom()
+                };
+                assert!((edge - document.list_state.viewport_bounds().center().y).abs() < px(1.));
+            });
+        }
     }
 
     #[gpui::test]
