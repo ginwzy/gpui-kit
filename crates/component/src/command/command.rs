@@ -68,6 +68,34 @@ pub struct Command {
 }
 
 impl Command {
+    /// Install this model and presentation without rendering the builder.
+    ///
+    /// Externally filtered pickers can call this when their results change,
+    /// then render the retained `Entity<CommandState>` directly. Navigation
+    /// and host redraws keep the installed model and measured row sizes.
+    pub fn install(self, cx: &mut App) {
+        let state = self.state.clone();
+        self.install_model(cx);
+        state.update(cx, |_, cx| cx.notify());
+    }
+
+    fn install_model(self, cx: &mut App) -> Entity<CommandState> {
+        let model = CommandModel {
+            entries: self.entries,
+            searchable: self.searchable,
+            filterable: self.filterable,
+            on_query: self.on_query,
+            on_select: self.on_select,
+            on_confirm: self.on_confirm,
+            on_cancel: self.on_cancel,
+        };
+        self.state.update(cx, |state, cx| {
+            state.options = self.options;
+            state.install_model(model, cx);
+        });
+        self.state
+    }
+
     /// Render the palette held by `state`.
     pub fn new(state: &Entity<CommandState>) -> Self {
         Self {
@@ -239,21 +267,6 @@ impl Styled for Command {
 
 impl RenderOnce for Command {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let options = self.options;
-        let model = CommandModel {
-            entries: self.entries,
-            searchable: self.searchable,
-            filterable: self.filterable,
-            on_query: self.on_query,
-            on_select: self.on_select,
-            on_confirm: self.on_confirm,
-            on_cancel: self.on_cancel,
-        };
-        self.state.update(cx, |state, cx| {
-            state.options = options;
-            state.install_model(model, cx);
-        });
-
-        self.state
+        self.install_model(cx)
     }
 }

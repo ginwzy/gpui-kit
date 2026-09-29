@@ -2205,6 +2205,17 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.list_state.clone()
     }
 
+    /// Visible selection-head bounds in window coordinates, from the current
+    /// text layout. Read after this document's prepaint for same-frame popup
+    /// placement. Returns `None` when the caret has no visible text geometry.
+    pub fn caret_bounds(&self) -> Option<Bounds<Pixels>> {
+        let (_, head) = self.selected_positions().ok()?;
+        let (origin, line_height, _, _) = self.text_position_for_position(&head)?;
+        let bounds = Bounds::new(origin, gpui::size(px(1.), line_height));
+        let visible = bounds.intersect(&self.list_state.viewport_bounds());
+        (visible.size.width > Pixels::ZERO && visible.size.height > Pixels::ZERO).then_some(bounds)
+    }
+
     pub fn set_dynamic_trailer(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if self.dynamic_trailer == enabled {
             return;

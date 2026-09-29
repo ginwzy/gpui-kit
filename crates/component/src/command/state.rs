@@ -168,6 +168,10 @@ impl CommandState {
 
     pub(crate) fn install_model(&mut self, model: CommandModel, cx: &mut Context<Self>) {
         let selected_index_path = self.selected_index();
+        let selected_id = self
+            .selected_index
+            .and_then(|ix| self.item_at(ix))
+            .and_then(|item| item.id.clone());
         self.model = model;
         self.update_matches(cx);
 
@@ -176,8 +180,13 @@ impl CommandState {
                 .iter()
                 .enumerate()
                 .find_map(|(matched_ix, matched)| {
-                    (!matched.disabled && matched.index_path == selected_index_path)
-                        .then_some(matched_ix)
+                    let same_item = match &selected_id {
+                        Some(id) => {
+                            self.item_at(matched_ix).and_then(|item| item.id.as_ref()) == Some(id)
+                        }
+                        None => matched.index_path == selected_index_path,
+                    };
+                    (!matched.disabled && same_item).then_some(matched_ix)
                 })
         });
 
@@ -742,7 +751,10 @@ impl CommandState {
         };
 
         self.item_row(selected, cx)
-            .id(self.matched[matched_ix].index_path)
+            .id(item
+                .id
+                .clone()
+                .unwrap_or_else(|| self.matched[matched_ix].index_path.into()))
             .test_support()
             .role(Role::ListBoxOption)
             .aria_selected(selected)
@@ -1128,6 +1140,54 @@ mod tests {
                 .on_children_prepainted(move |bounds, _, _| width.set(Some(bounds[0].size.width)))
                 .child(item)
         }
+    }
+
+    #[gpui::test]
+    fn retained_model_keeps_measurements_on_navigation_and_tracks_item_identity(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let builds = Rc::new(Cell::new(0));
+        let (state, cx) = cx.add_window_view(CommandState::new);
+        cx.update(|_, cx| {
+            Command::new(&state)
+                .searchable(false)
+                .items((0usize..50).map(|ix| {
+                    let builds = builds.clone();
+                    CommandItem::new()
+                        .id(ix)
+                        .label(format!("item-{ix}"))
+                        .child(move |_, _| {
+                            builds.set(builds.get() + 1);
+                            div().h(px(24.)).child(format!("item-{ix}"))
+                        })
+                }))
+                .max_h(px(120.))
+                .install(cx);
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            state.update(cx, |state, cx| state.focus(window, cx));
+            window.draw(cx).clear(cx);
+        });
+        builds.set(0);
+        cx.simulate_keystrokes("down");
+        assert!(
+            builds.get() < 50,
+            "navigation rebuilt every row: {}",
+            builds.get()
+        );
+        cx.update(|window, cx| {
+            assert_eq!(state.read(cx).selected_index(), Some(IndexPath::new(1)));
+            Command::new(&state)
+                .searchable(false)
+                .items(
+                    [2usize, 0, 1].map(|ix| CommandItem::new().id(ix).label(format!("item-{ix}"))),
+                )
+                .install(cx);
+            assert_eq!(state.read(cx).selected_index(), Some(IndexPath::new(2)));
+            window.draw(cx).clear(cx);
+        });
     }
 
     #[gpui::test]

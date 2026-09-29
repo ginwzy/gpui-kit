@@ -1,12 +1,13 @@
 use std::rc::Rc;
 
-use gpui::{Action, AnyElement, App, IntoElement, SharedString, Window};
+use gpui::{Action, AnyElement, App, ElementId, IntoElement, SharedString, Window};
 
 use crate::{Disableable, Icon};
 
 /// A single command in a [`crate::command::Command`] palette.
 ///
 pub struct CommandItem {
+    pub(crate) id: Option<ElementId>,
     label: Option<SharedString>,
     keywords: Vec<SharedString>,
     /// Boxed: an [`Icon`] carries a whole `StyleRefinement`, which would make
@@ -21,6 +22,7 @@ pub struct CommandItem {
 impl Clone for CommandItem {
     fn clone(&self) -> Self {
         Self {
+            id: self.id.clone(),
             label: self.label.clone(),
             keywords: self.keywords.clone(),
             icon: self.icon.clone(),
@@ -36,6 +38,7 @@ impl CommandItem {
     /// Create an empty command item.
     pub fn new() -> Self {
         Self {
+            id: None,
             label: None,
             keywords: Vec::new(),
             icon: None,
@@ -44,6 +47,13 @@ impl CommandItem {
             disabled: false,
             content: None,
         }
+    }
+
+    /// Give a command stable identity across result filtering and reordering.
+    /// Items without an ID retain the positional selection behavior.
+    pub fn id(mut self, id: impl Into<ElementId>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     /// Set the label to display and search.
