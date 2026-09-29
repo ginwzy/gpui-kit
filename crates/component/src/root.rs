@@ -20,15 +20,15 @@ use std::{any::TypeId, rc::Rc};
 actions!(root, [Tab, TabPrev]);
 
 const CONTEXT: &str = "Root";
-const TAB_CONTEXT: &str = "Root && !InputHandoff";
+const BINDING_CONTEXT: &str = "Root && !InputHandoff";
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("tab", Tab, Some(TAB_CONTEXT)),
-        KeyBinding::new("shift-tab", TabPrev, Some(TAB_CONTEXT)),
+        KeyBinding::new("tab", Tab, Some(BINDING_CONTEXT)),
+        KeyBinding::new("shift-tab", TabPrev, Some(BINDING_CONTEXT)),
         #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
+        KeyBinding::new("cmd-c", Copy, Some(BINDING_CONTEXT)),
         #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-c", Copy, Some(CONTEXT)),
+        KeyBinding::new("ctrl-c", Copy, Some(BINDING_CONTEXT)),
     ]);
 }
 
@@ -617,6 +617,76 @@ impl Render for Root {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+
+    struct CopyHandoffView {
+        focus: FocusHandle,
+        handoff: bool,
+        keys: Vec<String>,
+    }
+
+    impl Render for CopyHandoffView {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .on_action(cx.listener(|_, _: &Copy, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string("outer selection".into()));
+                }))
+                .child(
+                    div()
+                        .track_focus(&self.focus)
+                        .when(self.handoff, |this| this.key_context("InputHandoff"))
+                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                            this.keys.push(event.keystroke.key.clone());
+                            cx.stop_propagation();
+                        })),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn copy_binding_respects_input_handoff(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let view = cx.new(|cx| CopyHandoffView {
+            focus: cx.focus_handle(),
+            handoff: true,
+            keys: Vec::new(),
+        });
+        let (_, cx) = cx.add_window_view(|window, cx| Root::new(view.clone(), window, cx));
+        cx.update(|window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string("unchanged".into()));
+            view.read(cx).focus.clone().focus(window, cx);
+            window.draw(cx).clear(cx);
+        });
+        let copy = if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        };
+        cx.simulate_keystrokes(copy);
+        cx.update(|_, cx| {
+            assert_eq!(view.read(cx).keys, ["c"]);
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().unwrap(),
+                "unchanged"
+            );
+        });
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.handoff = false;
+                view.keys.clear();
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.simulate_keystrokes(copy);
+        cx.update(|_, cx| {
+            assert!(view.read(cx).keys.is_empty());
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().unwrap(),
+                "outer selection"
+            );
+        });
+    }
 
     struct TestView;
 
