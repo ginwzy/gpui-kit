@@ -39,6 +39,7 @@ use super::{
 const DOCUMENT_INPUT_CONTEXT: &str = "Input";
 
 mod host;
+mod inline_styles;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentEditRejection {
@@ -1639,11 +1640,13 @@ fn resolve_document_styles<I: Eq>(
         text,
         regions,
         styles.paragraphs().iter().map(|style| style.source()),
+        false,
     )?;
     validate_style_ranges(
         text,
         regions,
         styles.inline().iter().map(|style| style.source()),
+        true,
     )?;
 
     let display_text = projection.display_text();
@@ -1691,6 +1694,7 @@ fn validate_style_ranges<I: Eq>(
     text: &Rope,
     regions: &DocumentRegions<I>,
     ranges: impl IntoIterator<Item = Range<usize>>,
+    allow_editable: bool,
 ) -> Result<(), DocumentStyleError> {
     let mut ranges = ranges.into_iter().collect::<Vec<_>>();
     ranges.sort_by_key(|range| (range.start, range.end));
@@ -1714,13 +1718,13 @@ fn validate_style_ranges<I: Eq>(
             let region_range = region.range();
             if range.start < region_range.end && region_range.start < range.end {
                 match region.policy() {
-                    EditPolicy::Editable => {
+                    EditPolicy::Editable if !allow_editable => {
                         return Err(DocumentStyleError::EditableRange(range));
                     }
                     EditPolicy::Atomic => {
                         return Err(DocumentStyleError::AtomicRange(range));
                     }
-                    EditPolicy::Readonly | EditPolicy::Routed => {}
+                    EditPolicy::Editable | EditPolicy::Readonly | EditPolicy::Routed => {}
                 }
             }
         }
@@ -4814,7 +4818,7 @@ mod tests {
         }
     }
 
-    fn document_view(
+    pub(super) fn document_view(
         cx: &mut TestAppContext,
     ) -> (Entity<DocumentState<&'static str>>, VisualTestContext) {
         let mut document = None;

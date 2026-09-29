@@ -5,7 +5,7 @@ use gpui::{HighlightStyle, SharedString, TextStyleRefinement};
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DocumentStyles {
     paragraphs: Vec<DocumentParagraphStyle>,
-    inline: Vec<DocumentInlineStyle>,
+    pub(super) inline: Vec<DocumentInlineStyle>,
 }
 
 impl DocumentStyles {
@@ -72,6 +72,10 @@ impl DocumentStyles {
         for style in &mut styles.inline {
             style.source = super::position::transform_source_range(style.source.clone(), edits);
         }
+        // Inline ranges exclude insertions at their boundaries. Replacing a
+        // whole styled token can therefore invert its endpoints; the old
+        // decoration has been deleted and must not reject the text edit.
+        styles.inline.retain(|style| !style.source.is_empty());
         styles
     }
 }
@@ -104,6 +108,11 @@ pub struct DocumentInlineStyle {
 }
 
 impl DocumentInlineStyle {
+    pub(super) fn shifted(mut self, offset: usize) -> Self {
+        self.source = self.source.start + offset..self.source.end + offset;
+        self
+    }
+
     pub fn new(source: Range<usize>, highlight: HighlightStyle) -> Self {
         Self {
             source,
@@ -132,6 +141,7 @@ impl DocumentInlineStyle {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DocumentStyleError {
+    UnknownNode,
     OutOfBounds {
         range: Range<usize>,
         source_len: usize,
@@ -146,6 +156,7 @@ pub enum DocumentStyleError {
 impl std::fmt::Display for DocumentStyleError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnknownNode => formatter.write_str("style node does not exist"),
             Self::OutOfBounds { range, source_len } => {
                 write!(
                     formatter,
