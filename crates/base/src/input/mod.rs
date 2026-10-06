@@ -13,8 +13,7 @@ pub(crate) const MASK_CHAR: char = '•';
 #[path = "editor/auto_close.rs"]
 mod auto_close;
 mod base;
-#[path = "base/blink_cursor.rs"]
-pub(crate) mod blink_cursor;
+pub(crate) use crate::editing::blink_cursor;
 #[path = "base/change.rs"]
 mod change;
 #[path = "base/cursor.rs"]

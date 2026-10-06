@@ -1,17 +1,17 @@
 use std::{cell::Cell, collections::BTreeMap, error::Error, fmt, ops::Range, rc::Rc};
 
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle,
-    Focusable, HighlightStyle, InteractiveElement as _, IntoElement as _, ListAlignment,
-    ListOffset, ListState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
-    Pixels, Point, Render, SharedString, Styled as _, TextStyleRefinement, UTF16Selection, Window,
-    div, list, point, px,
+    AnyElement, App, AppContext as _, Bounds, ClipboardItem, Context, EntityInputHandler,
+    EventEmitter, FocusHandle, Focusable, HighlightStyle, InteractiveElement as _,
+    IntoElement as _, ListAlignment, ListOffset, ListState, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement as _, Pixels, Point, Render, SharedString, Styled as _,
+    TextStyleRefinement, UTF16Selection, Window, div, list, point, px,
 };
 use ropey::{LineType, Rope};
 use sum_tree::Bias;
 
 use crate::{
-    AutoScroll, Scrollbar, ScrollbarHandle,
+    AutoScroll, BlinkCursor, Scrollbar, ScrollbarHandle,
     actions::{SelectDown, SelectLeft, SelectRight, SelectUp},
     input::{
         Backspace, Copy, Cut, Delete, DeleteToBeginningOfLine, DeleteToEndOfLine,
@@ -1845,6 +1845,9 @@ pub struct DocumentState<I> {
     layout_items: Vec<DocumentLayoutItem<I>>,
     list_state: ListState,
     focus_handle: FocusHandle,
+    blink_cursor: gpui::Entity<BlinkCursor>,
+    _cursor_subscriptions: [gpui::Subscription; 2],
+    cursor_focus_subscriptions: Option<[gpui::Subscription; 3]>,
     text_layouts: Vec<TextLayoutRecord>,
     block_layouts: Vec<BlockLayoutRecord>,
     trailer_layout: Option<(usize, Bounds<Pixels>)>,
@@ -1941,11 +1944,26 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         let layout_items = model.layout_items();
         let list_state =
             ListState::new(layout_items.len(), ListAlignment::Top, px(400.)).measure_all();
+        let focus_handle = cx.focus_handle();
+        let blink_cursor = cx.new(|_| BlinkCursor::new());
+        let weak = cx.weak_entity();
+        let input_focus = focus_handle.clone();
+        let cursor_subscriptions = [
+            cx.observe(&blink_cursor, |_, _, cx| cx.notify()),
+            cx.intercept_keystrokes(move |_, window, cx| {
+                if input_focus.is_focused(window) && window.is_window_active() {
+                    _ = weak.update(cx, |this, cx| this.pause_blink_cursor(cx));
+                }
+            }),
+        ];
         Ok(Self {
             model,
             layout_items,
             list_state,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
+            blink_cursor,
+            _cursor_subscriptions: cursor_subscriptions,
+            cursor_focus_subscriptions: None,
             text_layouts: Vec::new(),
             block_layouts: Vec::new(),
             trailer_layout: None,
@@ -2430,6 +2448,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.undo.break_coalescing();
         self.preferred_x = None;
         self.auto_scroll.stop();
+        self.pause_blink_cursor(cx);
         cx.emit(DocumentEvent::SelectionChanged);
         cx.notify();
         Ok(())
@@ -2446,6 +2465,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         } else {
             self.model.replace_selection(start, end);
         }
+        self.pause_blink_cursor(cx);
         cx.emit(DocumentEvent::SelectionChanged);
         cx.notify();
     }
@@ -3862,6 +3882,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.model
             .replace_selection_positions(anchor, position)
             .expect("hit-tested positions must resolve");
+        self.pause_blink_cursor(cx);
         cx.emit(DocumentEvent::SelectionChanged);
         cx.notify();
     }
@@ -4141,6 +4162,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     fn request_caret_reveal(&mut self, cx: &mut Context<Self>) {
+        self.pause_blink_cursor(cx);
         self.stop_following(cx);
         self.clear_pending_viewport_anchor();
         self.caret_reveal_pending = true;
@@ -4419,6 +4441,65 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         }
     }
 
+    fn caret_is_editable(&self) -> bool {
+        (self.model.selected_range().is_empty() || self.model.marked_range().is_some())
+            && self
+                .model
+                .position_for_anchor(self.model.selection.head())
+                .is_ok_and(|position| {
+                    self.region(position.node_id())
+                        .is_some_and(|region| region.policy() == EditPolicy::Editable)
+                })
+    }
+
+    pub(super) fn show_cursor(&self, window: &Window, cx: &App) -> bool {
+        self.focus_handle.is_focused(window)
+            && window.is_window_active()
+            && self.caret_is_editable()
+            && (self.model.marked_range().is_some()
+                || cx.reduce_motion()
+                || self.blink_cursor.read(cx).visible())
+    }
+
+    fn pause_blink_cursor(&mut self, cx: &mut Context<Self>) {
+        self.blink_cursor.update(cx, |cursor, cx| {
+            if self.caret_is_editable() {
+                cursor.pause(cx);
+            } else {
+                cursor.stop(cx);
+            }
+        });
+    }
+
+    fn update_cursor_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.blink_cursor.update(cx, |cursor, cx| {
+            if self.focus_handle.is_focused(window)
+                && window.is_window_active()
+                && self.caret_is_editable()
+            {
+                cursor.start(cx);
+            } else {
+                cursor.stop(cx);
+            }
+        });
+    }
+
+    pub(super) fn prepare_caret(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cursor_focus_subscriptions.is_some() {
+            return;
+        }
+        // Construction is window-independent; bind focus observers at the first prepaint.
+        let focus = self.focus_handle.clone();
+        self.cursor_focus_subscriptions = Some([
+            cx.on_focus(&focus, window, Self::update_cursor_focus),
+            cx.on_blur(&focus, window, |this, _, cx| {
+                this.blink_cursor.update(cx, |cursor, cx| cursor.stop(cx));
+            }),
+            cx.observe_window_activation(window, Self::update_cursor_focus),
+        ]);
+        self.update_cursor_focus(window, cx);
+    }
+
     pub(super) fn segment_paint_snapshot(
         &self,
         item_ix: usize,
@@ -4562,9 +4643,10 @@ impl<I: Clone + Eq + 'static> EntityInputHandler for DocumentState<I> {
             .map(|range| self.range_to_utf16(&range))
     }
 
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         self.model.set_marked_range(None);
         self.undo.finish_composition();
+        self.pause_blink_cursor(cx);
     }
 
     fn replace_text_in_range(
@@ -4693,6 +4775,7 @@ impl<I: Clone + Eq + 'static> EntityInputHandler for DocumentState<I> {
         } else {
             self.model.replace_selection(range.start, range.end);
         }
+        self.pause_blink_cursor(cx);
         cx.emit(DocumentEvent::SelectionChanged);
         cx.notify();
     }
@@ -4805,8 +4888,8 @@ impl<I: Clone + Eq + 'static> Render for DocumentState<I> {
 mod tests {
     use super::*;
     use gpui::{
-        AppContext as _, Entity, FontWeight, IntoElement, Modifiers, MouseButton, ScrollDelta,
-        ScrollWheelEvent, TestAppContext, VisualTestContext, point, px,
+        Entity, FontWeight, IntoElement, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent,
+        TestAppContext, VisualTestContext, point, px,
     };
 
     use crate::{Theme, document::ProjectionSpan};
@@ -4857,6 +4940,111 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[gpui::test]
+    fn caret_respects_node_identity_selection_and_focus(cx: &mut TestAppContext) {
+        let (document, mut view) = document_view(cx);
+        view.update(|window, cx| {
+            let focus = document.read(cx).focus_handle.clone();
+            focus.focus(window, cx);
+            window.activate_window();
+            let _ = window.draw(cx);
+        });
+        view.run_until_parked();
+
+        // The readonly end and empty draft share an offset, but not edit ownership.
+        for (node, offset, expected) in [("history", 7, false), ("draft", 0, true)] {
+            view.update(|window, cx| {
+                document.update(cx, |document, cx| {
+                    let position = DocumentPosition::new(node, offset, Affinity::After);
+                    document
+                        .set_selection_positions(position.clone(), position, cx)
+                        .unwrap();
+                    assert_eq!(document.show_cursor(window, cx), expected);
+                });
+            });
+        }
+        view.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.replace_text_in_range(None, "draft", window, cx);
+                document.set_selection(7..12, false, cx);
+                assert!(!document.show_cursor(window, cx));
+                assert_eq!(document.selected_range(), 7..12);
+                document.set_selection(12..12, false, cx);
+                assert!(document.show_cursor(window, cx));
+            });
+            let other = cx.focus_handle();
+            other.focus(window, cx);
+        });
+        view.run_until_parked();
+        view.update(|window, cx| {
+            let state = document.read(cx);
+            assert!(!state.show_cursor(window, cx));
+            assert!(!state.blink_cursor.read(cx).visible());
+            assert_eq!(state.text(), "historydraft");
+        });
+    }
+
+    #[gpui::test]
+    fn host_stream_preserves_blink_phase_and_ime_keeps_caret_visible(cx: &mut TestAppContext) {
+        let (document, mut view) = document_view(cx);
+        view.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.set_selection(7..7, false, cx);
+                document.focus_handle.focus(window, cx);
+            });
+            window.activate_window();
+            let _ = window.draw(cx);
+        });
+        view.run_until_parked();
+        view.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.replace_text_in_range(None, "a", window, cx);
+                assert!(document.show_cursor(window, cx));
+            });
+        });
+        view.run_until_parked();
+        view.executor()
+            .advance_clock(std::time::Duration::from_millis(300));
+        view.run_until_parked();
+        view.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                assert!(!document.show_cursor(window, cx));
+                let transaction = EditTransaction::new(
+                    document.revision(),
+                    EditOrigin::Host,
+                    vec![TextEdit::new(0..0, "stream\n")],
+                    8,
+                )
+                .unwrap();
+                document
+                    .apply_host_transaction(
+                        transaction,
+                        vec![
+                            DocumentRegion::new("history", 0..14, EditPolicy::Readonly),
+                            DocumentRegion::new("draft", 14..15, EditPolicy::Editable),
+                        ],
+                        cx,
+                    )
+                    .unwrap();
+                assert!(!document.show_cursor(window, cx));
+                assert_eq!(document.selected_range(), 15..15);
+                document.replace_and_mark_text_in_range(None, "你", Some(0..1), window, cx);
+            });
+        });
+        view.run_until_parked();
+        view.executor()
+            .advance_clock(std::time::Duration::from_millis(300));
+        view.run_until_parked();
+        view.update(|window, cx| {
+            let state = document.read(cx);
+            assert!(!state.blink_cursor.read(cx).visible());
+            assert!(state.show_cursor(window, cx));
+            assert_eq!(state.text(), "stream\nhistorya你");
+        });
+        view.simulate_keystrokes("left");
+        assert!(document.read_with(&view, |state, cx| state.blink_cursor.read(cx).visible()));
     }
 
     #[test]

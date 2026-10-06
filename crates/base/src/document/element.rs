@@ -4,10 +4,11 @@ use gpui::{
     AnyElement, App, BorderStyle, Bounds, Corners, CursorStyle, Edges, Element, ElementId,
     ElementInputHandler, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
     LayoutId, PaintQuad, Pixels, Point, SharedString, Styled as _, StyledText, TextStyleRefinement,
-    Window, fill, px, size, transparent_black,
+    Window, fill, transparent_black,
 };
 
 use super::{DocumentState, state::DocumentTextPresentation};
+use crate::editing::blink_cursor::caret_bounds;
 
 pub(super) enum DocumentChild<I: 'static> {
     Text {
@@ -104,6 +105,7 @@ impl<I: Clone + Eq + 'static> Element for DocumentElement<I> {
     ) -> Self::PrepaintState {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         self.state.update(cx, |state, cx| {
+            state.prepare_caret(window, cx);
             state.prepare_layout(bounds, window, cx);
         });
         self.content.prepaint(window, cx);
@@ -316,10 +318,9 @@ impl<I: Clone + Eq + 'static> Element for DocumentTextElement<I> {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (focus_handle, selected_range, cursor) = self
-            .state
-            .read(cx)
-            .segment_paint_snapshot(self.item_ix, &self.display);
+        let state = self.state.read(cx);
+        let (_, selected_range, cursor) = state.segment_paint_snapshot(self.item_ix, &self.display);
+        let show_cursor = cursor.is_some() && state.show_cursor(window, cx);
         let layout = self.text.layout().clone();
         if let Some(selected_range) = selected_range.filter(|range| !range.is_empty()) {
             let selection_color = crate::Theme::global(cx).tokens.colors.selection;
@@ -336,13 +337,14 @@ impl<I: Clone + Eq + 'static> Element for DocumentTextElement<I> {
             cx,
         );
 
-        if focus_handle.is_focused(window)
+        if show_cursor
             && let Some(cursor) = cursor
             && let Some(position) = layout.position_for_index(cursor)
         {
+            let colors = crate::Theme::global(cx).tokens.colors;
             window.paint_quad(fill(
-                Bounds::new(position, size(px(1.5), layout.line_height())),
-                window.text_style().color,
+                caret_bounds(position, layout.line_height()),
+                colors.caret.unwrap_or(colors.foreground),
             ));
         }
     }

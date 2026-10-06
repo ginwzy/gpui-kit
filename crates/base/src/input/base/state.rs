@@ -3195,7 +3195,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub(crate) fn show_cursor(&self, window: &Window, cx: &App) -> bool {
         (self.focus_handle.is_focused(window) || M::is_context_menu_open(self, cx))
             && !self.disabled
-            && self.blink_cursor.read(cx).visible()
+            && (self.ime_marked_range.is_some()
+                || cx.reduce_motion()
+                || self.blink_cursor.read(cx).visible())
             && window.is_window_active()
     }
 

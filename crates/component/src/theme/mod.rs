@@ -431,6 +431,7 @@ impl Theme {
             input: self.input,
             ring: self.ring,
             selection: self.selection,
+            caret: Some(self.caret),
         }
     }
 

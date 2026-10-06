@@ -4,6 +4,7 @@
 //! smaller stable seam. Existing input facades consume each extracted
 //! primitive immediately; this is not a parallel editor implementation.
 
+pub(crate) mod blink_cursor;
 mod selection;
 
 pub(crate) use selection::{CursorSelection, Selections};

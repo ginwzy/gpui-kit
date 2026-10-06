@@ -103,6 +103,7 @@ pub use dialog::{
     Dialog, DialogBackdrop, DialogChangeReason, DialogClose, DialogDescription, DialogHandle,
     DialogPopup, DialogTitle, DialogTrigger,
 };
+pub use editing::blink_cursor::BlinkCursor;
 pub use element_ext::ElementExt;
 pub use event::{InteractiveElementExt, OngoingScrollExt};
 pub use focus_trap::FocusTrapElement;

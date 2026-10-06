@@ -3443,7 +3443,7 @@ const BASE: &str = r#"  /** A row. */
   export function dock_content(): NativeElement;
 
   /** Semantic color roles, aligned with `gpui_base::ColorTokens`. */
-  export type ColorTokens = { readonly [Role in ColorToken]: Color };
+  export type ColorTokens = { readonly [Role in ColorToken]: Color } & { readonly caret?: Color };
   /** Semantic spacing scale, aligned with `gpui_base::SpacingTokens`. */
   export interface SpacingTokens {
     readonly xxs: number; readonly xs: number; readonly sm: number;

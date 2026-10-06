@@ -17,7 +17,11 @@ use std::{ops::Range, rc::Rc};
 
 use crate::{
     Scrollbar,
-    input::{RopeExt as _, blink_cursor::CURSOR_WIDTH, display_map::LineLayout},
+    input::{
+        RopeExt as _,
+        blink_cursor::{CURSOR_WIDTH, caret_bounds},
+        display_map::LineLayout,
+    },
 };
 
 use super::{
@@ -532,8 +536,6 @@ impl<M: InputModeKind> TextElement<M> {
             line_origin
         };
 
-        let cursor_height = 0.85 * line_height;
-
         for selection in state.selections.iter() {
             let is_active = selection.id == active_id;
 
@@ -657,13 +659,7 @@ impl<M: InputModeKind> TextElement<M> {
                 cursor_x
             };
             cursor_infos.push(CursorRenderInfo {
-                bounds: Bounds::new(
-                    point(
-                        cursor_x,
-                        bounds.top() + cursor_pos.y + ((line_height - cursor_height) / 2.),
-                    ),
-                    size(CURSOR_WIDTH, cursor_height),
-                ),
+                bounds: caret_bounds(point(cursor_x, bounds.top() + cursor_pos.y), line_height),
                 is_active,
             });
         }
