@@ -1876,6 +1876,7 @@ pub struct DocumentState<I> {
     unpainted_pin_scroll: Pixels,
     caret_reveal_pending: bool,
     caret_reveal_scheduled: bool,
+    ime_position_pending: bool,
     scroll_handler_installed: bool,
     scrollbar_input_pending: Rc<Cell<bool>>,
     block_renderer: Option<BlockRenderer<I>>,
@@ -2011,6 +2012,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             unpainted_pin_scroll: Pixels::ZERO,
             caret_reveal_pending: false,
             caret_reveal_scheduled: false,
+            ime_position_pending: true,
             scroll_handler_installed: false,
             scrollbar_input_pending: Rc::default(),
             block_renderer: None,
@@ -4705,6 +4707,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     fn pause_blink_cursor(&mut self, cx: &mut Context<Self>) {
+        self.ime_position_pending = true;
         self.blink_cursor.update(cx, |cursor, cx| {
             if self.caret_is_editable() {
                 cursor.pause(cx);
@@ -4715,6 +4718,9 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     fn update_cursor_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_handle.is_focused(window) && window.is_window_active() {
+            self.ime_position_pending = true;
+        }
         self.blink_cursor.update(cx, |cursor, cx| {
             if self.focus_handle.is_focused(window)
                 && window.is_window_active()
@@ -4725,6 +4731,22 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                 cursor.stop(cx);
             }
         });
+    }
+
+    pub(super) fn finish_ime_layout(&mut self, previous: Option<Bounds<Pixels>>) {
+        self.ime_position_pending |= previous != self.caret_bounds();
+    }
+
+    pub(super) fn update_ime_position(&mut self, window: &Window) {
+        if self.ime_position_pending
+            && self.focus_handle.is_focused(window)
+            && self.caret_bounds().is_some()
+        {
+            // Consume the request after layout; invalidating every paint would keep
+            // scheduling frames, including when only the caret blinks.
+            self.ime_position_pending = false;
+            window.invalidate_character_coordinates();
+        }
     }
 
     pub(super) fn prepare_caret(&mut self, window: &mut Window, cx: &mut Context<Self>) {

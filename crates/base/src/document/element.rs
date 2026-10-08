@@ -104,6 +104,7 @@ impl<I: Clone + Eq + 'static> Element for DocumentElement<I> {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        let previous_caret = self.state.read(cx).caret_bounds();
         self.state.update(cx, |state, cx| {
             state.prepare_caret(window, cx);
             state.prepare_layout(bounds, window, cx);
@@ -111,6 +112,7 @@ impl<I: Clone + Eq + 'static> Element for DocumentElement<I> {
         self.content.prepaint(window, cx);
         self.state.update(cx, |state, cx| {
             state.extend_pointer_selection(cx);
+            state.finish_ime_layout(previous_caret);
         });
         hitbox
     }
@@ -133,6 +135,8 @@ impl<I: Clone + Eq + 'static> Element for DocumentElement<I> {
             cx,
         );
         self.content.paint(window, cx);
+        self.state
+            .update(cx, |state, _| state.update_ime_position(window));
         // A selection drag belongs to the document that received the press,
         // including moves/releases over embedded controls or outside its bounds.
         let state = self.state.clone();
