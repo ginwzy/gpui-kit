@@ -321,15 +321,15 @@ impl ResolvedDocumentStyles {
     fn splice(&mut self, range: Range<usize>, delta: isize, mut replacement: Self) {
         let from = self
             .paragraphs
-            .partition_point(|(display, _)| display.end <= range.start);
+            .partition_point(|style| style.display.end <= range.start);
         let to = self
             .paragraphs
-            .partition_point(|(display, _)| display.start < range.end);
-        for (display, _) in &mut replacement.paragraphs {
-            *display = shifted(display.clone(), range.start as isize);
+            .partition_point(|style| style.display.start < range.end);
+        for style in &mut replacement.paragraphs {
+            style.display = shifted(style.display.clone(), range.start as isize);
         }
-        for (display, _) in &mut self.paragraphs[to..] {
-            *display = shifted(display.clone(), delta);
+        for style in &mut self.paragraphs[to..] {
+            style.display = shifted(style.display.clone(), delta);
         }
         self.paragraphs.splice(from..to, replacement.paragraphs);
         let from = self

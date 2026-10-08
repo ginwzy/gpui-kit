@@ -716,8 +716,15 @@ struct DocumentModel<I> {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct ResolvedDocumentStyles {
-    paragraphs: Vec<(Range<usize>, TextStyleRefinement)>,
+    paragraphs: Vec<ResolvedParagraphStyle>,
     inline: Vec<ResolvedInlineStyle>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ResolvedParagraphStyle {
+    display: Range<usize>,
+    text_style: TextStyleRefinement,
+    hanging_marker: Option<SharedString>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -730,8 +737,18 @@ struct ResolvedInlineStyle {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct DocumentTextPresentation {
     pub(super) text_style: Option<TextStyleRefinement>,
+    pub(super) indent: Option<DocumentTextIndent>,
     pub(super) highlights: Vec<(Range<usize>, HighlightStyle)>,
     pub(super) font_family_overrides: Vec<(Range<usize>, SharedString)>,
+}
+
+/// Aligns a line of a paragraph with the text after its hanging marker.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct DocumentTextIndent {
+    pub(super) marker: SharedString,
+    /// The paragraph's first line shows the marker and indents only the rows
+    /// it wraps onto; later lines indent every row.
+    pub(super) hanging: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1093,12 +1110,17 @@ impl<I: Clone + Eq> DocumentModel<I> {
             .position_for_offset(source_start, Affinity::After)
             .ok()
             .map(DocumentPosition::into_node_id);
-        let text_style = self
-            .resolved_styles
-            .paragraphs
-            .iter()
-            .find(|(range, _)| range.start <= display.start && display.end <= range.end)
-            .map(|(_, style)| style.clone());
+        let paragraph =
+            self.resolved_styles.paragraphs.iter().find(|style| {
+                style.display.start <= display.start && display.end <= style.display.end
+            });
+        let text_style = paragraph.map(|style| style.text_style.clone());
+        let indent = paragraph.and_then(|style| {
+            Some(DocumentTextIndent {
+                marker: style.hanging_marker.clone()?,
+                hanging: style.display.start == display.start,
+            })
+        });
         let mut highlights = Vec::new();
         let mut font_family_overrides = Vec::new();
         for inline in &self.resolved_styles.inline {
@@ -1120,6 +1142,7 @@ impl<I: Clone + Eq> DocumentModel<I> {
             node_id,
             presentation: Box::new(DocumentTextPresentation {
                 text_style,
+                indent,
                 highlights,
                 font_family_overrides,
             }),
@@ -1675,7 +1698,11 @@ fn resolve_document_styles<I: Eq>(
         if !starts_line || !ends_line {
             return Err(DocumentStyleError::ParagraphBoundary(source));
         }
-        paragraphs.push((display, style.text_style().clone()));
+        paragraphs.push(ResolvedParagraphStyle {
+            display,
+            text_style: style.text_style().clone(),
+            hanging_marker: style.hanging_marker().cloned(),
+        });
     }
 
     let mut inline = Vec::with_capacity(styles.inline().len());
@@ -1751,6 +1778,7 @@ fn closest_caret_index(
     line_height: Pixels,
 ) -> usize {
     let row = ((position.y / line_height).max(0.) as usize).min(line.wrap_boundaries().len());
+    let position = point(position.x - line.indent.for_row(row), position.y);
     let boundary = |boundary: &gpui::WrapBoundary| {
         let glyph = &line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix];
         (glyph.index, glyph.position.x)
@@ -7869,6 +7897,79 @@ mod tests {
             assert_eq!(
                 (top.item_ix, top.offset_in_item),
                 (stopped.0.item_ix, stopped.0.offset_in_item)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn hanging_marker_aligns_wrapped_rows_and_later_lines(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        let marker = "• ";
+        let item = format!("{marker}{}\nnext line\n", "中文 words ".repeat(10));
+        let source = format!("{item}after");
+        let end = source.len();
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.set_text_renderer(
+                    |_, text, _, _| div().w(px(200.)).child(text).into_any_element(),
+                    cx,
+                );
+                document
+                    .reset(
+                        DocumentSnapshot::new(
+                            source.clone(),
+                            vec![
+                                DocumentRegion::new("history", 0..end, EditPolicy::Readonly),
+                                DocumentRegion::new("draft", end..end, EditPolicy::Editable),
+                            ],
+                            DocumentProjection::new(end, vec![]).unwrap(),
+                            vec![],
+                            DocumentStyles::new(
+                                vec![
+                                    super::super::DocumentParagraphStyle::new(
+                                        0..item.len(),
+                                        TextStyleRefinement::default(),
+                                    )
+                                    .with_hanging_marker(marker),
+                                ],
+                                vec![],
+                            ),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            });
+            let _ = window.draw(cx);
+        });
+        document.read_with(&cx, |document, _| {
+            let [first, second, after, ..] = document.text_layouts.as_slice() else {
+                panic!("expected three text lines");
+            };
+            let text_x = first.layout.position_for_index(marker.len()).unwrap().x;
+            assert!(text_x > first.bounds.left());
+
+            // Wrapped rows start under the text, and the indent itself maps to
+            // the start of the row.
+            let line = first.layout.line_layout_for_index(0).unwrap();
+            let boundary = line.wrap_boundaries[0];
+            let wrap = line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+            let row = first.bounds.top() + first.layout.line_height() * 1.5;
+            assert_eq!(
+                first.layout.index_for_position(point(text_x + px(1.), row)),
+                Ok(wrap)
+            );
+            assert_eq!(
+                first
+                    .layout
+                    .index_for_position(point(first.bounds.left() + px(1.), row)),
+                Err(wrap)
+            );
+            // Later lines of the paragraph keep that alignment; the next
+            // paragraph does not.
+            assert_eq!(second.layout.position_for_index(0).unwrap().x, text_x);
+            assert_eq!(
+                after.layout.position_for_index(0).unwrap().x,
+                after.bounds.left()
             );
         });
     }

@@ -84,11 +84,28 @@ impl DocumentStyles {
 pub struct DocumentParagraphStyle {
     source: Range<usize>,
     text_style: TextStyleRefinement,
+    hanging_marker: Option<SharedString>,
 }
 
 impl DocumentParagraphStyle {
     pub fn new(source: Range<usize>, text_style: TextStyleRefinement) -> Self {
-        Self { source, text_style }
+        Self {
+            source,
+            text_style,
+            hanging_marker: None,
+        }
+    }
+
+    /// Declares that the paragraph's display text starts with `marker`, such
+    /// as a list bullet. Wrapped rows and later lines of the paragraph align
+    /// with the text after it instead of with the marker.
+    pub fn with_hanging_marker(mut self, marker: impl Into<SharedString>) -> Self {
+        self.hanging_marker = Some(marker.into());
+        self
+    }
+
+    pub fn hanging_marker(&self) -> Option<&SharedString> {
+        self.hanging_marker.as_ref()
     }
 
     pub fn source(&self) -> Range<usize> {

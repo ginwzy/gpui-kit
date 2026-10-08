@@ -3,11 +3,14 @@ use std::ops::Range;
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, Corners, CursorStyle, Edges, Element, ElementId,
     ElementInputHandler, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    LayoutId, PaintQuad, Pixels, Point, SharedString, Styled as _, StyledText, TextStyleRefinement,
-    Window, fill, transparent_black,
+    LayoutId, LineIndent, PaintQuad, Pixels, Point, SharedString, Styled as _, StyledText,
+    TextStyleRefinement, Window, fill, px, transparent_black,
 };
 
-use super::{DocumentState, state::DocumentTextPresentation};
+use super::{
+    DocumentState,
+    state::{DocumentTextIndent, DocumentTextPresentation},
+};
 use crate::editing::blink_cursor::caret_bounds;
 
 pub(super) enum DocumentChild<I: 'static> {
@@ -231,6 +234,7 @@ struct DocumentTextElement<I: 'static> {
     display: Range<usize>,
     text: StyledText,
     text_style: Option<TextStyleRefinement>,
+    indent: Option<DocumentTextIndent>,
 }
 
 impl<I: 'static> DocumentTextElement<I> {
@@ -249,6 +253,7 @@ impl<I: 'static> DocumentTextElement<I> {
                 .with_highlights(presentation.highlights)
                 .with_font_family_overrides(presentation.font_family_overrides),
             text_style: presentation.text_style,
+            indent: presentation.indent,
         }
     }
 }
@@ -280,15 +285,34 @@ impl<I: Clone + Eq + 'static> Element for DocumentTextElement<I> {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        if let Some(style) = self.text_style.clone() {
-            window.with_text_style(Some(style), |window| {
-                self.text
-                    .request_layout(global_id, inspector_id, window, cx)
-            })
-        } else {
+        window.with_text_style(self.text_style.clone(), |window| {
+            if let Some(indent) = &self.indent {
+                // Measured in this line's own style so rows align with the
+                // text the marker precedes.
+                let style = window.text_style();
+                let width = window
+                    .text_system()
+                    .shape_line(
+                        indent.marker.clone(),
+                        style.font_size.to_pixels(window.rem_size()),
+                        &[style.to_run(indent.marker.len())],
+                        None,
+                    )
+                    .width;
+                let indent = if indent.hanging {
+                    LineIndent {
+                        first: px(0.),
+                        rest: width,
+                    }
+                } else {
+                    LineIndent::uniform(width)
+                };
+                let text = std::mem::replace(&mut self.text, StyledText::new(""));
+                self.text = text.with_line_indent(indent);
+            }
             self.text
                 .request_layout(global_id, inspector_id, window, cx)
-        }
+        })
     }
 
     fn prepaint(
@@ -464,7 +488,13 @@ fn paint_selection(
     ) else {
         return;
     };
-    for bounds in selection_quad_bounds(start, end, layout.bounds(), layout.line_height()) {
+    // Rows after the first start at the line's indent, not under a hanging marker.
+    let mut bounds = layout.bounds();
+    if let Some(line) = layout.line_layout_for_index(0) {
+        bounds.origin.x += line.indent.rest;
+        bounds.size.width -= line.indent.rest;
+    }
+    for bounds in selection_quad_bounds(start, end, bounds, layout.line_height()) {
         window.paint_quad(PaintQuad {
             bounds,
             background: color.into(),
