@@ -2501,9 +2501,6 @@ impl<M: InputModeKind> Element for TextElement<M> {
             // Layout consumers need changed geometry, not another notification
             // for every paint of an unchanged input.
             if geometry_changed {
-                if focused {
-                    window.invalidate_character_coordinates();
-                }
                 cx.notify();
             }
         });

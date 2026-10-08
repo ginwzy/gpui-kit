@@ -159,6 +159,9 @@ quickjs-jit-core = { opt-level = 3 }
 cap-std = { opt-level = 3 }
 
 [patch.crates-io]
+gpui-pre = { path = "../gpui-pre" }
+gpui-pre-linux = { path = "../gpui-pre-linux" }
+zed-xim = { path = "../zed-xim" }
 # LLRT's public modules still name their compatible binding dependency
 # `rquickjs`. Route those dependencies through a source-compatible facade so
 # the shell and LLRT share the exact same quickjs-jit types and VM.
