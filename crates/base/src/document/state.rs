@@ -349,7 +349,10 @@ impl<I: Clone + Eq> DocumentStructure<I> {
             .iter()
             .filter(|region| {
                 region.range().start >= start
-                    && matches!(region.policy(), EditPolicy::Editable | EditPolicy::Atomic)
+                    && matches!(
+                        region.policy(),
+                        EditPolicy::Editable | EditPolicy::Atomic | EditPolicy::Readonly
+                    )
             })
             .map(|region| {
                 let range = region.range();
@@ -477,6 +480,7 @@ struct RelativeSelection {
 struct RegionSelection<I> {
     region_id: I,
     selection: RelativeSelection,
+    affinities: (Affinity, Affinity),
 }
 
 // A record owns only replaced text, in region-relative coordinates. Multiple
@@ -1618,6 +1622,14 @@ impl<I: Clone + Eq> DocumentModel<I> {
                     .map(|selection| RegionSelection {
                         region_id: region.id().clone(),
                         selection,
+                        affinities: (
+                            self.position_for_anchor(self.selection.anchor())
+                                .unwrap()
+                                .affinity(),
+                            self.position_for_anchor(self.selection.head())
+                                .unwrap()
+                                .affinity(),
+                        ),
                     })
             })
     }
@@ -1634,6 +1646,12 @@ impl<I: Clone + Eq> DocumentModel<I> {
                     .map(|selection| RegionSelection {
                         region_id: region.id().clone(),
                         selection,
+                        affinities: (
+                            self.position_for_anchor(marked.anchor())
+                                .unwrap()
+                                .affinity(),
+                            self.position_for_anchor(marked.head()).unwrap().affinity(),
+                        ),
                     })
             })
     }
@@ -1641,11 +1659,19 @@ impl<I: Clone + Eq> DocumentModel<I> {
     fn restore_active_selection(&mut self, capture: &RegionSelection<I>) {
         if let Some(index) = self.region_index(&capture.region_id) {
             let range = self.regions.as_slice()[index].range();
-            self.select_in_region(
-                index,
-                capture.selection.anchor.min(range.len()),
-                capture.selection.head.min(range.len()),
-            );
+            self.replace_selection_positions(
+                DocumentPosition::new(
+                    capture.region_id.clone(),
+                    capture.selection.anchor.min(range.len()),
+                    capture.affinities.0,
+                ),
+                DocumentPosition::new(
+                    capture.region_id.clone(),
+                    capture.selection.head.min(range.len()),
+                    capture.affinities.1,
+                ),
+            )
+            .expect("retained editable selection resolves after host update");
         }
     }
 
@@ -5155,6 +5181,9 @@ impl<I: Clone + Eq + 'static> Render for DocumentState<I> {
             .child(scrollbar)
     }
 }
+
+#[cfg(test)]
+mod readonly_composition_tests;
 
 #[cfg(test)]
 mod tests {
