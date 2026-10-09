@@ -2144,7 +2144,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) -> Result<(), ProjectionError> {
         self.model.set_projection(projection)?;
-        self.reconcile_layout_items_from(0);
+        self.reconcile_presented_layout_items();
         cx.emit(DocumentEvent::ProjectionChanged);
         cx.notify();
         Ok(())
@@ -2232,7 +2232,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             return Err(PresentationError::Blocks(BlockError::MissingRenderer));
         }
         self.model.set_presentation(projection, blocks)?;
-        self.reconcile_layout_items_from(0);
+        self.reconcile_presented_layout_items();
         cx.emit(DocumentEvent::PresentationChanged);
         cx.notify();
         Ok(())
@@ -2250,7 +2250,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         }
         self.model
             .set_rich_presentation(projection, blocks, styles)?;
-        self.reconcile_layout_items_from(0);
+        self.reconcile_presented_layout_items();
         cx.emit(DocumentEvent::PresentationChanged);
         cx.notify();
         Ok(())
@@ -2281,7 +2281,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             anchored_blocks,
             styles,
         )?;
-        self.reconcile_layout_items_from(0);
+        self.reconcile_presented_layout_items();
         cx.emit(DocumentEvent::PresentationChanged);
         cx.notify();
         Ok(())
@@ -2397,7 +2397,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             self.trailer_height = None;
             self.trailer_layout = None;
         }
-        self.reconcile_layout_items_from(0);
+        self.reconcile_presented_layout_items();
         cx.notify();
     }
 
@@ -2711,6 +2711,15 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         start..end
     }
 
+    /// Presentation changes keep the source, so every unchanged item before
+    /// the first difference keeps its list slot. Splicing from item 0 would
+    /// move the list's scroll top to the document start.
+    fn reconcile_presented_layout_items(&mut self) {
+        self.reconcile_layout_items_from(usize::MAX);
+    }
+
+    /// `first_changed_item` bounds the reused prefix: source edits pass the
+    /// first item they touched, since earlier text may compare equal by accident.
     fn reconcile_layout_items_from(&mut self, first_changed_item: usize) {
         let next = self.next_layout_items();
         let mut prefix = 0;
