@@ -15,7 +15,7 @@ mod transaction;
 
 pub use anchored_block::{AnchoredBlock, AnchoredBlockError};
 pub use block::{BlockError, DocumentBlock};
-pub use element::DocumentElement;
+pub use element::{DocumentElement, DocumentText};
 pub use position::{
     Affinity, AnchorBias, DocumentAnchor, DocumentPosition, DocumentRevision, DocumentSelection,
     PositionError,

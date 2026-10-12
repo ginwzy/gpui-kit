@@ -12,7 +12,7 @@ use gpui::{
     EventEmitter, FocusHandle, Focusable, HighlightStyle, InteractiveElement as _,
     IntoElement as _, ListAlignment, ListOffset, ListState, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement as _, Pixels, Point, Render, SharedString, Styled as _,
-    TextStyleRefinement, UTF16Selection, Window, div, list, point, px,
+    TextStyleRefinement, UTF16Selection, Window, div, list, point, prelude::FluentBuilder as _, px,
 };
 use ropey::{LineType, Rope};
 use sum_tree::Bias;
@@ -1943,6 +1943,7 @@ pub struct DocumentState<I> {
     scrollbar_input_pending: Rc<Cell<bool>>,
     block_renderer: Option<BlockRenderer<I>>,
     text_renderer: Option<TextRenderer<I>>,
+    text_measurer: Option<TextMeasurer<I>>,
 }
 
 struct TextLayoutRecord {
@@ -1961,6 +1962,15 @@ struct BlockLayoutRecord {
 type BlockRenderer<I> = Rc<dyn Fn(&I, &mut Window, &mut App) -> AnyElement>;
 type TextRenderer<I> =
     Rc<dyn Fn(DocumentTextContext<I>, AnyElement, &mut Window, &mut App) -> AnyElement>;
+type TextMeasurer<I> = Rc<
+    dyn Fn(
+        DocumentTextContext<I>,
+        super::DocumentText,
+        Pixels,
+        &mut Window,
+        &mut App,
+    ) -> gpui::Size<Pixels>,
+>;
 
 struct PendingViewportAnchor {
     anchor: DocumentAnchor,
@@ -2078,6 +2088,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             scrollbar_input_pending: Rc::default(),
             block_renderer: None,
             text_renderer: None,
+            text_measurer: None,
         })
     }
 
@@ -2118,8 +2129,35 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) {
         self.text_renderer = Some(Rc::new(renderer));
+        self.text_measurer = None;
         self.list_state.remeasure_items(0..self.layout_items.len());
         cx.notify();
+    }
+
+    /// Decorate text rows, with an exact measurement callback for offscreen rows.
+    ///
+    /// Both callbacks receive the same document text and presentation. Measure
+    /// the supplied text at the same width and inherited style as the renderer,
+    /// and include any decoration that affects the row size. Returning a size
+    /// avoids constructing the row's controls and general layout tree.
+    /// Visible rows always use `renderer`; blocks keep their normal renderer.
+    /// Invalidation and total geometry remain owned by the document's list.
+    pub fn set_text_renderer_with_measurement(
+        &mut self,
+        renderer: impl Fn(DocumentTextContext<I>, AnyElement, &mut Window, &mut App) -> AnyElement
+        + 'static,
+        measure: impl Fn(
+            DocumentTextContext<I>,
+            super::DocumentText,
+            Pixels,
+            &mut Window,
+            &mut App,
+        ) -> gpui::Size<Pixels>
+        + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_text_renderer(renderer, cx);
+        self.text_measurer = Some(Rc::new(measure));
     }
 
     pub fn reset(
@@ -5122,9 +5160,36 @@ impl<I: Clone + Eq + 'static> Render for DocumentState<I> {
             });
         }
         let list_entity = entity.clone();
+        let measure_entity = entity.clone();
         let content = list(self.list_state.clone(), move |item_ix, window, cx| {
             list_entity.update(cx, |state, cx| {
                 state.render_layout_item(item_ix, window, cx)
+            })
+        })
+        .when(self.text_measurer.is_some(), |list| {
+            list.with_measure_item(move |item_ix, width, window, cx| {
+                measure_entity.update(cx, |state, cx| {
+                    let measure = state.text_measurer.as_ref()?;
+                    let DocumentLayoutItem::Text {
+                        source,
+                        node_id: Some(node_id),
+                        text,
+                        presentation,
+                        ..
+                    } = &state.layout_items[item_ix]
+                    else {
+                        return None;
+                    };
+                    let region = state.region(node_id).map(DocumentRegion::range);
+                    let context = DocumentTextContext {
+                        node_id: node_id.clone(),
+                        source: source.clone(),
+                        node_start: region.as_ref().map_or(0, |region| region.start),
+                        first_line: region.is_some_and(|region| source.start <= region.start),
+                    };
+                    let text = super::DocumentText::new(text.clone(), *presentation.clone());
+                    Some(measure(context, text, width, window, cx))
+                })
             })
         })
         .size_full()
@@ -5250,6 +5315,77 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[gpui::test]
+    fn direct_text_height_matches_styled_indented_element_layout(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        cx.draw(
+            Point::default(),
+            gpui::size(px(800.), px(600.)),
+            |window, cx| {
+                for text in [
+                    "",
+                    "中文🙂 á text",
+                    "• long wrapped text with punctuation, and 中文🙂",
+                ] {
+                    for width in [px(37.), px(150.), px(700.)] {
+                        for font_size in [px(14.), px(18.)] {
+                            for hanging in [false, true] {
+                                let presentation = DocumentTextPresentation {
+                                    text_style: Some(TextStyleRefinement {
+                                        font_size: Some(font_size.into()),
+                                        ..Default::default()
+                                    }),
+                                    indent: Some(DocumentTextIndent {
+                                        marker: "• ".into(),
+                                        hanging,
+                                    }),
+                                    highlights: vec![(
+                                        0..text.len(),
+                                        HighlightStyle {
+                                            font_weight: Some(FontWeight::BOLD),
+                                            ..Default::default()
+                                        },
+                                    )],
+                                    font_family_overrides: vec![],
+                                };
+                                let measured = super::super::DocumentText::new(
+                                    text.into(),
+                                    presentation.clone(),
+                                )
+                                .measure(width, window, cx);
+                                let mut actual = DocumentElement::render_child(
+                                    document.clone(),
+                                    DocumentChild::Text {
+                                        item_ix: 0,
+                                        display: 0..text.len(),
+                                        text: text.into(),
+                                        presentation: Box::new(presentation),
+                                    },
+                                );
+                                let actual = actual.layout_as_root(
+                                    gpui::size(
+                                        gpui::AvailableSpace::Definite(width),
+                                        gpui::AvailableSpace::MinContent,
+                                    ),
+                                    window,
+                                    cx,
+                                );
+                                // Text size is intrinsic; root layout stretches
+                                // the box to the available width. Row height must
+                                // still be exactly the shaped and wrapped height.
+                                assert_eq!(
+                                    measured.height, actual.height,
+                                    "width {width:?}, font {font_size:?}, hanging {hanging}"
+                                );
+                            }
+                        }
+                    }
+                }
+                div()
+            },
+        );
     }
 
     #[gpui::test]
