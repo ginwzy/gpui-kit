@@ -296,9 +296,17 @@ fn shifted(range: Range<usize>, delta: isize) -> Range<usize> {
 }
 
 impl<I> DocumentLayoutItem<I> {
-    fn source_start(&self) -> usize {
+    pub(super) fn source_start(&self) -> usize {
         match self {
             Self::Text { source, .. } | Self::Block { source, .. } => source.start,
+            Self::AnchoredBlock { source, .. } => *source,
+            Self::Trailer => usize::MAX,
+        }
+    }
+
+    pub(super) fn source_end(&self) -> usize {
+        match self {
+            Self::Text { source, .. } | Self::Block { source, .. } => source.end,
             Self::AnchoredBlock { source, .. } => *source,
             Self::Trailer => usize::MAX,
         }

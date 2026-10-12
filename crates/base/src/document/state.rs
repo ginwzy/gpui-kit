@@ -2631,16 +2631,70 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         true
     }
 
+    /// The first item that ends at or after `source`. Items end in document order.
     fn layout_item_for_source(&self, source: usize) -> usize {
-        self.layout_items
-            .iter()
-            .position(|item| match item {
-                DocumentLayoutItem::Text { source: text, .. } => source <= text.end,
-                DocumentLayoutItem::Block { source: block, .. } => source <= block.end,
-                DocumentLayoutItem::AnchoredBlock { source: block, .. } => source <= *block,
-                DocumentLayoutItem::Trailer => true,
-            })
-            .unwrap_or(self.layout_items.len())
+        let found = self
+            .layout_items
+            .partition_point(|item| item.source_end() < source);
+        #[cfg(test)]
+        assert_eq!(
+            found,
+            self.layout_items
+                .iter()
+                .position(|item| source <= item.source_end())
+                .unwrap_or(self.layout_items.len())
+        );
+        found
+    }
+
+    /// Items that may contain source `offset`: those starting at or before it,
+    /// back to the first that ends before it. Sources follow document order, so a
+    /// lookup costs the items around the offset, not the whole document.
+    fn items_around_source(&self, offset: usize) -> Range<usize> {
+        let end = self
+            .layout_items
+            .partition_point(|item| item.source_start() <= offset);
+        let mut start = end;
+        while start > 0 {
+            match &self.layout_items[start - 1] {
+                DocumentLayoutItem::Text { source, .. }
+                | DocumentLayoutItem::Block { source, .. }
+                    if source.end < offset =>
+                {
+                    break;
+                }
+                _ => start -= 1,
+            }
+        }
+        start..end
+    }
+
+    /// Items that may contain display `offset`, as [`Self::items_around_source`]
+    /// does for source offsets. Blocks sit at the display offset of their source.
+    fn items_around_display(&self, offset: usize) -> Range<usize> {
+        let display_start = |item: &DocumentLayoutItem<I>| match item {
+            DocumentLayoutItem::Text { display, .. } => display.start,
+            DocumentLayoutItem::Block { source, .. } => self
+                .model
+                .source_to_display(source.start, Affinity::Before)
+                .unwrap_or_default(),
+            DocumentLayoutItem::AnchoredBlock { source, .. } => self
+                .model
+                .source_to_display(*source, Affinity::Before)
+                .unwrap_or_default(),
+            DocumentLayoutItem::Trailer => usize::MAX,
+        };
+        let end = self
+            .layout_items
+            .partition_point(|item| display_start(item) <= offset);
+        let mut start = end;
+        while start > 0 {
+            match &self.layout_items[start - 1] {
+                DocumentLayoutItem::Text { display, .. } if display.end < offset => break,
+                _ => start -= 1,
+            }
+        }
+        start..end
     }
 
     fn reconcile_layout_items_from(&mut self, first_changed_item: usize) {
@@ -4271,9 +4325,29 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
 
     fn text_item_for_position(&self, position: &DocumentPosition<I>) -> Option<usize> {
         let offset = self.resolve_position(position).ok()?;
+        let found =
+            self.text_item_for_offset_in(position, offset, self.items_around_source(offset));
+        #[cfg(test)]
+        assert_eq!(
+            found,
+            self.text_item_for_offset_in(position, offset, 0..self.layout_items.len())
+        );
+        found
+    }
+
+    fn text_item_for_offset_in(
+        &self,
+        position: &DocumentPosition<I>,
+        offset: usize,
+        items: Range<usize>,
+    ) -> Option<usize> {
         let mut fallback = None;
         let mut owned = None;
-        for (ix, item) in self.layout_items.iter().enumerate() {
+        for (ix, item) in self.layout_items[items.clone()]
+            .iter()
+            .enumerate()
+            .map(|(ix, item)| (items.start + ix, item))
+        {
             let DocumentLayoutItem::Text {
                 source, node_id, ..
             } = item
@@ -4342,18 +4416,34 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     // Resolve against the whole layout, so virtualization cannot transfer a boundary
     // caret to a preceding item when its actual owner is just outside the viewport.
     fn text_item_for_display(&self, offset: usize, affinity: Affinity) -> Option<usize> {
-        let mut matches =
-            self.layout_items
-                .iter()
-                .enumerate()
-                .filter_map(|(ix, item)| match item {
-                    DocumentLayoutItem::Text { display, .. }
-                        if display.start <= offset && offset <= display.end =>
-                    {
-                        Some(ix)
-                    }
-                    _ => None,
-                });
+        let found =
+            self.text_item_for_display_in(offset, affinity, self.items_around_display(offset));
+        #[cfg(test)]
+        assert_eq!(
+            found,
+            self.text_item_for_display_in(offset, affinity, 0..self.layout_items.len())
+        );
+        found
+    }
+
+    fn text_item_for_display_in(
+        &self,
+        offset: usize,
+        affinity: Affinity,
+        items: Range<usize>,
+    ) -> Option<usize> {
+        let mut matches = self.layout_items[items.clone()]
+            .iter()
+            .enumerate()
+            .map(|(ix, item)| (items.start + ix, item))
+            .filter_map(|(ix, item)| match item {
+                DocumentLayoutItem::Text { display, .. }
+                    if display.start <= offset && offset <= display.end =>
+                {
+                    Some(ix)
+                }
+                _ => None,
+            });
         if affinity == Affinity::Before {
             matches.next()
         } else {
