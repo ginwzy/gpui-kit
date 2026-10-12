@@ -213,10 +213,14 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.model.anchored_blocks.extend(candidate.anchored_blocks);
         self.model
             .styles
-            .splice(source, new_text.len(), candidate.styles);
-        self.model
-            .resolved_styles
-            .splice(display, display_delta, candidate.resolved_styles);
+            .splice(source.clone(), new_text.len(), candidate.styles);
+        self.model.resolved_styles.splice(
+            source,
+            source_delta,
+            display,
+            display_delta,
+            candidate.resolved_styles,
+        );
         self.model.reconcile_anchor_nodes();
         self.model.revision = self.model.revision.next();
         for item in &mut self.layout_items[old_layout.end..] {
@@ -318,7 +322,14 @@ impl<I> DocumentLayoutItem<I> {
 }
 
 impl ResolvedDocumentStyles {
-    fn splice(&mut self, range: Range<usize>, delta: isize, mut replacement: Self) {
+    fn splice(
+        &mut self,
+        source: Range<usize>,
+        source_delta: isize,
+        range: Range<usize>,
+        delta: isize,
+        mut replacement: Self,
+    ) {
         let from = self
             .paragraphs
             .partition_point(|style| style.display.end <= range.start);
@@ -334,14 +345,16 @@ impl ResolvedDocumentStyles {
         self.paragraphs.splice(from..to, replacement.paragraphs);
         let from = self
             .inline
-            .partition_point(|style| style.display.end <= range.start);
+            .partition_point(|style| style.source.end <= source.start);
         let to = self
             .inline
-            .partition_point(|style| style.display.start < range.end);
+            .partition_point(|style| style.source.start < source.end);
         for style in &mut replacement.inline {
+            style.source = shifted(style.source.clone(), source.start as isize);
             style.display = shifted(style.display.clone(), range.start as isize);
         }
         for style in &mut self.inline[to..] {
+            style.source = shifted(style.source.clone(), source_delta);
             style.display = shifted(style.display.clone(), delta);
         }
         self.inline.splice(from..to, replacement.inline);

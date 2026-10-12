@@ -733,6 +733,7 @@ struct ResolvedParagraphStyle {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ResolvedInlineStyle {
+    source: Range<usize>,
     display: Range<usize>,
     highlight: HighlightStyle,
     font_family: Option<SharedString>,
@@ -1127,7 +1128,14 @@ impl<I: Clone + Eq> DocumentModel<I> {
         });
         let mut highlights = Vec::new();
         let mut font_family_overrides = Vec::new();
-        for inline in &self.resolved_styles.inline {
+        // Resolved inline endpoints are monotonic. A line only
+        // needs its intersecting styles, even in a document with many matches.
+        let inline = &self.resolved_styles.inline;
+        let from = inline.partition_point(|style| style.display.end <= display.start);
+        for inline in inline[from..]
+            .iter()
+            .take_while(|style| style.display.start < display.end)
+        {
             let start = display.start.max(inline.display.start);
             let end = display.end.min(inline.display.end);
             if start >= end {
@@ -1744,6 +1752,7 @@ fn resolve_document_styles<I: Eq>(
             continue;
         }
         inline.push(ResolvedInlineStyle {
+            source,
             display,
             highlight: style.highlight(),
             font_family: style.font_family_override().cloned(),

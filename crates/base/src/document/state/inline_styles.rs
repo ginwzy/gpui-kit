@@ -17,25 +17,60 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     pub fn set_node_inline_styles(
         &mut self,
         id: &I,
+        styles: Vec<DocumentInlineStyle>,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, DocumentStyleError> {
+        let len = self
+            .region(id)
+            .ok_or(DocumentStyleError::UnknownNode)?
+            .range()
+            .len();
+        self.set_node_inline_styles_in_range(id, 0..len, styles, cx)
+    }
+
+    /// Replace inline styles inside `range`, preserving all other presentation.
+    /// Both the replacement range and style ranges use node-local UTF-8 offsets.
+    /// Existing styles crossing either boundary are rejected atomically; clear
+    /// a range with an empty vector. Text, selection, composition, revision,
+    /// undo and the viewport are preserved. Only intersecting text is revisited.
+    pub fn set_node_inline_styles_in_range(
+        &mut self,
+        id: &I,
+        range: Range<usize>,
         mut styles: Vec<DocumentInlineStyle>,
         cx: &mut Context<Self>,
     ) -> Result<bool, DocumentStyleError> {
-        let source = self
+        let node = self
             .region(id)
             .ok_or(DocumentStyleError::UnknownNode)?
             .range();
+        if range.start > range.end || range.end > node.len() {
+            return Err(DocumentStyleError::OutOfBounds {
+                range,
+                source_len: node.len(),
+            });
+        }
+        let source = node.start + range.start..node.start + range.end;
+        if self.model.text.clip_offset(source.start, Bias::Left) != source.start
+            || self.model.text.clip_offset(source.end, Bias::Right) != source.end
+        {
+            return Err(DocumentStyleError::InvalidBoundary(source));
+        }
         for style in &styles {
-            let range = style.source();
-            if range.start > range.end || range.end > source.len() {
+            let style_range = style.source();
+            if style_range.start > style_range.end || style_range.end > node.len() {
                 return Err(DocumentStyleError::OutOfBounds {
-                    range,
-                    source_len: source.len(),
+                    range: style_range,
+                    source_len: node.len(),
                 });
+            }
+            if style_range.start < range.start || style_range.end > range.end {
+                return Err(DocumentStyleError::Overlap(style_range));
             }
         }
         styles = styles
             .into_iter()
-            .map(|style| style.shifted(source.start))
+            .map(|style| style.shifted(node.start))
             .collect();
         styles.sort_by_key(|style| (style.source().start, style.source().end));
         validate_style_ranges(
@@ -85,9 +120,8 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                 .expect("node end maps to display");
         let resolved_inline = &self.model.resolved_styles.inline;
         let resolved_from =
-            resolved_inline.partition_point(|style| style.display.end <= display.start);
-        let resolved_to =
-            resolved_inline.partition_point(|style| style.display.start < display.end);
+            resolved_inline.partition_point(|style| style.source.end <= source.start);
+        let resolved_to = resolved_inline.partition_point(|style| style.source.start < source.end);
 
         self.capture_viewport_anchor();
         self.model.styles.inline.splice(from..to, styles);
@@ -95,6 +129,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             .resolved_styles
             .inline
             .splice(resolved_from..resolved_to, resolved.inline);
+        let mut remeasure: Option<Range<usize>> = None;
         for ix in 0..self.layout_items.len() {
             let DocumentLayoutItem::Text {
                 display: line,
@@ -114,8 +149,18 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             );
             if !self.layout_items[ix].same_layout_identity(&next) {
                 self.layout_items[ix] = next;
-                self.list_state.remeasure_items(ix..ix + 1);
+                match &mut remeasure {
+                    Some(range) if range.end == ix => range.end = ix + 1,
+                    pending => {
+                        if let Some(range) = pending.replace(ix..ix + 1) {
+                            self.list_state.remeasure_items(range);
+                        }
+                    }
+                }
             }
+        }
+        if let Some(range) = remeasure {
+            self.list_state.remeasure_items(range);
         }
         cx.emit(DocumentEvent::PresentationChanged);
         cx.notify();
