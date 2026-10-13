@@ -228,73 +228,13 @@ impl<I: Clone + Eq + 'static> Element for DocumentTrailerElement<I> {
     }
 }
 
-/// A document row's text with its resolved presentation, for exact measurement.
-/// Created by the document; the host supplies only its row's inherited style
-/// and available text width. No layout geometry is retained here.
-pub struct DocumentText {
-    text: StyledText,
-    text_style: Option<TextStyleRefinement>,
-    indent: Option<DocumentTextIndent>,
-}
-
-impl DocumentText {
-    pub(super) fn new(text: SharedString, presentation: DocumentTextPresentation) -> Self {
-        Self {
-            text: StyledText::new(text)
-                .with_highlights(presentation.highlights)
-                .with_font_family_overrides(presentation.font_family_overrides),
-            text_style: presentation.text_style,
-            indent: presentation.indent,
-        }
-    }
-
-    /// Measure intrinsic text size using the visible row's presentation and
-    /// measuring code. The row renderer may allocate a wider box to this text.
-    pub fn measure(
-        mut self,
-        width: Pixels,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> gpui::Size<Pixels> {
-        window.with_text_style(self.text_style.clone(), |window| {
-            self.prepare(window);
-            self.text.measure(width, window, cx)
-        })
-    }
-
-    fn prepare(&mut self, window: &mut Window) {
-        if let Some(indent) = &self.indent {
-            // Measured in this line's own style so rows align with the
-            // text the marker precedes.
-            let style = window.text_style();
-            let width = window
-                .text_system()
-                .shape_line(
-                    indent.marker.clone(),
-                    style.font_size.to_pixels(window.rem_size()),
-                    &[style.to_run(indent.marker.len())],
-                    None,
-                )
-                .width;
-            let indent = if indent.hanging {
-                LineIndent {
-                    first: px(0.),
-                    rest: width,
-                }
-            } else {
-                LineIndent::uniform(width)
-            };
-            let text = std::mem::replace(&mut self.text, StyledText::new(""));
-            self.text = text.with_line_indent(indent);
-        }
-    }
-}
-
 struct DocumentTextElement<I: 'static> {
     state: gpui::Entity<DocumentState<I>>,
     item_ix: usize,
     display: Range<usize>,
-    text: DocumentText,
+    text: StyledText,
+    text_style: Option<TextStyleRefinement>,
+    indent: Option<DocumentTextIndent>,
 }
 
 impl<I: 'static> DocumentTextElement<I> {
@@ -309,7 +249,11 @@ impl<I: 'static> DocumentTextElement<I> {
             state,
             item_ix,
             display,
-            text: DocumentText::new(text, presentation),
+            text: StyledText::new(text)
+                .with_highlights(presentation.highlights)
+                .with_font_family_overrides(presentation.font_family_overrides),
+            text_style: presentation.text_style,
+            indent: presentation.indent,
         }
     }
 }
@@ -341,10 +285,32 @@ impl<I: Clone + Eq + 'static> Element for DocumentTextElement<I> {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        window.with_text_style(self.text.text_style.clone(), |window| {
-            self.text.prepare(window);
+        window.with_text_style(self.text_style.clone(), |window| {
+            if let Some(indent) = &self.indent {
+                // Measured in this line's own style so rows align with the
+                // text the marker precedes.
+                let style = window.text_style();
+                let width = window
+                    .text_system()
+                    .shape_line(
+                        indent.marker.clone(),
+                        style.font_size.to_pixels(window.rem_size()),
+                        &[style.to_run(indent.marker.len())],
+                        None,
+                    )
+                    .width;
+                let indent = if indent.hanging {
+                    LineIndent {
+                        first: px(0.),
+                        rest: width,
+                    }
+                } else {
+                    LineIndent::uniform(width)
+                };
+                let text = std::mem::replace(&mut self.text, StyledText::new(""));
+                self.text = text.with_line_indent(indent);
+            }
             self.text
-                .text
                 .request_layout(global_id, inspector_id, window, cx)
         })
     }
@@ -359,9 +325,8 @@ impl<I: Clone + Eq + 'static> Element for DocumentTextElement<I> {
         cx: &mut App,
     ) {
         self.text
-            .text
             .prepaint(global_id, inspector_id, bounds, &mut (), window, cx);
-        let layout = self.text.text.layout().clone();
+        let layout = self.text.layout().clone();
         self.state.update(cx, |state, cx| {
             state.update_text_layout(self.item_ix, self.display.clone(), layout, bounds, cx);
         });
@@ -380,13 +345,13 @@ impl<I: Clone + Eq + 'static> Element for DocumentTextElement<I> {
         let state = self.state.read(cx);
         let (_, selected_range, cursor) = state.segment_paint_snapshot(self.item_ix, &self.display);
         let show_cursor = cursor.is_some() && state.show_cursor(window, cx);
-        let layout = self.text.text.layout().clone();
+        let layout = self.text.layout().clone();
         if let Some(selected_range) = selected_range.filter(|range| !range.is_empty()) {
             let selection_color = crate::Theme::global(cx).tokens.colors.selection;
             paint_selection(&layout, selected_range, selection_color, window);
         }
 
-        self.text.text.paint(
+        self.text.paint(
             global_id,
             inspector_id,
             bounds,
