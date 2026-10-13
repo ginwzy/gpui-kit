@@ -7,10 +7,9 @@
 use std::{error::Error, fmt, ops::Range, sync::Arc};
 
 use gpui::{
-    AbsoluteLength, AppContext as _, Bounds, Context, Font, LineFragment, LineWrapper, Pixels,
-    Task, Window, px,
+    AbsoluteLength, AppContext as _, Bounds, Context, Font, LineWrapper, Pixels, Task, Window, px,
 };
-use unicode_segmentation::GraphemeCursor;
+use unicode_segmentation::UnicodeSegmentation as _;
 
 use super::{DocumentLayoutItem, DocumentState};
 use crate::document::{DocumentRevision, EditPolicy};
@@ -383,31 +382,66 @@ fn changed_lines(text: &str, old: &[usize], new: &[usize]) -> Vec<Range<usize>> 
 }
 
 /// Row starts inside each line of `text` when wrapped to `width`, ascending.
-/// A start that would split a grapheme cluster moves back to the cluster's
-/// start; a cluster wider than a row keeps a row to itself.
-pub(super) fn wrap_rows(text: &str, wrapper: &mut LineWrapper, width: Pixels) -> Vec<usize> {
+///
+/// Rows break with GPUI's wrapping rules but are measured as they are drawn,
+/// each as its own unwrapped line: a grapheme cluster advances by its shaped
+/// width (a ZWJ sequence is one glyph), and a tab advances to the next tab stop
+/// from the row's start. Rows therefore never split a cluster. A tab exactly at
+/// a stop counts a whole tab, so a row is never estimated narrower than drawn.
+fn wrap_rows(text: &str, wrapper: &mut LineWrapper, width: Pixels) -> Vec<usize> {
     let mut breaks = Vec::new();
     let mut line_start = 0;
     for line in text.split('\n') {
-        let mut row_start = 0;
-        for boundary in wrapper.wrap_line_unindented(&[LineFragment::text(line)], width) {
-            let mut start = boundary.ix;
-            let mut cursor = GraphemeCursor::new(start, line.len(), true);
-            if !cursor.is_boundary(line, 0).unwrap_or(true) {
-                start = cursor
-                    .prev_boundary(line, 0)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(row_start);
-            }
-            if row_start < start && start < line.len() {
-                breaks.push(line_start + start);
-                row_start = start;
-            }
-        }
+        wrap_line(line, wrapper, width, |start| {
+            breaks.push(line_start + start)
+        });
         line_start += line.len() + 1;
     }
     breaks
+}
+
+fn wrap_line(line: &str, wrapper: &mut LineWrapper, width: Pixels, mut row: impl FnMut(usize)) {
+    let mut row_start = 0;
+    let mut x = px(0.);
+    // A break opportunity in the current row, after the line's leading indent.
+    let mut candidate = None;
+    let mut indented = false;
+    let mut previous = '\0';
+    for (ix, cluster) in line.grapheme_indices(true) {
+        let first = cluster.chars().next().unwrap_or_default();
+        if indented && LineWrapper::can_break_before(previous, first) {
+            candidate = Some(ix);
+        }
+        indented |= first != ' ';
+        let mut cluster_advance = advance(wrapper, cluster, x);
+        if x + cluster_advance > width && ix > row_start {
+            let start = candidate.filter(|start| *start > row_start).unwrap_or(ix);
+            row(start);
+            row_start = start;
+            candidate = None;
+            // Tab stops restart with the row, so measure the carried text again.
+            x = line[start..ix]
+                .graphemes(true)
+                .fold(px(0.), |x, cluster| x + advance(wrapper, cluster, x));
+            cluster_advance = advance(wrapper, cluster, x);
+        }
+        x += cluster_advance;
+        previous = cluster.chars().last().unwrap_or(first);
+    }
+}
+
+/// How far `cluster` advances a row already `x` wide.
+fn advance(wrapper: &mut LineWrapper, cluster: &str, x: Pixels) -> Pixels {
+    if cluster != "\t" {
+        return wrapper.cluster_width(cluster);
+    }
+    let tab = wrapper.char_width('\t');
+    if tab <= px(0.) {
+        return px(0.);
+    }
+    // Stops at every tab width; landing on one (within rounding) moves to the next.
+    let stops = ((x + px(0.01)) / tab).floor();
+    tab * (stops + 1.) - x
 }
 
 #[cfg(test)]
@@ -416,7 +450,6 @@ mod tests {
         Entity, IntoElement, ParentElement as _, Render, Styled as _, TestAppContext,
         VisualTestContext, div, size,
     };
-    use unicode_segmentation::UnicodeSegmentation as _;
 
     use super::*;
     use crate::{
@@ -467,6 +500,98 @@ mod tests {
             assert!(*start > previous && text.as_bytes()[start - 1] != b'\n');
             previous = *start;
         }
+    }
+
+    #[test]
+    fn rows_are_never_wider_than_they_are_drawn() {
+        // The platform's own text system, so clusters, tabs and fallback fonts
+        // shape as they do in the app.
+        let mut app =
+            gpui::TestApp::with_text_system(gpui_platform::current_platform(true).text_system());
+        struct Empty;
+        impl Render for Empty {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        // Bundled fonts, so the test does not depend on what the machine has.
+        app.text_system()
+            .add_fonts(vec![
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../story-web/fonts/JetBrainsMono-Regular.ttf"
+                ))
+                .as_slice()
+                .into(),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../story-web/fonts/NotoSansSC-Regular-subset.ttf"
+                ))
+                .as_slice()
+                .into(),
+            ])
+            .unwrap();
+        let mut window = app.open_window(|_, _| Empty);
+        let json = format!(
+            "{{{}}}",
+            (0..60)
+                .map(|i| format!("\"k{i}\":\"v {i}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let texts = [
+            "\tfn\tmain()\t{\t}\tlet\tx\t=\t1;\t".repeat(12),
+            "family 👨\u{200d}👩\u{200d}👧\u{200d}👦 skin 👍🏽 flag 🏳\u{fe0f}\u{200d}🌈 ".repeat(12),
+            "e\u{301}a\u{308}n\u{303}o\u{302} Z\u{335}a\u{336}l\u{337}g\u{338}o ".repeat(24),
+            "中文的长段落，包含标点；English words 12345 と日本語のテキスト。".repeat(12),
+            json,
+        ];
+        window.update(|_, window, cx| {
+            let font = gpui::font("JetBrains Mono");
+            let size = px(14.);
+            let mut wrapper = cx.text_system().line_wrapper(font.clone(), size);
+            let run = |len| gpui::TextRun {
+                len,
+                font: font.clone(),
+                color: gpui::black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            // A tab reaches the next stop from the row's start, so each "a\t" fills
+            // exactly one stop rather than a character plus a whole tab. The row
+            // then breaks before its last tab, as wrapping breaks before symbols.
+            let tab = window
+                .text_system()
+                .shape_line("\t".into(), size, &[run(1)], None)
+                .width;
+            let pairs = "a\t".repeat(40);
+            let width = px(310.);
+            let per_row = (width / tab).floor() as usize;
+            assert_eq!(wrap_rows(&pairs, &mut wrapper, width)[0], per_row * 2 - 1);
+            for text in &texts {
+                let clusters: Vec<_> = text.grapheme_indices(true).map(|(ix, _)| ix).collect();
+                for width in [px(120.), px(310.)] {
+                    let breaks = wrap_rows(text, &mut wrapper, width);
+                    assert!(!breaks.is_empty(), "{text:?} wraps at {width:?}");
+                    let mut start = 0;
+                    for end in breaks.iter().copied().chain([text.len()]) {
+                        assert!(end == text.len() || clusters.contains(&end));
+                        let row = &text[start..end];
+                        let drawn = window
+                            .text_system()
+                            .shape_line(row.to_owned().into(), size, &[run(row.len())], None)
+                            .width;
+                        // A cluster wider than a row keeps a row to itself.
+                        assert!(
+                            drawn <= width + px(0.01) || row.graphemes(true).count() == 1,
+                            "{row:?} draws {drawn:?} in {width:?}"
+                        );
+                        start = end;
+                    }
+                }
+            }
+        });
     }
 
     struct Root(Entity<DocumentState<&'static str>>);
