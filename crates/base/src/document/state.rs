@@ -47,6 +47,9 @@ const DOCUMENT_INPUT_CONTEXT: &str = "Input";
 
 mod host;
 mod inline_styles;
+mod text_rows;
+
+pub use text_rows::{TextRows, TextRowsError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentEditRejection {
@@ -981,7 +984,9 @@ impl<I: Clone + Eq> DocumentModel<I> {
         self.projection_map.display_to_source(offset, affinity)
     }
 
-    fn layout_items(&self) -> Vec<DocumentLayoutItem<I>> {
+    /// Items for the document, with text lines split at the display offsets in
+    /// `row_starts` (ascending) when it lays out display rows.
+    fn layout_items(&self, row_starts: &[usize]) -> Vec<DocumentLayoutItem<I>> {
         let display_text = self.display_text();
         let mut display_cursor = 0;
         let mut source_cursor = 0;
@@ -1011,6 +1016,7 @@ impl<I: Clone + Eq> DocumentModel<I> {
                 display_cursor..display_start,
                 source_cursor..source.start,
                 false,
+                row_starts,
             );
             if let Some(block) = block {
                 items.push(DocumentLayoutItem::Block {
@@ -1038,6 +1044,7 @@ impl<I: Clone + Eq> DocumentModel<I> {
             display_cursor..display_text.len(),
             source_cursor..self.text.len(),
             true,
+            row_starts,
         );
         for block in &self.anchored_blocks {
             let (source, display) = anchored_display_offset(
@@ -1080,17 +1087,23 @@ impl<I: Clone + Eq> DocumentModel<I> {
         range: Range<usize>,
         source: Range<usize>,
         include_empty_tail: bool,
+        row_starts: &[usize],
     ) {
+        let mut push_line = |line: Range<usize>| {
+            for row in text_rows::rows_of_line(line, row_starts) {
+                items.push(self.text_layout_item(display_text, row, source.clone()));
+            }
+        };
         let mut start = range.start;
         for newline in display_text[range.clone()].match_indices('\n') {
             // The line terminator separates layout items. Passing it to StyledText
             // creates another visual row inside each item and doubles line spacing.
             let end = range.start + newline.0;
-            items.push(self.text_layout_item(display_text, start..end, source.clone()));
+            push_line(start..end);
             start = end + 1;
         }
         if start < range.end || (include_empty_tail && start == range.end) {
-            items.push(self.text_layout_item(display_text, start..range.end, source));
+            push_line(start..range.end);
         }
     }
 
@@ -1944,6 +1957,8 @@ pub struct DocumentState<I> {
     block_renderer: Option<BlockRenderer<I>>,
     text_renderer: Option<TextRenderer<I>>,
     text_measurer: Option<TextMeasurer<I>>,
+    /// Display rows for read-only text, when the host asked for them.
+    text_rows: Option<text_rows::TextRowsState>,
 }
 
 struct TextLayoutRecord {
@@ -2044,7 +2059,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) -> Result<Self, RegionError> {
         let model = DocumentModel::new(text, regions)?;
-        let layout_items = model.layout_items();
+        let layout_items = model.layout_items(&[]);
         let list_state =
             ListState::new(layout_items.len(), ListAlignment::Top, px(400.)).measure_all();
         let focus_handle = cx.focus_handle();
@@ -2089,6 +2104,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             block_renderer: None,
             text_renderer: None,
             text_measurer: None,
+            text_rows: None,
         })
     }
 
@@ -2199,6 +2215,9 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.caret_reveal_pending = false;
         self.text_layouts.clear();
         self.block_layouts.clear();
+        if let Some(rows) = &mut self.text_rows {
+            rows.clear();
+        }
         self.trailer_layout = None;
         self.layout_items = self.next_layout_items();
         self.list_state.reset(self.layout_items.len());
@@ -2728,7 +2747,12 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     fn next_layout_items(&self) -> Vec<DocumentLayoutItem<I>> {
-        let mut items = self.model.layout_items();
+        let breaks = self
+            .text_rows
+            .as_ref()
+            .map(|rows| rows.breaks.clone())
+            .unwrap_or_default();
+        let mut items = self.model.layout_items(&breaks);
         if self.dynamic_trailer {
             items.push(DocumentLayoutItem::Trailer);
         }
@@ -3356,6 +3380,14 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                 .anchors
                 .apply_edit(&edit.range(), edit.replacement().len());
             self.model.text.replace(edit.range(), edit.replacement());
+        }
+        if let Some(rows) = &mut self.text_rows {
+            rows.apply_edits(
+                transaction
+                    .edits()
+                    .iter()
+                    .map(|edit| (edit.range(), edit.replacement().len())),
+            );
         }
         self.model.regions = next_regions;
         self.model.reconcile_anchor_nodes();
@@ -4827,6 +4859,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         }
         self.layout_style = Some(layout_style);
         self.last_bounds = Some(bounds);
+        self.prepare_text_rows(bounds, window, cx);
         self.unpainted_pin_scroll = Pixels::ZERO;
         if self.dynamic_trailer
             && self.trailer_height != Some(bounds.size.height)
@@ -4992,11 +5025,17 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                         first_line: region.is_some_and(|region| source.start <= region.start),
                     });
                 }
+                let mut presentation = presentation.clone();
+                if self.text_rows.is_some() {
+                    // A display row is one line; its wrap was decided with the geometry.
+                    presentation.text_style.get_or_insert_default().white_space =
+                        Some(gpui::WhiteSpace::Nowrap);
+                }
                 DocumentChild::Text {
                     item_ix,
                     display: display.clone(),
                     text: text.clone(),
-                    presentation: presentation.clone(),
+                    presentation,
                 }
             }
             DocumentLayoutItem::Block { id, source } => {
@@ -5673,14 +5712,14 @@ mod tests {
             .unwrap();
         assert_eq!(model.text(), "first\nsecond");
         assert!(matches!(
-            model.layout_items()[1],
+            model.layout_items(&[])[1],
             DocumentLayoutItem::AnchoredBlock {
                 id: "comment",
                 source: 6
             }
         ));
         assert!(matches!(
-            model.layout_items()[2],
+            model.layout_items(&[])[2],
             DocumentLayoutItem::Text { .. }
         ));
         model
@@ -5758,7 +5797,7 @@ mod tests {
                 DocumentStyles::default(),
             )
             .unwrap();
-        let items = model.layout_items();
+        let items = model.layout_items(&[]);
         assert!(
             matches!(items[0], DocumentLayoutItem::Text { ref text, .. } if text.as_ref() == "A")
         );
@@ -5878,7 +5917,7 @@ mod tests {
                 assert_eq!(
                     document
                         .model
-                        .layout_items()
+                        .layout_items(&[])
                         .iter()
                         .filter(|item| matches!(item, DocumentLayoutItem::AnchoredBlock { .. }))
                         .count(),
@@ -6973,7 +7012,7 @@ mod tests {
                             cx,
                         )
                         .unwrap();
-                    assert_eq!(document.layout_items, document.model.layout_items());
+                    assert_eq!(document.layout_items, document.model.layout_items(&[]));
                     let rebuilt =
                         ProjectionMap::new(&document.model.text, &document.model.projection);
                     assert_eq!(document.display_text(), rebuilt.display_text());

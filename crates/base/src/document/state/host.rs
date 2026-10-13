@@ -147,7 +147,8 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             return Err(HostTransactionError::FragmentBoundary);
         }
         let old_layout = self.layout_boundary(nodes.start)..self.layout_boundary(nodes.end);
-        let mut replacement = candidate.layout_items();
+        // A fragment's lines show unwrapped until the document wraps them again.
+        let mut replacement = candidate.layout_items(&[]);
         // The following retained node owns the caret row at the fragment end.
         if nodes.end != regions.len()
             && matches!(replacement.last(), Some(DocumentLayoutItem::Text { display, .. }) if display.is_empty())
@@ -174,6 +175,9 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
 
         // All fallible work is complete. Publish source, presentation and layout together.
         self.capture_viewport_anchor();
+        if let Some(rows) = &mut self.text_rows {
+            rows.apply_edits([(source.clone(), candidate.text.len())]);
+        }
         if let Some(edit) = edit {
             self.model
                 .anchors

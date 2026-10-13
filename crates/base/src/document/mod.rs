@@ -25,7 +25,7 @@ pub use region::{DocumentRegion, DocumentRegions, EditPolicy, RegionError};
 pub use state::{
     DocumentEditRejection, DocumentEvent, DocumentSnapshot, DocumentState, DocumentStructure,
     DocumentTextContext, HostTransactionError, PresentationError, RoutedEdit, ScrollPinError,
-    StructureError, StructureReplay, UndoCheckpoint,
+    StructureError, StructureReplay, TextRows, TextRowsError, UndoCheckpoint,
 };
 pub use style::{DocumentInlineStyle, DocumentParagraphStyle, DocumentStyleError, DocumentStyles};
 pub use transaction::{EditDecision, EditOrigin, EditTransaction, TextEdit, TransactionError};
