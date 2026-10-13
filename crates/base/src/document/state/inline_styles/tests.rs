@@ -52,6 +52,7 @@ fn node_styles_preserve_input_state_and_only_remeasure_changed_text(cx: &mut Tes
             let DocumentLayoutItem::Text { presentation, .. } = &doc.layout_items[1] else {
                 panic!("draft text")
             };
+            let presentation = presentation.as_deref().unwrap();
             assert_eq!(presentation.highlights[0].0, 0..6);
             doc.replace_and_mark_text_in_range(None, "你", Some(1..1), window, cx);
             let marked = doc.marked_text_range(window, cx);

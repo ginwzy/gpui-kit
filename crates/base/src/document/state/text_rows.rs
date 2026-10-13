@@ -558,10 +558,10 @@ mod tests {
                 .layout_items
                 .iter()
                 .filter_map(|item| match item {
-                    DocumentLayoutItem::Text { display, text, .. }
+                    DocumentLayoutItem::Text { display, .. }
                         if display.start >= 6 && display.end <= 6 + line.len() =>
                     {
-                        Some(text.to_string())
+                        Some(&document.display_text()[display.clone()])
                     }
                     _ => None,
                 })

@@ -742,7 +742,7 @@ struct ResolvedInlineStyle {
     font_family: Option<SharedString>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct DocumentTextPresentation {
     pub(super) text_style: Option<TextStyleRefinement>,
     pub(super) indent: Option<DocumentTextIndent>,
@@ -765,8 +765,11 @@ enum DocumentLayoutItem<I> {
         display: Range<usize>,
         source: Range<usize>,
         node_id: Option<I>,
-        text: SharedString,
-        presentation: Box<DocumentTextPresentation>,
+        /// Identifies the row's text without holding it; the text is sliced
+        /// from the display text when the row is drawn.
+        fingerprint: u64,
+        /// `None` for unstyled text, which then costs no allocation.
+        presentation: Option<Box<DocumentTextPresentation>>,
     },
     Block {
         id: I,
@@ -784,13 +787,13 @@ impl<I: Eq> DocumentLayoutItem<I> {
         match (self, other) {
             (
                 Self::Text {
-                    text: left,
+                    fingerprint: left,
                     node_id: left_node,
                     presentation: left_presentation,
                     ..
                 },
                 Self::Text {
-                    text: right,
+                    fingerprint: right,
                     node_id: right_node,
                     presentation: right_presentation,
                     ..
@@ -1124,10 +1127,7 @@ impl<I: Clone + Eq> DocumentModel<I> {
             .unwrap_or(segment.end)
             .clamp(source_start, segment.end);
         let source = source_start..source_end;
-        let node_id = self
-            .position_for_offset(source_start, Affinity::After)
-            .ok()
-            .map(DocumentPosition::into_node_id);
+        let node_id = self.node_after(source_start);
         let paragraph =
             self.resolved_styles.paragraphs.iter().find(|style| {
                 style.display.start <= display.start && display.end <= style.display.end
@@ -1160,17 +1160,19 @@ impl<I: Clone + Eq> DocumentModel<I> {
                 font_family_overrides.push((local, font_family.clone()));
             }
         }
+        let presentation = DocumentTextPresentation {
+            text_style,
+            indent,
+            highlights,
+            font_family_overrides,
+        };
         DocumentLayoutItem::Text {
-            text: display_text[display.clone()].to_string().into(),
+            fingerprint: text_fingerprint(&display_text[display.clone()]),
             display,
             source,
             node_id,
-            presentation: Box::new(DocumentTextPresentation {
-                text_style,
-                indent,
-                highlights,
-                font_family_overrides,
-            }),
+            presentation: (presentation != DocumentTextPresentation::default())
+                .then(|| Box::new(presentation)),
         }
     }
 
@@ -1197,6 +1199,28 @@ impl<I: Clone + Eq> DocumentModel<I> {
 
     fn cursor(&self) -> usize {
         self.selection_offsets().1
+    }
+
+    /// The node a layout item starting at `offset` belongs to: the last region
+    /// containing it, as [`Self::position_for_offset`] with `After` finds. Item
+    /// starts are character boundaries, and regions are in order.
+    fn node_after(&self, offset: usize) -> Option<I> {
+        let regions = self.regions.as_slice();
+        let found = regions
+            .partition_point(|region| region.range().start <= offset)
+            .checked_sub(1)
+            .map(|ix| &regions[ix])
+            .filter(|region| region.range().contains_inclusive(offset))
+            .map(|region| region.id().clone());
+        #[cfg(test)]
+        assert!(
+            found
+                == self
+                    .position_for_offset(offset, Affinity::After)
+                    .ok()
+                    .map(DocumentPosition::into_node_id)
+        );
+        found
     }
 
     fn position_for_offset(
@@ -1707,6 +1731,15 @@ impl<I: Clone + Eq> DocumentModel<I> {
         });
         self.set_marked_range(range);
     }
+}
+
+/// Identifies a row's text for layout reuse. Deterministic within a process;
+/// a collision could only keep a stale measurement, never wrong text.
+fn text_fingerprint(text: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::hash::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn resolve_document_styles<I: Eq>(
@@ -4975,8 +5008,8 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                 display,
                 source,
                 node_id,
-                text,
                 presentation,
+                ..
             } => {
                 if let Some(node_id) = node_id {
                     let region = self.region(node_id).map(DocumentRegion::range);
@@ -4987,7 +5020,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                         first_line: region.is_some_and(|region| source.start <= region.start),
                     });
                 }
-                let mut presentation = presentation.clone();
+                let mut presentation = presentation.as_deref().cloned().unwrap_or_default();
                 if self.text_rows.is_some() {
                     // A display row is one line; its wrap was decided with the geometry.
                     presentation.text_style.get_or_insert_default().white_space =
@@ -4996,8 +5029,9 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                 DocumentChild::Text {
                     item_ix,
                     display: display.clone(),
-                    text: text.clone(),
-                    presentation,
+                    // Rows hold no text; only the rows in view slice it.
+                    text: self.model.display_text()[display.clone()].to_owned().into(),
+                    presentation: Box::new(presentation),
                 }
             }
             DocumentLayoutItem::Block { id, source } => {
@@ -5487,6 +5521,25 @@ mod tests {
     }
 
     #[test]
+    fn unstyled_rows_hold_no_text_or_presentation_and_compare_by_content() {
+        let model = DocumentModel::new(
+            "same\nsame\nother",
+            vec![DocumentRegion::new("text", 0..15, EditPolicy::Readonly)],
+        )
+        .unwrap();
+        let items = model.layout_items(&[]);
+        let DocumentLayoutItem::Text {
+            presentation: None, ..
+        } = &items[0]
+        else {
+            panic!("an unstyled row allocates no presentation");
+        };
+        // Identity follows content, not position, so shifted rows still match.
+        assert!(items[0].same_layout_identity(&items[1]));
+        assert!(!items[1].same_layout_identity(&items[2]));
+    }
+
+    #[test]
     fn insertion_expands_only_the_trailing_editable_region() {
         let mut model = model();
         let transaction = EditTransaction::new(
@@ -5663,7 +5716,7 @@ mod tests {
             .unwrap();
         let items = model.layout_items(&[]);
         assert!(
-            matches!(items[0], DocumentLayoutItem::Text { ref text, .. } if text.as_ref() == "A")
+            matches!(items[0], DocumentLayoutItem::Text { ref display, .. } if &model.display_text()[display.clone()] == "A")
         );
         assert!(matches!(
             items[1],
@@ -5674,7 +5727,7 @@ mod tests {
             DocumentLayoutItem::AnchoredBlock { id: "second", .. }
         ));
         assert!(
-            matches!(items[3], DocumentLayoutItem::Text { ref text, .. } if text.as_ref() == "B")
+            matches!(items[3], DocumentLayoutItem::Text { ref display, .. } if &model.display_text()[display.clone()] == "B")
         );
     }
 
@@ -8419,6 +8472,7 @@ mod tests {
             let DocumentLayoutItem::Text { presentation, .. } = &document.layout_items[0] else {
                 panic!("first item must be text");
             };
+            let presentation = presentation.as_deref().unwrap();
             assert_eq!(
                 presentation.text_style.as_ref().unwrap().font_size,
                 Some(px(24.).into())
@@ -8426,6 +8480,7 @@ mod tests {
             let DocumentLayoutItem::Text { presentation, .. } = &document.layout_items[1] else {
                 panic!("second item must be text");
             };
+            let presentation = presentation.as_deref().unwrap();
             assert_eq!(presentation.highlights.len(), 1);
             assert_eq!(presentation.highlights[0].0, 6..10);
             assert_eq!(
