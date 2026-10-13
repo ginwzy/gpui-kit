@@ -15,7 +15,8 @@ use super::{DocumentLayoutItem, DocumentState};
 use crate::document::{DocumentRevision, EditPolicy};
 
 /// Texts up to this size wrap within the frame that first shows them. Longer
-/// ones show unwrapped source lines until a background wrap arrives.
+/// ones show unwrapped source lines until a background wrap arrives. Only the
+/// part intersecting the viewport is shaped during that interval.
 const WRAP_IN_FRAME_BYTES: usize = 256 * 1024;
 
 /// How a read-only document lays its text out as display rows.
@@ -83,6 +84,8 @@ pub(super) struct TextRowsState {
     wrapped: Option<RowWrap>,
     /// A wrap computing in the background, with what it wraps for.
     pending: Option<(RowWrap, Task<()>)>,
+    /// A completed task waits for layout to validate the current width/font.
+    ready: Option<Vec<usize>>,
     line_height: Option<Pixels>,
 }
 
@@ -113,6 +116,8 @@ impl TextRowsState {
         breaks.extend(old.map(|start| start.saturating_add_signed(delta)));
         self.breaks = Arc::new(breaks);
         self.wrapped = None;
+        self.pending = None;
+        self.ready = None;
     }
 
     /// Forgets every row start, as after the text is replaced wholesale.
@@ -120,6 +125,11 @@ impl TextRowsState {
         self.breaks = Arc::default();
         self.wrapped = None;
         self.pending = None;
+        self.ready = None;
+    }
+
+    pub(super) fn is_wrapping(&self) -> bool {
+        self.wrapped.is_none() || self.pending.is_some()
     }
 }
 
@@ -145,6 +155,8 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                 if state.rows != rows {
                     state.rows = rows;
                     state.wrapped = None;
+                    state.pending = None;
+                    state.ready = None;
                 }
             }
             (Some(rows), None) => {
@@ -154,6 +166,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                     breaks: Arc::default(),
                     wrapped: None,
                     pending: None,
+                    ready: None,
                     line_height: None,
                 });
             }
@@ -230,14 +243,24 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             font: style.font(),
             font_size,
         };
-        if state.wrapped.as_ref() == Some(&wrap)
-            || state
-                .pending
-                .as_ref()
-                .is_some_and(|(pending, _)| *pending == wrap)
-        {
+        if state.wrapped.as_ref() == Some(&wrap) {
+            state.pending = None;
+            state.ready = None;
             return;
         }
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|(pending, _)| *pending == wrap)
+        {
+            if let Some(breaks) = state.ready.take() {
+                state.pending = None;
+                self.apply_text_rows(wrap, breaks, cx);
+            }
+            return;
+        }
+        state.pending = None;
+        state.ready = None;
         let mut wrapper = cx
             .text_system()
             .line_wrapper(wrap.font.clone(), wrap.font_size);
@@ -259,20 +282,52 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                 let Some(state) = this.text_rows.as_mut() else {
                     return;
                 };
-                if state
-                    .pending
-                    .as_ref()
-                    .is_some_and(|(wrap, _)| *wrap == pending)
+                if this.model.revision == pending.revision
+                    && state
+                        .pending
+                        .as_ref()
+                        .is_some_and(|(wrap, _)| *wrap == pending)
                 {
-                    // This task is finishing; let it complete rather than cancel it.
-                    if let Some((_, task)) = state.pending.take() {
-                        task.detach();
-                    }
-                    this.apply_text_rows(pending, breaks, cx);
+                    // Width and font are known only during layout. Publishing
+                    // the result here could install yesterday's geometry just
+                    // before a resize or theme change reaches prepare_layout.
+                    state.ready = Some(breaks);
+                    cx.notify();
                 }
             });
         });
         state.pending = Some((wrap, task));
+    }
+
+    /// Horizontal virtualization while the complete wrap is pending. The
+    /// source, row descriptors and list extent stay intact. In Nowrap mode the
+    /// remainder is already outside the content mask; do not shape it merely
+    /// to throw those glyphs away. An extra viewport keeps shaping context past
+    /// the visible edge, and the slice always ends between grapheme clusters.
+    pub(super) fn text_row_paint_range(
+        &self,
+        display: Range<usize>,
+        cx: &Context<Self>,
+    ) -> Range<usize> {
+        let Some((wrap, _)) = self
+            .text_rows
+            .as_ref()
+            .and_then(|rows| rows.pending.as_ref())
+        else {
+            return display;
+        };
+        let text = &self.model.display_text()[display.clone()];
+        let mut wrapper = cx
+            .text_system()
+            .line_wrapper(wrap.font.clone(), wrap.font_size);
+        let mut x = px(0.);
+        for (ix, cluster) in text.grapheme_indices(true) {
+            x += advance(&mut wrapper, cluster, x);
+            if x > wrap.width * 2. {
+                return display.start..display.start + ix + cluster.len();
+            }
+        }
+        display
     }
 
     /// Installs a finished wrap, laying out again only the lines whose rows changed.
@@ -291,6 +346,16 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             return;
         }
         self.capture_viewport_anchor();
+        let reanchor = self
+            .pending_viewport_anchor
+            .as_ref()
+            .filter(|pending| !pending.reveal_on_wrap)
+            .and_then(|pending| {
+                let position = self.model.position_for_anchor(pending.anchor).ok()?;
+                // A replaced source can leave an anchor with no current geometry.
+                self.text_position_for_position(&position)?;
+                self.resolve_position(&position).ok()
+            });
         let text = self.model.display_text();
         let text_len = self.model.text.len();
         let display_start = |item: &DocumentLayoutItem<I>| match item {
@@ -331,6 +396,14 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         if let Some((start, end)) = span {
             let count = (end as isize - start as isize + added) as usize;
             self.list_state.splice(start..end, count);
+        }
+        // Re-index a retained visible anchor so its geometry can be restored.
+        // Explicit reveals wait until layout supplies the new viewport height.
+        if let Some(offset) = reanchor {
+            self.list_state.scroll_to(gpui::ListOffset {
+                item_ix: self.layout_item_for_source(offset),
+                offset_in_item: px(0.),
+            });
         }
         cx.notify();
     }
@@ -469,6 +542,7 @@ mod tests {
             breaks: Arc::new(vec![5, 10, 20, 30]),
             wrapped: None,
             pending: None,
+            ready: None,
             line_height: None,
         };
         // Starts before an edit stay, starts inside it drop, later ones shift.
@@ -594,11 +668,18 @@ mod tests {
         });
     }
 
-    struct Root(Entity<DocumentState<&'static str>>);
+    struct Root(
+        Entity<DocumentState<&'static str>>,
+        Option<gpui::SharedString>,
+    );
 
     impl Render for Root {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(self.0.clone())
+            let mut element = div().size_full().child(self.0.clone());
+            if let Some(family) = &self.1 {
+                element = element.font_family(family.clone());
+            }
+            element
         }
     }
 
@@ -621,7 +702,7 @@ mod tests {
                     )
                     .unwrap()
                 }));
-                cx.new(|_| Root(document.clone().unwrap()))
+                cx.new(|_| Root(document.clone().unwrap(), None))
             })
             .unwrap()
         });
@@ -751,21 +832,186 @@ mod tests {
 
     #[gpui::test]
     fn long_texts_wrap_in_the_background(cx: &mut TestAppContext) {
-        let text = format!("{}\n", "word ".repeat(WRAP_IN_FRAME_BYTES / 5 + 10));
+        use crate::document::{Affinity, DocumentPosition};
+        for line in [
+            "word ".repeat(WRAP_IN_FRAME_BYTES / 5 + 10),
+            "中文🙂e\u{301}👩\u{200d}💻\t ".repeat(15_000),
+        ] {
+            let text = format!("{line}\nshort\n");
+            let (document, mut cx) = rows_view(&text, cx);
+            document.update(&mut cx, |document, cx| {
+                document.set_text_rows(Some(TextRows::new()), cx).unwrap();
+                document
+                    .set_selection_positions(
+                        DocumentPosition::new("source", 0, Affinity::After),
+                        DocumentPosition::new("source", text.len(), Affinity::Before),
+                        cx,
+                    )
+                    .unwrap();
+            });
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                document.update(cx, |document, cx| {
+                    document.copy(&crate::input::Copy, window, cx)
+                });
+                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), text);
+                let document = document.read(cx);
+                assert!(document.text_rows.as_ref().unwrap().pending.is_some());
+                assert!(document.text_rows.as_ref().unwrap().breaks.is_empty());
+                // Full source and row ranges remain available for selection,
+                // copying and navigation; only offscreen glyphs are omitted.
+                assert_eq!(document.layout_items, document.model.layout_items(&[]));
+                assert_eq!(document.selected_range(), 0..text.len());
+                assert_eq!(document.text(), text);
+                let first = &document.text_layouts[0];
+                assert!(first.display.len() < 4096);
+                assert!(first.layout.line_layout_for_index(0).unwrap().width() >= px(320.));
+                assert!(
+                    text.grapheme_indices(true)
+                        .any(|(ix, _)| ix == first.display.end)
+                );
+            });
+            draw(&mut cx);
+            draw(&mut cx);
+            let wrapped = breaks(&document, &mut cx);
+            assert!(!wrapped.is_empty());
+            assert_eq!(wrapped, expected(&document, px(320.), &mut cx));
+            document.read_with(&cx, |document, _| {
+                assert_eq!(document.selected_range(), 0..text.len());
+                assert_eq!(document.layout_items, document.model.layout_items(&wrapped));
+                assert_eq!(document.text(), text);
+                let list = &document.list_state;
+                let height = document.text_rows.as_ref().unwrap().line_height.unwrap();
+                assert_eq!(
+                    list.max_offset_for_scrollbar().y,
+                    (height * list.item_count() as f32 - list.viewport_bounds().size.height)
+                        .max(px(0.))
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn completed_wrap_is_validated_at_layout_and_host_edits_cancel_it(cx: &mut TestAppContext) {
+        let text = "word 中文🙂 ".repeat(30_000);
         let (document, mut cx) = rows_view(&text, cx);
         document.update(&mut cx, |document, cx| {
             document.set_text_rows(Some(TextRows::new()), cx).unwrap();
         });
-        // The first frame shows the source line unwrapped.
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
-        assert!(breaks(&document, &mut cx).is_empty());
+        // Stage a completed result without draining the dispatcher: draining
+        // also paints, so it cannot represent the task/next-layout boundary.
+        let ready = expected(&document, px(320.), &mut cx);
+        document.update(&mut cx, |document, _| {
+            document.text_rows.as_mut().unwrap().ready = Some(ready)
+        });
+        document.read_with(&cx, |document, _| {
+            assert!(document.text_rows.as_ref().unwrap().ready.is_some());
+            assert!(document.text_rows.as_ref().unwrap().breaks.is_empty());
+        });
+        // The old result is already ready, but a resize arrives before paint.
+        cx.simulate_resize(size(px(520.), px(200.)));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        document.read_with(&cx, |document, _| {
+            let rows = document.text_rows.as_ref().unwrap();
+            assert!(rows.ready.is_none());
+            assert!(rows.breaks.is_empty());
+            assert_eq!(rows.pending.as_ref().unwrap().0.width, px(520.));
+        });
+        let ready = expected(&document, px(520.), &mut cx);
+        document.update(&mut cx, |document, _| {
+            document.text_rows.as_mut().unwrap().ready = Some(ready)
+        });
+        let previous_font_size = document.read_with(&cx, |document, _| {
+            document
+                .text_rows
+                .as_ref()
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .0
+                .font_size
+        });
+        cx.update(|window, cx| {
+            window.set_rem_size(px(24.));
+            let _ = window.draw(cx);
+        });
+        document.read_with(&cx, |document, _| {
+            let rows = document.text_rows.as_ref().unwrap();
+            assert!(rows.ready.is_none());
+            assert!(rows.breaks.is_empty());
+            assert_ne!(
+                rows.pending.as_ref().unwrap().0.font_size,
+                previous_font_size
+            );
+        });
+        let ready = expected(&document, px(520.), &mut cx);
+        document.update(&mut cx, |document, _| {
+            document.text_rows.as_mut().unwrap().ready = Some(ready)
+        });
+        cx.update(|window, cx| {
+            window
+                .root::<Root>()
+                .flatten()
+                .unwrap()
+                .update(cx, |root, cx| {
+                    root.1 = Some("Changed test font".into());
+                    cx.notify();
+                });
+            let _ = window.draw(cx);
+        });
+        document.read_with(&cx, |document, _| {
+            let rows = document.text_rows.as_ref().unwrap();
+            assert!(rows.ready.is_none());
+            assert!(rows.breaks.is_empty());
+            assert_eq!(
+                rows.pending.as_ref().unwrap().0.font.family.as_ref(),
+                "Changed test font"
+            );
+        });
+        // Replacing the text must also invalidate a completed but uninstalled
+        // result, even without a layout between the edit and task delivery.
+        let ready = expected(&document, px(520.), &mut cx);
+        document.update(&mut cx, |document, _| {
+            document.text_rows.as_mut().unwrap().ready = Some(ready)
+        });
+        document.update(&mut cx, |document, cx| {
+            let replacement = "新的🙂e\u{301}\nshort";
+            let transaction = EditTransaction::new(
+                document.revision(),
+                EditOrigin::Host,
+                vec![TextEdit::new(0..text.len(), replacement)],
+                text.len(),
+            )
+            .unwrap();
+            document
+                .apply_host_transaction(
+                    transaction,
+                    vec![DocumentRegion::new(
+                        "source",
+                        0..replacement.len(),
+                        EditPolicy::Readonly,
+                    )],
+                    cx,
+                )
+                .unwrap();
+            let rows = document.text_rows.as_ref().unwrap();
+            assert!(rows.pending.is_none());
+            assert!(rows.ready.is_none());
+        });
         draw(&mut cx);
-        draw(&mut cx);
-        let wrapped = breaks(&document, &mut cx);
-        assert!(!wrapped.is_empty());
-        assert_eq!(wrapped, expected(&document, px(320.), &mut cx));
+        assert_eq!(
+            breaks(&document, &mut cx),
+            expected(&document, px(520.), &mut cx)
+        );
+        document.read_with(&cx, |document, _| {
+            assert_eq!(document.text(), "新的🙂e\u{301}\nshort")
+        });
     }
 
     #[gpui::test]

@@ -2013,6 +2013,7 @@ type TextRenderer<I> =
 struct PendingViewportAnchor {
     anchor: DocumentAnchor,
     viewport_y: Pixels,
+    reveal_on_wrap: bool,
 }
 
 struct ScrollPin<I> {
@@ -2584,8 +2585,33 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     ) -> Result<(), PositionError> {
         let offset = self.resolve_position(position)?;
         self.stop_following(cx);
-        self.list_state
-            .scroll_to_reveal_item(self.layout_item_for_source(offset));
+        self.clear_pending_viewport_anchor();
+        if self
+            .text_rows
+            .as_ref()
+            .is_some_and(|rows| rows.is_wrapping())
+        {
+            // The target may still belong to one unwrapped source line. Keep
+            // its identity until the full wrap supplies its display-row index.
+            self.pending_viewport_anchor = Some(PendingViewportAnchor {
+                anchor: self.model.anchors.create_for_node(
+                    offset,
+                    AnchorBias::Right,
+                    Some(position.node_id().clone()),
+                    position.affinity(),
+                ),
+                viewport_y: self.list_state.viewport_bounds().top(),
+                reveal_on_wrap: true,
+            });
+        } else {
+            // At a soft-wrap boundary, affinity chooses the owning display row.
+            let item_ix = self
+                .text_rows
+                .as_ref()
+                .and_then(|_| self.text_item_for_position(position))
+                .unwrap_or_else(|| self.layout_item_for_source(offset));
+            self.list_state.scroll_to_reveal_item(item_ix);
+        }
         cx.notify();
         Ok(())
     }
@@ -4345,6 +4371,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                 position.affinity(),
             ),
             viewport_y,
+            reveal_on_wrap: false,
         });
     }
 
@@ -4415,6 +4442,15 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             .text_layouts
             .iter()
             .find(|record| record.item_ix == item_ix)?;
+        // A pending text-row wrap can shape just the horizontal viewport.
+        // Unshaped offsets have no geometry yet; never map them to its edge.
+        if self.text_rows.is_some() && display > record.display.end && self.layout_items.get(item_ix).is_some_and(|item| {
+            matches!(
+                item, DocumentLayoutItem::Text { display, .. } if display.end > record.display.end
+            )
+        }) {
+            return None;
+        }
         let local = display.clamp(record.display.start, record.display.end) - record.display.start;
         record.layout.position_for_index(local).map(|position| {
             (
@@ -4515,21 +4551,33 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     fn restore_pending_viewport_anchor(&mut self, cx: &mut Context<Self>) {
+        if self
+            .text_rows
+            .as_ref()
+            .is_some_and(|rows| rows.is_wrapping())
+        {
+            return;
+        }
         let Some(pending) = self.pending_viewport_anchor.as_ref() else {
             return;
         };
         let Ok(position) = self.model.position_for_anchor(pending.anchor) else {
             return;
         };
+        if pending.reveal_on_wrap {
+            // This callback runs after List::prepaint installs this frame's
+            // viewport height. The target need not already have text geometry.
+            if self.list_state.viewport_bounds().size.height <= Pixels::ZERO {
+                return;
+            }
+            let _ = self.reveal_position(&position, cx);
+            return;
+        }
         let Some((position, _, _, _)) = self.text_position_for_position(&position) else {
             return;
         };
-        let pending = self
-            .pending_viewport_anchor
-            .take()
-            .expect("pending viewport anchor was present");
         self.list_state.scroll_by(position.y - pending.viewport_y);
-        self.model.anchors.remove(pending.anchor);
+        self.clear_pending_viewport_anchor();
         cx.notify();
     }
 
@@ -4601,6 +4649,13 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             return;
         };
         let Some((position, line_height, _, _)) = self.text_position_for_position(&caret) else {
+            if self
+                .text_rows
+                .as_ref()
+                .is_some_and(|rows| rows.is_wrapping())
+            {
+                return;
+            }
             if let Some(item_ix) = self.text_item_for_position(&caret) {
                 self.stop_following(cx);
                 if self.list_state.bounds_for_item(item_ix).is_some() {
@@ -5035,11 +5090,18 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                     presentation.text_style.get_or_insert_default().white_space =
                         Some(gpui::WhiteSpace::Nowrap);
                 }
+                let paint_display = self.text_row_paint_range(display.clone(), cx);
+                if paint_display.end < display.end {
+                    presentation.highlights.retain_mut(|(range, _)| {
+                        range.end = range.end.min(paint_display.len());
+                        range.start < range.end
+                    });
+                }
                 DocumentChild::Text {
                     item_ix,
-                    display: display.clone(),
+                    display: paint_display.clone(),
                     // Rows hold no text; only the rows in view slice it.
-                    text: self.model.display_text()[display.clone()].to_owned().into(),
+                    text: self.model.display_text()[paint_display].to_owned().into(),
                     presentation: Box::new(presentation),
                 }
             }
@@ -5288,6 +5350,17 @@ impl<I: Clone + Eq + 'static> Render for DocumentState<I> {
                 };
                 entity.update(cx, |state, cx| {
                     state.caret_reveal_pending = false;
+                    if state
+                        .text_rows
+                        .as_ref()
+                        .is_some_and(|rows| rows.is_wrapping())
+                        || state
+                            .pending_viewport_anchor
+                            .as_ref()
+                            .is_some_and(|pending| pending.reveal_on_wrap)
+                    {
+                        state.clear_pending_viewport_anchor();
+                    }
                     state.stop_following(cx);
                     cx.emit(DocumentEvent::ViewportScrolled);
                 });
