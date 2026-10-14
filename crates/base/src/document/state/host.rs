@@ -147,8 +147,9 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             return Err(HostTransactionError::FragmentBoundary);
         }
         let old_layout = self.layout_boundary(nodes.start)..self.layout_boundary(nodes.end);
-        // A fragment's lines show unwrapped until the document wraps them again.
-        let mut replacement = candidate.layout_items(&[]);
+        // Lines wrapped before keep their rows; others wrap at the next layout.
+        let mut replacement =
+            candidate.layout_items(self.text_rows.as_ref().map(|rows| &rows.cache));
         // The following retained node owns the caret row at the fragment end.
         if nodes.end != regions.len()
             && matches!(replacement.last(), Some(DocumentLayoutItem::Text { display, .. }) if display.is_empty())
@@ -175,9 +176,6 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
 
         // All fallible work is complete. Publish source, presentation and layout together.
         self.capture_viewport_anchor();
-        if let Some(rows) = &mut self.text_rows {
-            rows.apply_edits([(source.clone(), candidate.text.len())]);
-        }
         if let Some(edit) = edit {
             self.model
                 .anchors
@@ -249,7 +247,21 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             self.list_state.splice(changed, count);
             self.list_state.clone().measure_all();
         }
+        let split = replacement.len() - suffix;
+        let (head, tail) = replacement.split_at_mut(split);
+        for (old, new) in old_items[..prefix].iter().zip(head) {
+            new.keep_geometry(old);
+        }
+        for (old, new) in old_items[old_items.len() - suffix..].iter().zip(tail) {
+            new.keep_geometry(old);
+        }
+        forget_touched_geometry(
+            &old_items[prefix..old_items.len() - suffix],
+            &mut replacement,
+            prefix..split,
+        );
         self.layout_items.splice(old_layout, replacement);
+        self.layout_items_changed();
         if let Some(selection) = &selection {
             self.model.restore_active_selection(selection);
         }
@@ -300,6 +312,51 @@ fn shifted(range: Range<usize>, delta: isize) -> Range<usize> {
 }
 
 impl<I> DocumentLayoutItem<I> {
+    /// The node a text or block item belongs to.
+    pub(super) fn node(&self) -> Option<&I> {
+        match self {
+            Self::Text { node_id, .. } => node_id.as_ref(),
+            Self::Block { id, .. } | Self::AnchoredBlock { id, .. } => Some(id),
+            Self::Trailer => None,
+        }
+    }
+
+    /// Drops the geometry layout derived for this item.
+    pub(super) fn forget_geometry(&mut self) {
+        match self {
+            Self::Text { frame, wrapped, .. } => {
+                frame.0 = None;
+                wrapped.0 = None;
+            }
+            Self::Block { height, .. } | Self::AnchoredBlock { height, .. } => {
+                height.0 = Default::default()
+            }
+            Self::Trailer => {}
+        }
+    }
+
+    /// Takes the geometry layout derived for `old`, an item of the same identity.
+    pub(super) fn keep_geometry(&mut self, old: &Self) {
+        match (self, old) {
+            (
+                Self::Text { frame, wrapped, .. },
+                Self::Text {
+                    frame: old_frame,
+                    wrapped: old_wrapped,
+                    ..
+                },
+            ) => {
+                *frame = *old_frame;
+                *wrapped = *old_wrapped;
+            }
+            (
+                Self::Block { height, .. } | Self::AnchoredBlock { height, .. },
+                Self::Block { height: old, .. } | Self::AnchoredBlock { height: old, .. },
+            ) => *height = *old,
+            _ => {}
+        }
+    }
+
     pub(super) fn source_start(&self) -> usize {
         match self {
             Self::Text { source, .. } | Self::Block { source, .. } => source.start,
@@ -319,10 +376,14 @@ impl<I> DocumentLayoutItem<I> {
     fn shift(&mut self, source_delta: isize, display_delta: isize) {
         match self {
             Self::Text {
-                source, display, ..
+                source,
+                display,
+                line,
+                ..
             } => {
                 *source = shifted(source.clone(), source_delta);
                 *display = shifted(display.clone(), display_delta);
+                *line = shifted(line.clone(), display_delta);
             }
             Self::Block { source, .. } => *source = shifted(source.clone(), source_delta),
             Self::AnchoredBlock { source, .. } => {
@@ -398,4 +459,45 @@ fn fragment_edit(start: usize, old: &str, new: &str) -> Option<TextEdit> {
         start + prefix..start + old.len() - suffix,
         &new[prefix..new.len() - suffix],
     ))
+}
+
+/// Retained items keep the geometry derived for them, but a line's frame can
+/// depend on where it sits in its node. `items[changed]` replaced `replaced`;
+/// retained lines of the nodes involved may have moved within them, so their
+/// geometry is derived again.
+pub(super) fn forget_touched_geometry<I: Clone + Eq>(
+    replaced: &[DocumentLayoutItem<I>],
+    items: &mut [DocumentLayoutItem<I>],
+    changed: Range<usize>,
+) {
+    let mut touched: Vec<I> = Vec::new();
+    for node in replaced
+        .iter()
+        .chain(&items[changed.clone()])
+        .filter_map(DocumentLayoutItem::node)
+    {
+        if !touched.contains(node) {
+            touched.push(node.clone());
+        }
+    }
+    if touched.is_empty() {
+        return;
+    }
+    let touches =
+        |item: &DocumentLayoutItem<I>| item.node().is_some_and(|node| touched.contains(node));
+    let before = items[..changed.start]
+        .iter()
+        .rev()
+        .take_while(|item| touches(item))
+        .count();
+    let after = items[changed.end..]
+        .iter()
+        .take_while(|item| touches(item))
+        .count();
+    for item in &mut items[changed.start - before..changed.start] {
+        item.forget_geometry();
+    }
+    for item in &mut items[changed.end..changed.end + after] {
+        item.forget_geometry();
+    }
 }

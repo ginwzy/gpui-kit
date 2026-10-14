@@ -145,7 +145,7 @@ fn assert_first_match(model: &DocumentModel<&str>) {
                 .iter()
                 .find(|style| style.display.start <= line.start && line.end <= style.display.end);
             let DocumentLayoutItem::Text { presentation, .. } =
-                model.text_layout_item(display, line.clone(), 0..model.text.len())
+                model.text_layout_item(display, line.clone(), 0..model.text.len(), line.clone(), 0)
             else {
                 unreachable!()
             };
@@ -300,7 +300,7 @@ fn styled_splices_and_local_updates_match_full_rebuild(cx: &mut gpui::TestAppCon
                     )
                     .unwrap();
                 assert_eq!(doc.model.resolved_styles, rebuilt.resolved_styles);
-                assert_eq!(doc.layout_items, rebuilt.layout_items(&[]));
+                assert_eq!(doc.layout_items, rebuilt.layout_items(None));
                 assert_eq!(doc.selected_positions().unwrap(), selection);
                 assert_eq!(doc.undo.undo.len(), undo);
                 assert_first_match(&doc.model);

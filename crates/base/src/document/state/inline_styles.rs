@@ -129,6 +129,14 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             .resolved_styles
             .inline
             .splice(resolved_from..resolved_to, resolved.inline);
+        if self.text_rows.is_some() {
+            // Rows depend on fonts, so a row's style can move its line's breaks.
+            let first = self.layout_item_for_source(source.start);
+            self.reconcile_layout_items_from(first);
+            cx.emit(DocumentEvent::PresentationChanged);
+            cx.notify();
+            return Ok(true);
+        }
         let mut remeasure: Option<Range<usize>> = None;
         for ix in 0..self.layout_items.len() {
             let DocumentLayoutItem::Text {
@@ -142,11 +150,17 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             if line.start >= display.end || line.end <= display.start {
                 continue;
             }
-            let next = self.model.text_layout_item(
+            let mut next = self.model.text_layout_item(
                 self.model.projection_map.display_text(),
                 line.clone(),
                 segment.clone(),
+                line.clone(),
+                0,
             );
+            let key = super::text_rows::line_key(&next);
+            if let DocumentLayoutItem::Text { line_key, .. } = &mut next {
+                *line_key = key;
+            }
             if !self.layout_items[ix].same_layout_identity(&next) {
                 self.layout_items[ix] = next;
                 match &mut remeasure {

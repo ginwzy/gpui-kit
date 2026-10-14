@@ -52,7 +52,7 @@ mod text_rows;
 #[cfg(test)]
 mod style_tests;
 
-pub use text_rows::{TextRows, TextRowsError};
+pub use text_rows::{TextFrame, TextRows};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentEditRejection {
@@ -244,6 +244,8 @@ pub struct DocumentTextContext<I> {
     source: Range<usize>,
     node_start: usize,
     first_line: bool,
+    first_row: bool,
+    last_row: bool,
 }
 
 impl<I> DocumentTextContext<I> {
@@ -263,6 +265,17 @@ impl<I> DocumentTextContext<I> {
 
     pub fn is_first_line(&self) -> bool {
         self.first_line
+    }
+
+    /// Whether this is the first display row of its line. Without text rows,
+    /// every line is one row.
+    pub fn is_first_row(&self) -> bool {
+        self.first_row
+    }
+
+    /// Whether this is the last display row of its line.
+    pub fn is_last_row(&self) -> bool {
+        self.last_row
     }
 }
 
@@ -773,16 +786,38 @@ enum DocumentLayoutItem<I> {
         fingerprint: u64,
         /// `None` for unstyled text, which then costs no allocation.
         presentation: Option<Box<DocumentTextPresentation>>,
+        /// The display line this row belongs to. Without text rows, every line
+        /// is one row.
+        line: Range<usize>,
+        /// Identifies the line's text and fonts, keying its wrap in text rows.
+        line_key: u64,
+        /// The line's resolved frame in text rows, once layout resolved it.
+        frame: Derived<Option<text_rows::RowFrame>>,
+        /// What the line's rows were wrapped for, once text rows wrapped it.
+        wrapped: Derived<Option<text_rows::WrapKey>>,
     },
     Block {
         id: I,
         source: Range<usize>,
+        height: Derived<text_rows::BlockGeometry>,
     },
     AnchoredBlock {
         id: I,
         source: usize,
+        height: Derived<text_rows::BlockGeometry>,
     },
     Trailer,
+}
+
+/// Geometry a layout pass derives for an item. It is not part of the item's
+/// identity: equal items compare equal whatever geometry they hold.
+#[derive(Clone, Copy, Debug, Default)]
+struct Derived<T>(T);
+
+impl<T> PartialEq for Derived<T> {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 impl<I: Eq> DocumentLayoutItem<I> {
@@ -790,19 +825,32 @@ impl<I: Eq> DocumentLayoutItem<I> {
         match (self, other) {
             (
                 Self::Text {
+                    display: left_display,
                     fingerprint: left,
                     node_id: left_node,
                     presentation: left_presentation,
+                    line: left_line,
+                    line_key: left_key,
                     ..
                 },
                 Self::Text {
+                    display: right_display,
                     fingerprint: right,
                     node_id: right_node,
                     presentation: right_presentation,
+                    line: right_line,
+                    line_key: right_key,
                     ..
                 },
             ) => {
-                left_node == right_node && left == right && left_presentation == right_presentation
+                // A row keeps its place in its line, wherever the line moved.
+                left_node == right_node
+                    && left == right
+                    && left_presentation == right_presentation
+                    && left_key == right_key
+                    && left_line.len() == right_line.len()
+                    && left_display.start - left_line.start
+                        == right_display.start - right_line.start
             }
             (Self::Block { id: left, .. }, Self::Block { id: right, .. }) => left == right,
             (
@@ -992,7 +1040,9 @@ impl<I: Clone + Eq> DocumentModel<I> {
 
     /// Items for the document, with text lines split at the display offsets in
     /// `row_starts` (ascending) when it lays out display rows.
-    fn layout_items(&self, row_starts: &[usize]) -> Vec<DocumentLayoutItem<I>> {
+    /// Layout items in document order. With `rows`, each line splits into the
+    /// display rows last wrapped for its text and fonts; otherwise a line is one item.
+    fn layout_items(&self, rows: Option<&text_rows::RowCache>) -> Vec<DocumentLayoutItem<I>> {
         let display_text = self.display_text();
         let mut display_cursor = 0;
         let mut source_cursor = 0;
@@ -1022,20 +1072,19 @@ impl<I: Clone + Eq> DocumentModel<I> {
                 display_cursor..display_start,
                 source_cursor..source.start,
                 false,
-                row_starts,
+                rows,
             );
             if let Some(block) = block {
                 items.push(DocumentLayoutItem::Block {
                     id: block.id().clone(),
                     source: source.clone(),
+                    height: Derived::default(),
                 });
                 blocks.next();
             } else {
-                let mut item = self.text_layout_item(
-                    display_text,
-                    display_start..display_start,
-                    source.clone(),
-                );
+                let empty = display_start..display_start;
+                let mut item =
+                    self.text_layout_item(display_text, empty.clone(), source.clone(), empty, 0);
                 if let DocumentLayoutItem::Text { node_id, .. } = &mut item {
                     *node_id = Some(region.id().clone());
                 }
@@ -1050,40 +1099,59 @@ impl<I: Clone + Eq> DocumentModel<I> {
             display_cursor..display_text.len(),
             source_cursor..self.text.len(),
             true,
-            row_starts,
+            rows,
         );
-        for block in &self.anchored_blocks {
-            let (source, display) = anchored_display_offset(
-                block,
-                |position| self.resolve_position(position),
-                |offset, affinity| self.source_to_display(offset, affinity),
-                display_text,
-            )
-            .expect("validated anchored block must map to a line boundary");
-            let index = items
-                .iter()
-                .position(|item| match item {
+        if self.anchored_blocks.is_empty() {
+            return items;
+        }
+        // Each anchored block goes before the first text or block item at or after
+        // its offset, after anchored blocks at earlier offsets. Text and blocks
+        // are in document order, so one merge places them all.
+        let mut anchored: Vec<_> = self
+            .anchored_blocks
+            .iter()
+            .map(|block| {
+                let (source, display) = anchored_display_offset(
+                    block,
+                    |position| self.resolve_position(position),
+                    |offset, affinity| self.source_to_display(offset, affinity),
+                    display_text,
+                )
+                .expect("validated anchored block must map to a line boundary");
+                let index = items.partition_point(|item| match item {
                     DocumentLayoutItem::Text {
                         display: range,
                         source: text,
                         ..
-                    } => range.start >= display && text.start >= source,
-                    DocumentLayoutItem::Block { source: range, .. } => range.start >= source,
-                    DocumentLayoutItem::AnchoredBlock {
-                        source: previous, ..
-                    } => *previous > source,
-                    DocumentLayoutItem::Trailer => true,
-                })
-                .unwrap_or(items.len());
-            items.insert(
-                index,
-                DocumentLayoutItem::AnchoredBlock {
-                    id: block.id().clone(),
+                    } => !(range.start >= display && text.start >= source),
+                    DocumentLayoutItem::Block { source: range, .. } => range.start < source,
+                    DocumentLayoutItem::AnchoredBlock { .. } => true,
+                    DocumentLayoutItem::Trailer => false,
+                });
+                (index, source, block.id().clone())
+            })
+            .collect();
+        anchored.sort_by_key(|(index, source, _)| (*index, *source));
+        let mut merged = Vec::with_capacity(items.len() + anchored.len());
+        let mut anchored = anchored.into_iter().peekable();
+        for (ix, item) in items.into_iter().enumerate() {
+            while let Some((_, source, id)) = anchored.next_if(|(index, _, _)| *index == ix) {
+                merged.push(DocumentLayoutItem::AnchoredBlock {
+                    id,
                     source,
-                },
-            );
+                    height: Derived::default(),
+                });
+            }
+            merged.push(item);
         }
-        items
+        merged.extend(
+            anchored.map(|(_, source, id)| DocumentLayoutItem::AnchoredBlock {
+                id,
+                source,
+                height: Derived::default(),
+            }),
+        );
+        merged
     }
 
     fn push_text_layout_items(
@@ -1093,11 +1161,29 @@ impl<I: Clone + Eq> DocumentModel<I> {
         range: Range<usize>,
         source: Range<usize>,
         include_empty_tail: bool,
-        row_starts: &[usize],
+        rows: Option<&text_rows::RowCache>,
     ) {
         let mut push_line = |line: Range<usize>| {
-            for row in text_rows::rows_of_line(line, row_starts) {
-                items.push(self.text_layout_item(display_text, row, source.clone()));
+            // Every line is keyed, so turning text rows on keeps these items.
+            let mut whole =
+                self.text_layout_item(display_text, line.clone(), source.clone(), line.clone(), 0);
+            let line_key = text_rows::line_key(&whole);
+            let starts = rows.map_or(&[][..], |rows| rows.row_starts(line_key));
+            if starts.is_empty() {
+                if let DocumentLayoutItem::Text { line_key: key, .. } = &mut whole {
+                    *key = line_key;
+                }
+                items.push(whole);
+                return;
+            }
+            for row in text_rows::rows_of_line(line.clone(), starts) {
+                items.push(self.text_layout_item(
+                    display_text,
+                    row,
+                    source.clone(),
+                    line.clone(),
+                    line_key,
+                ));
             }
         };
         let mut start = range.start;
@@ -1118,6 +1204,8 @@ impl<I: Clone + Eq> DocumentModel<I> {
         display_text: &str,
         display: Range<usize>,
         segment: Range<usize>,
+        line: Range<usize>,
+        line_key: u64,
     ) -> DocumentLayoutItem<I> {
         // A hidden object shares display offsets with both adjacent text runs.
         // Keep the source extent so caret ownership does not cross that object.
@@ -1181,6 +1269,10 @@ impl<I: Clone + Eq> DocumentModel<I> {
             node_id,
             presentation: (presentation != DocumentTextPresentation::default())
                 .then(|| Box::new(presentation)),
+            line,
+            line_key,
+            frame: Derived::default(),
+            wrapped: Derived::default(),
         }
     }
 
@@ -1953,11 +2045,19 @@ fn validate_projection<I: Eq>(
         {
             return Err(ProjectionError::InvalidMapping(span_source));
         }
-        if regions.as_slice().iter().any(|region| {
-            region.policy() == EditPolicy::Editable
-                && span_source.start < region.range().end
-                && region.range().start < span_source.end
-        }) {
+        // Regions are in source order with monotonic ends, so only those from
+        // the first ending after the span's start can intersect it.
+        let regions = regions.as_slice();
+        let from = regions.partition_point(|region| region.range().end <= span_source.start);
+        if regions[from..]
+            .iter()
+            .take_while(|region| region.range().start < span_source.end)
+            .any(|region| {
+                region.policy() == EditPolicy::Editable
+                    && span_source.start < region.range().end
+                    && region.range().start < span_source.end
+            })
+        {
             return Err(ProjectionError::EditableOverlap(span_source));
         }
     }
@@ -2005,7 +2105,9 @@ pub struct DocumentState<I> {
     scrollbar_input_pending: Rc<Cell<bool>>,
     block_renderer: Option<BlockRenderer<I>>,
     text_renderer: Option<TextRenderer<I>>,
-    /// Display rows for read-only text, when the host asked for them.
+    text_frame_resolver: Option<TextFrameResolver<I>>,
+    block_height_resolver: Option<BlockHeightResolver<I>>,
+    /// Display rows, when the host asked for them.
     text_rows: Option<text_rows::TextRowsState>,
 }
 
@@ -2023,6 +2125,8 @@ struct BlockLayoutRecord {
 }
 
 type BlockRenderer<I> = Rc<dyn Fn(&I, &mut Window, &mut App) -> AnyElement>;
+type TextFrameResolver<I> = Rc<dyn Fn(&DocumentTextContext<I>, &Window, &App) -> TextFrame>;
+type BlockHeightResolver<I> = Rc<dyn Fn(&I, &Window, &App) -> Option<gpui::AbsoluteLength>>;
 type TextRenderer<I> =
     Rc<dyn Fn(DocumentTextContext<I>, AnyElement, &mut Window, &mut App) -> AnyElement>;
 
@@ -2099,7 +2203,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) -> Result<Self, RegionError> {
         let model = DocumentModel::new(text, regions)?;
-        let layout_items = model.layout_items(&[]);
+        let layout_items = model.layout_items(None);
         let list_state =
             ListState::new(layout_items.len(), ListAlignment::Top, px(400.)).measure_all();
         let focus_handle = cx.focus_handle();
@@ -2143,6 +2247,8 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             scrollbar_input_pending: Rc::default(),
             block_renderer: None,
             text_renderer: None,
+            text_frame_resolver: None,
+            block_height_resolver: None,
             text_rows: None,
         })
     }
@@ -2227,12 +2333,10 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.caret_reveal_pending = false;
         self.text_layouts.clear();
         self.block_layouts.clear();
-        if let Some(rows) = &mut self.text_rows {
-            rows.clear();
-        }
         self.trailer_layout = None;
         self.layout_items = self.next_layout_items();
         self.list_state.reset(self.layout_items.len());
+        self.layout_items_changed();
         cx.emit(DocumentEvent::PresentationChanged);
         cx.emit(DocumentEvent::SelectionChanged);
         cx.notify();
@@ -2367,6 +2471,18 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         self.model
             .region_index(id)
             .map(|index| &self.model.regions.as_slice()[index])
+    }
+
+    /// The region `id`, found from a source `offset` it holds without scanning
+    /// every region. Regions are in source order.
+    pub(super) fn region_at(&self, id: &I, offset: usize) -> Option<&DocumentRegion<I>> {
+        let regions = self.model.regions.as_slice();
+        let from = regions.partition_point(|region| region.range().end < offset);
+        regions[from..]
+            .iter()
+            .take_while(|region| region.range().start <= offset)
+            .find(|region| region.id() == id)
+            .or_else(|| self.region(id))
     }
 
     pub fn region_text(&self, id: &I) -> Option<String> {
@@ -2621,10 +2737,15 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             });
         } else {
             // At a soft-wrap boundary, affinity chooses the owning display row.
+            // A block's positions belong to the block, not to text beside it.
             let item_ix = self
                 .text_rows
                 .as_ref()
                 .and_then(|_| self.text_item_for_position(position))
+                .filter(|ix| {
+                    matches!(&self.layout_items[*ix], DocumentLayoutItem::Text { node_id, .. }
+                        if node_id.as_ref() == Some(position.node_id()))
+                })
                 .unwrap_or_else(|| self.layout_item_for_source(offset));
             self.list_state.scroll_to_reveal_item(item_ix);
         }
@@ -2661,7 +2782,16 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 
     /// Invalidates measurements after the host changes a node's custom renderer geometry.
+    /// With text rows, layout resolves the node's frames and block heights again.
     pub fn remeasure_node(&mut self, id: &I, cx: &mut Context<Self>) -> bool {
+        if self.text_rows.is_some() {
+            self.capture_viewport_anchor();
+            let cleared = self.clear_row_geometry(|node| node == Some(id));
+            if cleared {
+                cx.notify();
+            }
+            return cleared;
+        }
         let indices: Vec<_> = self
             .layout_items
             .iter()
@@ -2788,17 +2918,30 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             // measurements, but measure every inserted/replaced item before
             // publishing the next scroll extent, including offscreen items.
             self.list_state.clone().measure_all();
+            self.layout_items_changed();
         }
+        let mut next = next;
+        // Retained items keep the geometry layout derived for them.
+        let split = next.len() - suffix;
+        let (head, tail) = next.split_at_mut(split);
+        for (old, new) in self.layout_items[..prefix].iter().zip(head) {
+            new.keep_geometry(old);
+        }
+        for (old, new) in self.layout_items[old_end..].iter().zip(tail) {
+            new.keep_geometry(old);
+        }
+        host::forget_touched_geometry(
+            &self.layout_items[prefix..old_end],
+            &mut next,
+            prefix..split,
+        );
         self.layout_items = next;
     }
 
     fn next_layout_items(&self) -> Vec<DocumentLayoutItem<I>> {
-        let breaks = self
-            .text_rows
-            .as_ref()
-            .map(|rows| rows.breaks.clone())
-            .unwrap_or_default();
-        let mut items = self.model.layout_items(&breaks);
+        let mut items = self
+            .model
+            .layout_items(self.text_rows.as_ref().map(|rows| &rows.cache));
         if self.dynamic_trailer {
             items.push(DocumentLayoutItem::Trailer);
         }
@@ -3426,14 +3569,6 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                 .anchors
                 .apply_edit(&edit.range(), edit.replacement().len());
             self.model.text.replace(edit.range(), edit.replacement());
-        }
-        if let Some(rows) = &mut self.text_rows {
-            rows.apply_edits(
-                transaction
-                    .edits()
-                    .iter()
-                    .map(|edit| (edit.range(), edit.replacement().len())),
-            );
         }
         self.model.regions = next_regions;
         self.model.reconcile_anchor_nodes();
@@ -4458,15 +4593,6 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             .text_layouts
             .iter()
             .find(|record| record.item_ix == item_ix)?;
-        // A pending text-row wrap can shape just the horizontal viewport.
-        // Unshaped offsets have no geometry yet; never map them to its edge.
-        if self.text_rows.is_some() && display > record.display.end && self.layout_items.get(item_ix).is_some_and(|item| {
-            matches!(
-                item, DocumentLayoutItem::Text { display, .. } if display.end > record.display.end
-            )
-        }) {
-            return None;
-        }
         let local = display.clamp(record.display.start, record.display.end) - record.display.start;
         record.layout.position_for_index(local).map(|position| {
             (
@@ -4853,6 +4979,15 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         Some((point.y - self.unpainted_pin_scroll - viewport.top()) / viewport.size.height)
     }
 
+    /// Where the text of item `item_ix` was laid out this frame.
+    #[cfg(debug_assertions)]
+    pub(super) fn text_bounds(&self, item_ix: usize) -> Option<Bounds<Pixels>> {
+        self.text_layouts
+            .iter()
+            .find(|record| record.item_ix == item_ix)
+            .map(|record| record.bounds)
+    }
+
     pub(super) fn update_text_layout(
         &mut self,
         item_ix: usize,
@@ -4934,7 +5069,6 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         }
         self.layout_style = Some(layout_style);
         self.last_bounds = Some(bounds);
-        self.prepare_text_rows(bounds, window, cx);
         self.unpainted_pin_scroll = Pixels::ZERO;
         if self.dynamic_trailer
             && self.trailer_height != Some(bounds.size.height)
@@ -4943,13 +5077,27 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             // The viewport is known before List::prepaint measures its items.
             // Include the actual trailer height in this frame's total.
             self.trailer_height = Some(bounds.size.height);
-            if let Some(index) = self
-                .layout_items
-                .iter()
-                .position(|item| matches!(item, DocumentLayoutItem::Trailer))
-            {
-                self.list_state.remeasure_items(index..index + 1);
+            if matches!(self.layout_items.last(), Some(DocumentLayoutItem::Trailer)) {
+                let index = self.layout_items.len() - 1;
+                if self.text_rows.is_some() {
+                    self.list_state
+                        .set_item_heights(index, [Some(bounds.size.height)]);
+                } else {
+                    self.list_state.remeasure_items(index..index + 1);
+                }
             }
+        }
+        self.prepare_text_rows(bounds, window, cx);
+        // A reveal that waited for rows can find its row now, before the list
+        // lays out this frame, when the list keeps last frame's viewport.
+        // Otherwise it waits until the list has laid out the new viewport.
+        if self
+            .pending_viewport_anchor
+            .as_ref()
+            .is_some_and(|pending| pending.reveal_on_wrap)
+            && self.list_state.viewport_bounds().size == bounds.size
+        {
+            self.restore_pending_viewport_anchor(cx);
         }
         self.text_layouts.clear();
         self.block_layouts.clear();
@@ -5079,6 +5227,9 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut text_context = None;
+        let mut hidden = false;
+        #[cfg(debug_assertions)]
+        let mut text_top = None;
         let child = match self
             .layout_items
             .get(item_ix)
@@ -5089,15 +5240,21 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                 source,
                 node_id,
                 presentation,
+                line,
+                frame,
                 ..
             } => {
                 if let Some(node_id) = node_id {
-                    let region = self.region(node_id).map(DocumentRegion::range);
+                    let region = self
+                        .region_at(node_id, source.start)
+                        .map(DocumentRegion::range);
                     text_context = Some(DocumentTextContext {
                         node_id: node_id.clone(),
                         source: source.clone(),
                         node_start: region.as_ref().map_or(0, |region| region.start),
                         first_line: region.is_some_and(|region| source.start <= region.start),
+                        first_row: display.start == line.start,
+                        last_row: display.end == line.end,
                     });
                 }
                 let mut presentation = presentation.as_deref().cloned().unwrap_or_default();
@@ -5105,23 +5262,23 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                     // A display row is one line; its wrap was decided with the geometry.
                     presentation.text_style.get_or_insert_default().white_space =
                         Some(gpui::WhiteSpace::Nowrap);
-                }
-                let paint_display = self.text_row_paint_range(display.clone(), cx);
-                if paint_display.end < display.end {
-                    presentation.highlights.retain_mut(|(range, _)| {
-                        range.end = range.end.min(paint_display.len());
-                        range.start < range.end
-                    });
+                    hidden = frame
+                        .0
+                        .is_some_and(|frame| frame.row_height(display, line) == px(0.));
+                    #[cfg(debug_assertions)]
+                    {
+                        text_top = frame.0.map(|frame| frame.text_top(display, line));
+                    }
                 }
                 DocumentChild::Text {
                     item_ix,
-                    display: paint_display.clone(),
+                    display: display.clone(),
                     // Rows hold no text; only the rows in view slice it.
-                    text: self.model.display_text()[paint_display].to_owned().into(),
+                    text: self.model.display_text()[display.clone()].to_owned().into(),
                     presentation: Box::new(presentation),
                 }
             }
-            DocumentLayoutItem::Block { id, source } => {
+            DocumentLayoutItem::Block { id, source, .. } => {
                 let renderer = self
                     .block_renderer
                     .as_ref()
@@ -5133,7 +5290,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                     element: renderer(id, window, cx),
                 }
             }
-            DocumentLayoutItem::AnchoredBlock { id, source } => {
+            DocumentLayoutItem::AnchoredBlock { id, source, .. } => {
                 let renderer = self
                     .block_renderer
                     .as_ref()
@@ -5153,10 +5310,24 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             },
         };
         let element = DocumentElement::render_child(cx.entity(), child);
-        match (&self.text_renderer, text_context) {
+        let element = match (&self.text_renderer, text_context) {
             (Some(renderer), Some(context)) => renderer(context, element, window, cx),
             _ => element,
+        };
+        #[cfg(debug_assertions)]
+        if let Some(text_top) = text_top.filter(|_| !hidden) {
+            return super::element::DocumentRowCheck::new(cx.entity(), item_ix, text_top, element)
+                .into_any_element();
         }
+        if hidden {
+            // A hidden line keeps its text for positions but takes no space.
+            return gpui::div()
+                .h_0()
+                .overflow_hidden()
+                .child(element)
+                .into_any_element();
+        }
+        element
     }
 }
 
@@ -5625,7 +5796,7 @@ mod tests {
             vec![DocumentRegion::new("text", 0..15, EditPolicy::Readonly)],
         )
         .unwrap();
-        let items = model.layout_items(&[]);
+        let items = model.layout_items(None);
         let DocumentLayoutItem::Text {
             presentation: None, ..
         } = &items[0]
@@ -5727,14 +5898,15 @@ mod tests {
             .unwrap();
         assert_eq!(model.text(), "first\nsecond");
         assert!(matches!(
-            model.layout_items(&[])[1],
+            model.layout_items(None)[1],
             DocumentLayoutItem::AnchoredBlock {
                 id: "comment",
-                source: 6
+                source: 6,
+                ..
             }
         ));
         assert!(matches!(
-            model.layout_items(&[])[2],
+            model.layout_items(None)[2],
             DocumentLayoutItem::Text { .. }
         ));
         model
@@ -5812,7 +5984,7 @@ mod tests {
                 DocumentStyles::default(),
             )
             .unwrap();
-        let items = model.layout_items(&[]);
+        let items = model.layout_items(None);
         assert!(
             matches!(items[0], DocumentLayoutItem::Text { ref display, .. } if &model.display_text()[display.clone()] == "A")
         );
@@ -5932,7 +6104,7 @@ mod tests {
                 assert_eq!(
                     document
                         .model
-                        .layout_items(&[])
+                        .layout_items(None)
                         .iter()
                         .filter(|item| matches!(item, DocumentLayoutItem::AnchoredBlock { .. }))
                         .count(),
@@ -7027,7 +7199,7 @@ mod tests {
                             cx,
                         )
                         .unwrap();
-                    assert_eq!(document.layout_items, document.model.layout_items(&[]));
+                    assert_eq!(document.layout_items, document.model.layout_items(None));
                     let rebuilt =
                         ProjectionMap::new(&document.model.text, &document.model.projection);
                     assert_eq!(document.display_text(), rebuilt.display_text());
