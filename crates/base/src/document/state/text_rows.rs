@@ -396,6 +396,8 @@ pub(in crate::document) struct TextRowsState {
     check: bool,
     /// Every line must be checked, not just those in view.
     scan_all: bool,
+    /// The widest printable ASCII character in the base font, once a wrap needs it.
+    ascii_advance: Option<Pixels>,
     pending: Option<Task<()>>,
     ready: Option<WrapResult>,
 }
@@ -424,6 +426,7 @@ impl TextRowsState {
             resolve: true,
             check: true,
             scan_all: true,
+            ascii_advance: None,
             pending: None,
             ready: None,
         }
@@ -541,6 +544,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             (None, Some(_)) => {
                 self.text_rows = None;
                 self.reconcile_layout_items_from(0);
+                // Geometry belongs to the rows that derived it. Without any,
+                // rows that come back need not clear it before their first layout.
+                for item in &mut self.layout_items {
+                    item.forget_geometry();
+                }
                 // Every item returns to measurement, including retained blocks.
                 self.list_state
                     .set_item_heights(0, std::iter::repeat_n(None, self.layout_items.len()));
@@ -629,11 +637,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         };
         let style = RowsStyle::new(window);
         if state.style.as_ref() != Some(&style) {
-            if state.style.is_some() {
+            // Before the first style, rows have derived no geometry to clear.
+            state.ascii_advance = None;
+            if state.style.replace(style).is_some() {
                 state.generation += 1;
+                self.clear_row_geometry(|_| true);
             }
-            state.style = Some(style);
-            self.clear_row_geometry(|_| true);
         }
         let Some(state) = self.text_rows.as_mut() else {
             return;
@@ -907,6 +916,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        let ascii_advance = self.ascii_advance(window, cx);
         let Some(state) = self.text_rows.as_ref() else {
             return;
         };
@@ -931,6 +941,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             let DocumentLayoutItem::Text {
                 line,
                 line_key,
+                presentation,
                 frame: Derived(Some(frame)),
                 wrapped,
                 ..
@@ -949,6 +960,23 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 widths: frame.widths(width),
             };
             if wrapped.0 == Some(wrap) {
+                continue;
+            }
+            // Wrapping cannot break a line that never reaches its width.
+            if presentation.is_none()
+                && ascii_advance.is_some_and(|advance| {
+                    fits_unwrapped(
+                        &self.model.display_text()[line.clone()],
+                        advance,
+                        wrap.widths.0,
+                    )
+                })
+            {
+                if rows.len() == 1 {
+                    settled.push((rows, wrap));
+                } else {
+                    outdated.push((rows, wrap, Arc::from([])));
+                }
                 continue;
             }
             match state.cache.lines.get(line_key) {
@@ -1137,6 +1165,19 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 matches!(item, DocumentLayoutItem::Text { display, line, .. }
                     if display.start - line.start == *start as usize)
             })
+    }
+
+    /// The widest printable ASCII character in the base font.
+    fn ascii_advance(&mut self, window: &Window, cx: &App) -> Option<Pixels> {
+        let state = self.text_rows.as_mut()?;
+        if state.ascii_advance.is_none() {
+            let mut wrappers = FontTable::new(window).wrappers(cx);
+            let mut buffer = [0; 4];
+            state.ascii_advance = Some((b' '..=b'~').fold(Pixels::ZERO, |widest, byte| {
+                widest.max(wrappers[0].cluster_width(char::from(byte).encode_utf8(&mut buffer)))
+            }));
+        }
+        state.ascii_advance
     }
 
     fn line_spec(&self, line: &StaleLine, fonts: &mut FontTable) -> LineSpec {
@@ -1430,6 +1471,15 @@ fn wrap_line(
         previous = cluster.chars().last().unwrap_or(first);
     }
     starts
+}
+
+/// Whether `wrap_line` keeps `line` whole at `width` without measuring it: in
+/// printable ASCII every character is its own cluster, so the line is never
+/// wider than its length times the widest one. Half a pixel absorbs rounding
+/// in the wrap's running sum.
+fn fits_unwrapped(line: &str, ascii_advance: Pixels, width: Pixels) -> bool {
+    ascii_advance * line.len() as f32 <= width - px(0.5)
+        && line.bytes().all(|byte| (b' '..=b'~').contains(&byte))
 }
 
 /// How far `cluster` advances a row already `x` wide.
@@ -1823,6 +1873,46 @@ mod tests {
             assert_eq!(document.layout_items, document.model.layout_items(None));
         });
         draw(&mut cx);
+
+        // Rows that come back derive their geometry anew.
+        document.update(&mut cx, |document, cx| {
+            document.set_text_rows(Some(TextRows::new()), cx);
+        });
+        draw(&mut cx);
+        assert_declared_geometry(&document, &mut cx);
+        assert!(line_rows(&document, "text", &mut cx).len() > narrow.len());
+    }
+
+    #[gpui::test]
+    fn ascii_lines_short_of_their_width_wrap_whole(cx: &mut TestAppContext) {
+        let mut wrappers = vec![
+            cx.text_system()
+                .line_wrapper(gpui::font("Zed Mono"), px(16.)),
+        ];
+        let mut buffer = [0; 4];
+        let advance = (b' '..=b'~').fold(Pixels::ZERO, |widest, byte| {
+            widest.max(wrappers[0].cluster_width(char::from(byte).encode_utf8(&mut buffer)))
+        });
+        let words = "fn wrap(x: u8) -> Vec<u32> { x.max(1) } // ~!@#$%^&*()_+ ";
+        let (mut fit, mut wide) = (0, 0);
+        for len in 1..words.len() * 3 {
+            let line: String = words.chars().cycle().take(len).collect();
+            for width in (20..=900).step_by(37).map(|width| px(width as f32)) {
+                if fits_unwrapped(&line, advance, width) {
+                    fit += 1;
+                    assert_eq!(
+                        wrap_line(&line, &[(line.len(), 0)], &mut wrappers, (width, width)),
+                        Vec::<u32>::new(),
+                        "{line:?} at {width:?}"
+                    );
+                } else {
+                    wide += 1;
+                }
+            }
+        }
+        assert!(fit > 0 && wide > 0);
+        assert!(!fits_unwrapped("tab\there", advance, px(900.)));
+        assert!(!fits_unwrapped("中文", advance, px(900.)));
     }
 
     #[gpui::test]
