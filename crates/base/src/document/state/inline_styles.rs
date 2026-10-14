@@ -4,7 +4,7 @@ use crate::document::DocumentInlineStyle;
 #[cfg(test)]
 mod tests;
 
-impl<I: Clone + Eq + 'static> DocumentState<I> {
+impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// Current source-relative presentation styles, including editable text.
     pub fn styles(&self) -> &DocumentStyles {
         &self.model.styles

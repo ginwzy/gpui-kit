@@ -95,9 +95,11 @@ pub(crate) fn validate_blocks<I: Eq>(
         }
         previous_end = source.end;
 
-        let Some(region) = regions
-            .as_slice()
+        let candidates = regions.as_slice();
+        let from = candidates.partition_point(|region| region.range().start < source.start);
+        let Some(region) = candidates[from..]
             .iter()
+            .take_while(|region| region.range().start == source.start)
             .find(|region| region.range() == source && region.policy() == EditPolicy::Atomic)
         else {
             return Err(BlockError::MissingAtomicRegion(source));
@@ -105,9 +107,11 @@ pub(crate) fn validate_blocks<I: Eq>(
         if region.id() != block.id() {
             return Err(BlockError::RegionIdMismatch(source));
         }
-        if !projection
-            .spans()
+        let spans = projection.spans();
+        let from = spans.partition_point(|span| span.source().start < source.start);
+        if !spans[from..]
             .iter()
+            .take_while(|span| span.source().start == source.start)
             .any(|span| span.source() == source && span.replacement().is_empty())
         {
             return Err(BlockError::VisibleSource(source));
@@ -162,6 +166,47 @@ mod tests {
                 3
             ),
             Err(BlockError::RegionIdMismatch(0..3))
+        );
+    }
+
+    #[test]
+    fn each_block_finds_its_own_region_and_span_among_neighbors() {
+        let regions = DocumentRegions::new(
+            vec![
+                DocumentRegion::new("card", 5..8, EditPolicy::Atomic),
+                DocumentRegion::new("lead", 0..0, EditPolicy::Editable),
+                DocumentRegion::new("text", 3..5, EditPolicy::Readonly),
+                DocumentRegion::new("tool", 0..3, EditPolicy::Atomic),
+            ],
+            8,
+        )
+        .unwrap();
+        let hidden = DocumentProjection::new(
+            8,
+            vec![ProjectionSpan::hide(0..3), ProjectionSpan::hide(5..8)],
+        )
+        .unwrap();
+        let blocks = [
+            DocumentBlock::new("tool", 0..3),
+            DocumentBlock::new("card", 5..8),
+        ];
+
+        assert_eq!(validate_blocks(&blocks, &regions, &hidden, 8), Ok(()));
+        assert_eq!(
+            validate_blocks(&[DocumentBlock::new("text", 3..5)], &regions, &hidden, 8),
+            Err(BlockError::MissingAtomicRegion(3..5))
+        );
+        let replaced = DocumentProjection::new(
+            8,
+            vec![
+                ProjectionSpan::hide(0..3),
+                ProjectionSpan::replace(5..8, "card"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            validate_blocks(&blocks, &regions, &replaced, 8),
+            Err(BlockError::VisibleSource(5..8))
         );
     }
 }

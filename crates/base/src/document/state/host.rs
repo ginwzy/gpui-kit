@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{collections::HashSet, hash::Hash, ops::Range};
 
 use gpui::Context;
 
@@ -10,7 +10,7 @@ use super::{
     HostTransactionError, PresentationError, RegionError, ResolvedDocumentStyles, TextEdit,
 };
 
-impl<I: Clone + Eq + 'static> DocumentState<I> {
+impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// Replace the nodes in `first..end` with a locally addressed readonly snapshot.
     /// Equal boundaries insert before a node. `None` denotes the document end.
     /// Projection, styles and anchored blocks must stay inside the replaced nodes;
@@ -100,11 +100,10 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                 BlockError::MissingRenderer,
             ));
         }
-        let removed = |id: &I| {
-            regions[nodes.clone()]
-                .iter()
-                .any(|region| region.id() == id)
-        };
+        let removed: HashSet<&I> = regions[nodes.clone()]
+            .iter()
+            .map(|region| region.id())
+            .collect();
         let mut candidate =
             DocumentModel::new(snapshot.text, snapshot.regions).map_err(|error| {
                 HostTransactionError::InvalidFragment(PresentationError::Regions(error))
@@ -125,16 +124,18 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
                 self.model
                     .anchored_blocks
                     .iter()
-                    .filter(|block| !removed(block.position().node_id()))
+                    .filter(|block| !removed.contains(block.position().node_id()))
                     .map(|block| block.id()),
             );
+        let fragment_ids: HashSet<&I> = candidate
+            .regions
+            .as_slice()
+            .iter()
+            .map(|region| region.id())
+            .chain(candidate.anchored_blocks.iter().map(|block| block.id()))
+            .collect();
         for id in retained_ids {
-            if candidate.region_index(id).is_some()
-                || candidate
-                    .anchored_blocks
-                    .iter()
-                    .any(|block| block.id() == id)
-            {
+            if fragment_ids.contains(id) {
                 return Err(HostTransactionError::InvalidFragment(
                     PresentationError::Regions(RegionError::DuplicateId { index: nodes.start }),
                 ));
@@ -170,7 +171,7 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
             .model
             .anchored_blocks
             .iter()
-            .filter(|block| !removed(block.position().node_id()))
+            .filter(|block| !removed.contains(block.position().node_id()))
             .cloned()
             .collect::<Vec<_>>();
 
@@ -465,39 +466,27 @@ fn fragment_edit(start: usize, old: &str, new: &str) -> Option<TextEdit> {
 /// depend on where it sits in its node. `items[changed]` replaced `replaced`;
 /// retained lines of the nodes involved may have moved within them, so their
 /// geometry is derived again.
-pub(super) fn forget_touched_geometry<I: Clone + Eq>(
+pub(super) fn forget_touched_geometry<I: Clone + Eq + Hash>(
     replaced: &[DocumentLayoutItem<I>],
     items: &mut [DocumentLayoutItem<I>],
     changed: Range<usize>,
 ) {
-    let mut touched: Vec<I> = Vec::new();
-    for node in replaced
+    let (head, rest) = items.split_at_mut(changed.start);
+    let (changed, tail) = rest.split_at_mut(changed.len());
+    let touched: HashSet<&I> = replaced
         .iter()
-        .chain(&items[changed.clone()])
+        .chain(&*changed)
         .filter_map(DocumentLayoutItem::node)
-    {
-        if !touched.contains(node) {
-            touched.push(node.clone());
-        }
-    }
+        .collect();
     if touched.is_empty() {
         return;
     }
     let touches =
         |item: &DocumentLayoutItem<I>| item.node().is_some_and(|node| touched.contains(node));
-    let before = items[..changed.start]
-        .iter()
-        .rev()
-        .take_while(|item| touches(item))
-        .count();
-    let after = items[changed.end..]
-        .iter()
-        .take_while(|item| touches(item))
-        .count();
-    for item in &mut items[changed.start - before..changed.start] {
+    for item in head.iter_mut().rev().take_while(|item| touches(item)) {
         item.forget_geometry();
     }
-    for item in &mut items[changed.end..changed.end + after] {
+    for item in tail.iter_mut().take_while(|item| touches(item)) {
         item.forget_geometry();
     }
 }

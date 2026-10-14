@@ -14,7 +14,7 @@
 //! keep their previous rows, and the heights of those rows, until it lands.
 use std::{
     collections::HashMap,
-    hash::{BuildHasherDefault, DefaultHasher, Hash as _, Hasher},
+    hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher},
     ops::Range,
     sync::Arc,
 };
@@ -510,7 +510,7 @@ impl LineSpec {
     }
 }
 
-impl<I: Clone + Eq + 'static> DocumentState<I> {
+impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// Lay text out as display rows, or `None` to return to one measured item
     /// per line.
     ///

@@ -1,8 +1,9 @@
 use std::{
     cell::Cell,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     fmt,
+    hash::Hash,
     ops::{Range, RangeInclusive},
     rc::Rc,
 };
@@ -351,7 +352,7 @@ impl<I> DocumentStructure<I> {
     }
 }
 
-impl<I: Clone + Eq> DocumentStructure<I> {
+impl<I: Clone + Eq + Hash> DocumentStructure<I> {
     fn suffix(model: &DocumentModel<I>, start: usize) -> Option<Self> {
         if start > model.text.len() || model.text.clip_offset(start, Bias::Left) != start {
             return None;
@@ -582,7 +583,7 @@ impl<I> Default for DocumentUndoManager<I> {
     }
 }
 
-impl<I: Clone + Eq> DocumentUndoManager<I> {
+impl<I: Clone + Eq + Hash> DocumentUndoManager<I> {
     fn checkpoint(&mut self) -> UndoCheckpoint {
         self.break_coalescing();
         UndoCheckpoint(self.next_sequence)
@@ -871,7 +872,7 @@ impl<I: Eq> DocumentLayoutItem<I> {
     }
 }
 
-impl<I: Clone + Eq> DocumentModel<I> {
+impl<I: Clone + Eq + Hash> DocumentModel<I> {
     fn new(text: impl Into<String>, regions: Vec<DocumentRegion<I>>) -> Result<Self, RegionError> {
         let text = Rope::from(text.into());
         let regions = DocumentRegions::new(regions, text.len())?;
@@ -988,20 +989,22 @@ impl<I: Clone + Eq> DocumentModel<I> {
         regions: &DocumentRegions<I>,
         text: &Rope,
     ) -> Result<(), AnchoredBlockError> {
-        for (ix, block) in anchored.iter().enumerate() {
-            if regions
-                .as_slice()
-                .iter()
-                .any(|region| region.id() == block.id())
-                || blocks.iter().any(|other| other.id() == block.id())
-                || anchored[..ix].iter().any(|other| other.id() == block.id())
-            {
+        if anchored.is_empty() {
+            return Ok(());
+        }
+        let regions_by_id: HashMap<&I, &DocumentRegion<I>> = regions
+            .as_slice()
+            .iter()
+            .map(|region| (region.id(), region))
+            .collect();
+        let mut ids: HashSet<&I> = blocks.iter().map(|block| block.id()).collect();
+        for block in anchored {
+            if regions_by_id.contains_key(block.id()) || !ids.insert(block.id()) {
                 return Err(AnchoredBlockError::DuplicateId);
             }
-            let region = regions
-                .as_slice()
-                .iter()
-                .find(|region| region.id() == block.position().node_id())
+            let region = regions_by_id
+                .get(block.position().node_id())
+                .copied()
                 .ok_or(AnchoredBlockError::InvalidPosition(
                     PositionError::NodeNotFound,
                 ))?;
@@ -1107,13 +1110,25 @@ impl<I: Clone + Eq> DocumentModel<I> {
         // Each anchored block goes before the first text or block item at or after
         // its offset, after anchored blocks at earlier offsets. Text and blocks
         // are in document order, so one merge places them all.
+        let region_ix: HashMap<&I, usize> = self
+            .regions
+            .as_slice()
+            .iter()
+            .enumerate()
+            .map(|(ix, region)| (region.id(), ix))
+            .collect();
         let mut anchored: Vec<_> = self
             .anchored_blocks
             .iter()
             .map(|block| {
                 let (source, display) = anchored_display_offset(
                     block,
-                    |position| self.resolve_position(position),
+                    |position| {
+                        self.resolve_position_in(
+                            position,
+                            region_ix.get(position.node_id()).copied(),
+                        )
+                    },
                     |offset, affinity| self.source_to_display(offset, affinity),
                     display_text,
                 )
@@ -1356,9 +1371,16 @@ impl<I: Clone + Eq> DocumentModel<I> {
     }
 
     fn resolve_position(&self, position: &DocumentPosition<I>) -> Result<usize, PositionError> {
-        let index = self
-            .region_index(position.node_id())
-            .ok_or(PositionError::NodeNotFound)?;
+        self.resolve_position_in(position, self.region_index(position.node_id()))
+    }
+
+    /// Resolves `position` in the region at `index`, the index of its node.
+    fn resolve_position_in(
+        &self,
+        position: &DocumentPosition<I>,
+        index: Option<usize>,
+    ) -> Result<usize, PositionError> {
+        let index = index.ok_or(PositionError::NodeNotFound)?;
         let range = self.regions.as_slice()[index].range();
         if position.offset() > range.len() {
             return Err(PositionError::NodeOffsetOutOfBounds {
@@ -2196,7 +2218,7 @@ impl ScrollbarHandle for DocumentScrollbarHandle {
     }
 }
 
-impl<I: Clone + Eq + 'static> DocumentState<I> {
+impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     pub fn new(
         text: impl Into<String>,
         regions: Vec<DocumentRegion<I>>,
@@ -5331,15 +5353,15 @@ impl<I: Clone + Eq + 'static> DocumentState<I> {
     }
 }
 
-impl<I: Clone + Eq + 'static> EventEmitter<DocumentEvent<I>> for DocumentState<I> {}
+impl<I: Clone + Eq + Hash + 'static> EventEmitter<DocumentEvent<I>> for DocumentState<I> {}
 
-impl<I: Clone + Eq + 'static> Focusable for DocumentState<I> {
+impl<I: Clone + Eq + Hash + 'static> Focusable for DocumentState<I> {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl<I: Clone + Eq + 'static> EntityInputHandler for DocumentState<I> {
+impl<I: Clone + Eq + Hash + 'static> EntityInputHandler for DocumentState<I> {
     fn text_for_range(
         &mut self,
         range_utf16: Range<usize>,
@@ -5522,7 +5544,7 @@ impl<I: Clone + Eq + 'static> EntityInputHandler for DocumentState<I> {
     }
 }
 
-impl<I: Clone + Eq + 'static> Render for DocumentState<I> {
+impl<I: Clone + Eq + Hash + 'static> Render for DocumentState<I> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let entity = cx.entity();
         if !self.scroll_handler_installed {
@@ -5938,6 +5960,49 @@ mod tests {
             ))
         );
         assert_eq!(model.anchored_blocks, vec![row]);
+    }
+
+    #[test]
+    fn anchored_rows_need_unique_ids_and_a_known_node() {
+        let mut model = DocumentModel::new(
+            "a\nb\n",
+            vec![
+                DocumentRegion::new("a", 0..2, EditPolicy::Readonly),
+                DocumentRegion::new("b", 2..4, EditPolicy::Readonly),
+            ],
+        )
+        .unwrap();
+        let row =
+            |id, node| AnchoredBlock::new(id, DocumentPosition::new(node, 0, Affinity::Before));
+        let mut present = |rows| {
+            model.set_rich_presentation_with_anchors(
+                DocumentProjection::identity(4),
+                Vec::new(),
+                rows,
+                DocumentStyles::default(),
+            )
+        };
+        let duplicate = Err(PresentationError::AnchoredBlocks(
+            AnchoredBlockError::DuplicateId,
+        ));
+        assert_eq!(present(vec![row("b", "a")]), duplicate);
+        assert_eq!(present(vec![row("x", "a"), row("x", "b")]), duplicate);
+        assert_eq!(
+            present(vec![row("x", "missing")]),
+            Err(PresentationError::AnchoredBlocks(
+                AnchoredBlockError::InvalidPosition(PositionError::NodeNotFound)
+            ))
+        );
+        assert_eq!(present(vec![row("y", "b"), row("x", "a")]), Ok(()));
+        let rows: Vec<_> = model
+            .layout_items(None)
+            .into_iter()
+            .filter_map(|item| match item {
+                DocumentLayoutItem::AnchoredBlock { id, source, .. } => Some((id, source)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows, vec![("x", 0), ("y", 2)]);
     }
 
     #[test]

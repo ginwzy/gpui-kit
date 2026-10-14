@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{hash::Hash, ops::Range};
 
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, Corners, CursorStyle, Edges, Element, ElementId,
@@ -37,7 +37,7 @@ pub struct DocumentElement<I: 'static> {
     content: AnyElement,
 }
 
-impl<I: Clone + Eq + 'static> DocumentElement<I> {
+impl<I: Clone + Eq + Hash + 'static> DocumentElement<I> {
     pub(super) fn new(state: gpui::Entity<DocumentState<I>>, content: AnyElement) -> Self {
         Self { state, content }
     }
@@ -67,7 +67,7 @@ impl<I: Clone + Eq + 'static> DocumentElement<I> {
     }
 }
 
-impl<I: Clone + Eq + 'static> IntoElement for DocumentElement<I> {
+impl<I: Clone + Eq + Hash + 'static> IntoElement for DocumentElement<I> {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -75,7 +75,7 @@ impl<I: Clone + Eq + 'static> IntoElement for DocumentElement<I> {
     }
 }
 
-impl<I: Clone + Eq + 'static> Element for DocumentElement<I> {
+impl<I: Clone + Eq + Hash + 'static> Element for DocumentElement<I> {
     type RequestLayoutState = ();
     type PrepaintState = Hitbox;
 
@@ -169,7 +169,7 @@ impl<I: 'static> DocumentTrailerElement<I> {
     }
 }
 
-impl<I: Clone + Eq + 'static> IntoElement for DocumentTrailerElement<I> {
+impl<I: Clone + Eq + Hash + 'static> IntoElement for DocumentTrailerElement<I> {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -177,7 +177,7 @@ impl<I: Clone + Eq + 'static> IntoElement for DocumentTrailerElement<I> {
     }
 }
 
-impl<I: Clone + Eq + 'static> Element for DocumentTrailerElement<I> {
+impl<I: Clone + Eq + Hash + 'static> Element for DocumentTrailerElement<I> {
     type RequestLayoutState = ();
     type PrepaintState = ();
 
@@ -258,7 +258,7 @@ impl<I: 'static> DocumentTextElement<I> {
     }
 }
 
-impl<I: Clone + Eq + 'static> IntoElement for DocumentTextElement<I> {
+impl<I: Clone + Eq + Hash + 'static> IntoElement for DocumentTextElement<I> {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -266,7 +266,7 @@ impl<I: Clone + Eq + 'static> IntoElement for DocumentTextElement<I> {
     }
 }
 
-impl<I: Clone + Eq + 'static> Element for DocumentTextElement<I> {
+impl<I: Clone + Eq + Hash + 'static> Element for DocumentTextElement<I> {
     type RequestLayoutState = ();
     type PrepaintState = ();
 
@@ -400,7 +400,7 @@ impl<I: 'static> DocumentBlockElement<I> {
     }
 }
 
-impl<I: Clone + Eq + 'static> IntoElement for DocumentBlockElement<I> {
+impl<I: Clone + Eq + Hash + 'static> IntoElement for DocumentBlockElement<I> {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -408,7 +408,7 @@ impl<I: Clone + Eq + 'static> IntoElement for DocumentBlockElement<I> {
     }
 }
 
-impl<I: Clone + Eq + 'static> Element for DocumentBlockElement<I> {
+impl<I: Clone + Eq + Hash + 'static> Element for DocumentBlockElement<I> {
     type RequestLayoutState = ();
     type PrepaintState = ();
 
@@ -566,7 +566,7 @@ impl<I: 'static> DocumentRowCheck<I> {
 }
 
 #[cfg(debug_assertions)]
-impl<I: Clone + Eq + 'static> IntoElement for DocumentRowCheck<I> {
+impl<I: Clone + Eq + Hash + 'static> IntoElement for DocumentRowCheck<I> {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -575,7 +575,7 @@ impl<I: Clone + Eq + 'static> IntoElement for DocumentRowCheck<I> {
 }
 
 #[cfg(debug_assertions)]
-impl<I: Clone + Eq + 'static> Element for DocumentRowCheck<I> {
+impl<I: Clone + Eq + Hash + 'static> Element for DocumentRowCheck<I> {
     type RequestLayoutState = ();
     type PrepaintState = ();
 

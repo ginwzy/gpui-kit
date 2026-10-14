@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, ops::Range};
+use std::{collections::HashSet, error::Error, fmt, hash::Hash, ops::Range};
 
 /// Mutation policy for one source range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -41,11 +41,12 @@ pub struct DocumentRegions<I> {
     regions: Vec<DocumentRegion<I>>,
 }
 
-impl<I: Eq> DocumentRegions<I> {
+impl<I: Eq + Hash> DocumentRegions<I> {
     pub fn new(
         mut regions: Vec<DocumentRegion<I>>,
         source_len: usize,
     ) -> Result<Self, RegionError> {
+        let mut ids = HashSet::with_capacity(regions.len());
         for (index, region) in regions.iter().enumerate() {
             if region.range.start > region.range.end {
                 return Err(RegionError::InvalidRange { index });
@@ -53,7 +54,7 @@ impl<I: Eq> DocumentRegions<I> {
             if region.range.end > source_len {
                 return Err(RegionError::OutOfBounds { index, source_len });
             }
-            if regions[..index].iter().any(|other| other.id == region.id) {
+            if !ids.insert(&region.id) {
                 return Err(RegionError::DuplicateId { index });
             }
         }
@@ -76,7 +77,9 @@ impl<I: Eq> DocumentRegions<I> {
 
         Ok(Self { regions })
     }
+}
 
+impl<I> DocumentRegions<I> {
     pub fn as_slice(&self) -> &[DocumentRegion<I>] {
         &self.regions
     }
