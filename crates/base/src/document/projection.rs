@@ -433,16 +433,29 @@ impl ProjectionMap {
     }
 
     pub(crate) fn display_to_source(&self, offset: usize, affinity: Affinity) -> Option<usize> {
+        self.display_to_source_from(offset, affinity, &mut 0)
+    }
+
+    /// `display_to_source`, searching the runs forward from `hint` and leaving
+    /// there the run it starts from. Ascending offsets each cost O(log distance).
+    pub(crate) fn display_to_source_from(
+        &self,
+        offset: usize,
+        affinity: Affinity,
+        hint: &mut usize,
+    ) -> Option<usize> {
         if offset > self.display.len() {
             return None;
         }
         if offset == self.display.len() {
             return Some(self.source_len);
         }
-        let start = self.runs.partition_point(|run| {
+        let start = partition_from(&self.runs, *hint, |run| {
             run.display.end < offset || (run.display.end == offset && !run.display.is_empty())
         });
-        let end = self.runs.partition_point(|run| run.display.start <= offset);
+        *hint = start;
+        // Runs before `start` end at or before `offset`, so they also start there.
+        let end = partition_from(&self.runs, start, |run| run.display.start <= offset);
         let mut runs = self.runs[start..end].iter().filter(|run| {
             run.display.start <= offset
                 && (offset < run.display.end
@@ -473,6 +486,22 @@ impl ProjectionMap {
             }
         }
     }
+}
+
+/// `items.partition_point(pred)`, galloping forward from `hint` unless the
+/// answer lies before it. Ascending queries each cost O(log distance).
+pub(super) fn partition_from<T>(items: &[T], hint: usize, pred: impl Fn(&T) -> bool) -> usize {
+    let mut low = hint.min(items.len());
+    if low > 0 && !pred(&items[low - 1]) {
+        return items.partition_point(pred);
+    }
+    let mut step = 1;
+    while low + step <= items.len() && pred(&items[low + step - 1]) {
+        low += step;
+        step *= 2;
+    }
+    let high = (low + step).min(items.len());
+    low + items[low..high].partition_point(pred)
 }
 
 fn mapped_source_to_display(
@@ -525,11 +554,11 @@ fn mapped_display_to_source(
     affinity: Affinity,
 ) -> Option<usize> {
     let local = offset.saturating_sub(display_start);
-    let entry = mapping.iter().find(|entry| {
-        entry.display.start <= local
-            && (local < entry.display.end
-                || local == entry.display.end && affinity == Affinity::Before)
-    })?;
+    // Entries tile the replacement in order, so the first one that reaches
+    // `local` also starts at or before it.
+    let entry = mapping.get(mapping.partition_point(|entry| {
+        entry.display.end < local || (entry.display.end == local && affinity == Affinity::After)
+    }))?;
     if entry.source.len() == entry.display.len() {
         Some(entry.source.start + (local - entry.display.start).min(entry.source.len()))
     } else if local == entry.display.start || affinity == Affinity::Before {
@@ -703,6 +732,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn partition_from_any_hint_matches_partition_point() {
+        for len in 0..40 {
+            let items: Vec<usize> = (0..len).collect();
+            for split in 0..=len {
+                for hint in 0..=len + 2 {
+                    assert_eq!(
+                        partition_from(&items, hint, |item| *item < split),
+                        split,
+                        "len {len} split {split} hint {hint}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resumed_display_lookups_match_fresh_ones() {
+        let source = Rope::from("ab**中文 &amp;**cd\u{fffc}ef");
+        let len = source.len();
+        let projection = DocumentProjection::new(
+            len,
+            vec![
+                ProjectionSpan::mapped(
+                    2..18,
+                    "中文 &",
+                    vec![
+                        ProjectionMapping::new(0..7, 4..11),
+                        ProjectionMapping::new(7..8, 11..16),
+                    ],
+                ),
+                ProjectionSpan::hide(20..23),
+            ],
+        )
+        .unwrap();
+        let map = ProjectionMap::new(&source, &projection);
+        let mut hint = 0;
+        for offset in 0..=map.display_text().len() + 1 {
+            for affinity in [Affinity::After, Affinity::Before] {
+                assert_eq!(
+                    map.display_to_source_from(offset, affinity, &mut hint),
+                    map.display_to_source(offset, affinity),
+                    "{offset} {affinity:?}"
+                );
+            }
+        }
+        // A hint past the answer falls back to a full search.
+        let mut hint = map.runs.len();
+        assert_eq!(
+            map.display_to_source_from(0, Affinity::After, &mut hint),
+            Some(0)
+        );
     }
 
     #[test]

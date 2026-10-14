@@ -473,20 +473,66 @@ pub(super) fn forget_touched_geometry<I: Clone + Eq + Hash>(
 ) {
     let (head, rest) = items.split_at_mut(changed.start);
     let (changed, tail) = rest.split_at_mut(changed.len());
-    let touched: HashSet<&I> = replaced
-        .iter()
-        .chain(&*changed)
-        .filter_map(DocumentLayoutItem::node)
-        .collect();
-    if touched.is_empty() {
-        return;
-    }
-    let touches =
-        |item: &DocumentLayoutItem<I>| item.node().is_some_and(|node| touched.contains(node));
-    for item in head.iter_mut().rev().take_while(|item| touches(item)) {
+    let mut touched = TouchedNodes::new(replaced, changed);
+    for item in head.iter_mut().rev() {
+        if !item.node().is_some_and(|node| touched.contains(node)) {
+            break;
+        }
         item.forget_geometry();
     }
-    for item in tail.iter_mut().take_while(|item| touches(item)) {
+    for item in tail.iter_mut() {
+        if !item.node().is_some_and(|node| touched.contains(node)) {
+            break;
+        }
         item.forget_geometry();
+    }
+}
+
+/// The nodes of a replaced fragment and its replacement. Only the nodes next
+/// to the change are asked about, usually one or two, so each is found by a
+/// scan; indexing every node of a large fragment would cost more.
+struct TouchedNodes<'a, I> {
+    replaced: &'a [DocumentLayoutItem<I>],
+    changed: &'a [DocumentLayoutItem<I>],
+    last: Option<(I, bool)>,
+    scans: usize,
+    index: Option<HashSet<&'a I>>,
+}
+
+impl<'a, I: Clone + Eq + Hash> TouchedNodes<'a, I> {
+    const SCANS: usize = 4;
+
+    fn new(replaced: &'a [DocumentLayoutItem<I>], changed: &'a [DocumentLayoutItem<I>]) -> Self {
+        Self {
+            replaced,
+            changed,
+            last: None,
+            scans: 0,
+            index: None,
+        }
+    }
+
+    fn contains(&mut self, node: &I) -> bool {
+        if let Some((last, found)) = &self.last
+            && last == node
+        {
+            return *found;
+        }
+        let mut nodes = self
+            .replaced
+            .iter()
+            .chain(self.changed)
+            .filter_map(DocumentLayoutItem::node);
+        let found = if let Some(index) = &self.index {
+            index.contains(node)
+        } else if self.scans < Self::SCANS {
+            self.scans += 1;
+            nodes.any(|other| other == node)
+        } else {
+            let index = self.index.insert(nodes.collect());
+            index.contains(node)
+        };
+        self.last = Some((node.clone(), found));
+        found
     }
 }

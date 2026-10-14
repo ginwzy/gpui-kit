@@ -41,7 +41,7 @@ use super::{
     block::{transform_blocks, validate_blocks},
     element::DocumentChild,
     position::{shift_offset, transform_offset},
-    projection::ProjectionMap,
+    projection::{ProjectionMap, partition_from},
 };
 
 const DOCUMENT_INPUT_CONTEXT: &str = "Input";
@@ -722,6 +722,16 @@ impl<I: Clone + Eq + Hash> DocumentUndoManager<I> {
     }
 }
 
+/// Where the lookups for the previous layout item ended. Items built in
+/// document order resume there instead of searching from the start.
+#[derive(Clone, Copy, Default)]
+struct LayoutCursor {
+    run: usize,
+    region: usize,
+    paragraph: usize,
+    inline: usize,
+}
+
 #[derive(Clone)]
 struct DocumentModel<I> {
     text: Rope,
@@ -1050,6 +1060,7 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         let mut display_cursor = 0;
         let mut source_cursor = 0;
         let mut items = Vec::new();
+        let mut cursor = LayoutCursor::default();
         let mut blocks = self.blocks.iter().peekable();
         for (region_ix, region) in self.regions.as_slice().iter().enumerate() {
             let block = blocks
@@ -1071,11 +1082,11 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
                 .expect("validated block source must map to display");
             self.push_text_layout_items(
                 &mut items,
-                display_text,
                 display_cursor..display_start,
                 source_cursor..source.start,
                 false,
                 rows,
+                &mut cursor,
             );
             if let Some(block) = block {
                 items.push(DocumentLayoutItem::Block {
@@ -1086,8 +1097,14 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
                 blocks.next();
             } else {
                 let empty = display_start..display_start;
-                let mut item =
-                    self.text_layout_item(display_text, empty.clone(), source.clone(), empty, 0);
+                let mut item = self.text_layout_item_from(
+                    display_text,
+                    empty.clone(),
+                    source.clone(),
+                    empty,
+                    0,
+                    &mut cursor,
+                );
                 if let DocumentLayoutItem::Text { node_id, .. } = &mut item {
                     *node_id = Some(region.id().clone());
                 }
@@ -1098,11 +1115,11 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         }
         self.push_text_layout_items(
             &mut items,
-            display_text,
             display_cursor..display_text.len(),
             source_cursor..self.text.len(),
             true,
             rows,
+            &mut cursor,
         );
         if self.anchored_blocks.is_empty() {
             return items;
@@ -1172,16 +1189,24 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
     fn push_text_layout_items(
         &self,
         items: &mut Vec<DocumentLayoutItem<I>>,
-        display_text: &str,
         range: Range<usize>,
         source: Range<usize>,
         include_empty_tail: bool,
         rows: Option<&text_rows::RowCache>,
+        cursor: &mut LayoutCursor,
     ) {
+        let display_text = self.display_text();
         let mut push_line = |line: Range<usize>| {
             // Every line is keyed, so turning text rows on keeps these items.
-            let mut whole =
-                self.text_layout_item(display_text, line.clone(), source.clone(), line.clone(), 0);
+            let line_cursor = *cursor;
+            let mut whole = self.text_layout_item_from(
+                display_text,
+                line.clone(),
+                source.clone(),
+                line.clone(),
+                0,
+                cursor,
+            );
             let line_key = text_rows::line_key(&whole);
             let starts = rows.map_or(&[][..], |rows| rows.row_starts(line_key));
             if starts.is_empty() {
@@ -1191,13 +1216,16 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
                 items.push(whole);
                 return;
             }
+            // The rows start where the line did.
+            *cursor = line_cursor;
             for row in text_rows::rows_of_line(line.clone(), starts) {
-                items.push(self.text_layout_item(
+                items.push(self.text_layout_item_from(
                     display_text,
                     row,
                     source.clone(),
                     line.clone(),
                     line_key,
+                    cursor,
                 ));
             }
         };
@@ -1222,24 +1250,50 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         line: Range<usize>,
         line_key: u64,
     ) -> DocumentLayoutItem<I> {
+        self.text_layout_item_from(
+            display_text,
+            display,
+            segment,
+            line,
+            line_key,
+            &mut LayoutCursor::default(),
+        )
+    }
+
+    /// `text_layout_item`, with its lookups resuming at `cursor`. A pass over
+    /// lines in document order then avoids a full search per line.
+    fn text_layout_item_from(
+        &self,
+        display_text: &str,
+        display: Range<usize>,
+        segment: Range<usize>,
+        line: Range<usize>,
+        line_key: u64,
+        cursor: &mut LayoutCursor,
+    ) -> DocumentLayoutItem<I> {
         // A hidden object shares display offsets with both adjacent text runs.
         // Keep the source extent so caret ownership does not cross that object.
         let source_start = self
-            .display_to_source(display.start, Affinity::After)
+            .projection_map
+            .display_to_source_from(display.start, Affinity::After, &mut cursor.run)
             .unwrap_or(segment.end)
             .clamp(segment.start, segment.end);
         let source_end = self
-            .display_to_source(display.end, Affinity::Before)
+            .projection_map
+            .display_to_source_from(display.end, Affinity::Before, &mut cursor.run)
             .unwrap_or(segment.end)
             .clamp(source_start, segment.end);
         let source = source_start..source_end;
-        let node_id = self.node_after(source_start);
+        let node_id = self.node_after_from(source_start, &mut cursor.region);
         // Source styles are ordered and nonoverlapping; projection preserves
         // endpoint order (but can collapse or overlap display ranges). Find the
         // first end that can contain this line, then check its start. Keep equal
         // ends: an empty line at a shared boundary belongs to the first match.
         let paragraphs = &self.resolved_styles.paragraphs;
-        let from = paragraphs.partition_point(|style| style.display.end < display.end);
+        let from = partition_from(paragraphs, cursor.paragraph, |style| {
+            style.display.end < display.end
+        });
+        cursor.paragraph = from;
         let paragraph = paragraphs
             .get(from)
             .filter(|style| style.display.start <= display.start);
@@ -1255,7 +1309,10 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         // Resolved inline endpoints are monotonic. A line only
         // needs its intersecting styles, even in a document with many matches.
         let inline = &self.resolved_styles.inline;
-        let from = inline.partition_point(|style| style.display.end <= display.start);
+        let from = partition_from(inline, cursor.inline, |style| {
+            style.display.end <= display.start
+        });
+        cursor.inline = from;
         for inline in inline[from..]
             .iter()
             .take_while(|style| style.display.start < display.end)
@@ -1319,10 +1376,11 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
     /// The node a layout item starting at `offset` belongs to: the last region
     /// containing it, as [`Self::position_for_offset`] with `After` finds. Item
     /// starts are character boundaries, and regions are in order.
-    fn node_after(&self, offset: usize) -> Option<I> {
+    /// The node at `offset`, searching the regions forward from `hint`.
+    fn node_after_from(&self, offset: usize, hint: &mut usize) -> Option<I> {
         let regions = self.regions.as_slice();
-        let found = regions
-            .partition_point(|region| region.range().start <= offset)
+        *hint = partition_from(regions, *hint, |region| region.range().start <= offset);
+        let found = hint
             .checked_sub(1)
             .map(|ix| &regions[ix])
             .filter(|region| region.range().contains_inclusive(offset))
