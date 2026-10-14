@@ -49,6 +49,9 @@ mod host;
 mod inline_styles;
 mod text_rows;
 
+#[cfg(test)]
+mod style_tests;
+
 pub use text_rows::{TextRows, TextRowsError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1128,10 +1131,15 @@ impl<I: Clone + Eq> DocumentModel<I> {
             .clamp(source_start, segment.end);
         let source = source_start..source_end;
         let node_id = self.node_after(source_start);
-        let paragraph =
-            self.resolved_styles.paragraphs.iter().find(|style| {
-                style.display.start <= display.start && display.end <= style.display.end
-            });
+        // Source styles are ordered and nonoverlapping; projection preserves
+        // endpoint order (but can collapse or overlap display ranges). Find the
+        // first end that can contain this line, then check its start. Keep equal
+        // ends: an empty line at a shared boundary belongs to the first match.
+        let paragraphs = &self.resolved_styles.paragraphs;
+        let from = paragraphs.partition_point(|style| style.display.end < display.end);
+        let paragraph = paragraphs
+            .get(from)
+            .filter(|style| style.display.start <= display.start);
         let text_style = paragraph.map(|style| style.text_style.clone());
         let indent = paragraph.and_then(|style| {
             Some(DocumentTextIndent {
@@ -1831,7 +1839,15 @@ fn validate_style_ranges<I: Eq>(
         if range.start < previous_end {
             return Err(DocumentStyleError::Overlap(range));
         }
-        for region in regions.as_slice() {
+        // Canonical regions have monotonic starts and ends. These strict bounds
+        // preserve the existing intersection predicate even for an empty style
+        // inside a region, or an empty region inside a style.
+        let regions = regions.as_slice();
+        let from = regions.partition_point(|region| region.range().end <= range.start);
+        for region in regions[from..]
+            .iter()
+            .take_while(|region| region.range().start < range.end)
+        {
             let region_range = region.range();
             if range.start < region_range.end && region_range.start < range.end {
                 match region.policy() {
