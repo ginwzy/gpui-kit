@@ -663,6 +663,49 @@ mod tests {
     }
 
     #[test]
+    fn one_verbatim_run_maps_like_its_scalars() {
+        let source = Rope::from("x**重复 &amp;**y");
+        let map = |mapping| {
+            let projection = DocumentProjection::new(
+                source.len(),
+                vec![ProjectionSpan::mapped(
+                    1..source.len() - 1,
+                    "重复 &",
+                    mapping,
+                )],
+            )
+            .unwrap();
+            ProjectionMap::new(&source, &projection)
+        };
+        let scalars = map(vec![
+            ProjectionMapping::new(0..3, 3..6),
+            ProjectionMapping::new(3..6, 6..9),
+            ProjectionMapping::new(6..7, 9..10),
+            ProjectionMapping::new(7..8, 10..15),
+        ]);
+        let runs = map(vec![
+            ProjectionMapping::new(0..7, 3..10),
+            ProjectionMapping::new(7..8, 10..15),
+        ]);
+        for affinity in [Affinity::Before, Affinity::After] {
+            for offset in 0..=source.len() {
+                assert_eq!(
+                    runs.source_to_display(offset, affinity),
+                    scalars.source_to_display(offset, affinity),
+                    "source {offset} {affinity:?}"
+                );
+            }
+            for offset in 0..=runs.display_text().len() {
+                assert_eq!(
+                    runs.display_to_source(offset, affinity),
+                    scalars.display_to_source(offset, affinity),
+                    "display {offset} {affinity:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn invalid_spans_are_rejected() {
         assert_eq!(
             DocumentProjection::new(4, vec![ProjectionSpan::hide(2..2)]),
