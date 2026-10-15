@@ -64,6 +64,57 @@ impl DocumentStyles {
         self.paragraphs.is_empty() && self.inline.is_empty()
     }
 
+    /// Follows `edits` inside editable source `region`: styles at its edges
+    /// or inside it transform, later styles move by `delta`. Returns the
+    /// paragraph and inline styles that transformed, by index.
+    pub(super) fn edit_region(
+        &mut self,
+        region: Range<usize>,
+        edits: &[super::TextEdit],
+        delta: isize,
+    ) -> (Range<usize>, Range<usize>) {
+        let shift = |source: &mut Range<usize>| {
+            *source = source.start.checked_add_signed(delta).unwrap()
+                ..source.end.checked_add_signed(delta).unwrap();
+        };
+        let from = self
+            .paragraphs
+            .partition_point(|style| style.source.end < region.start);
+        let to = self
+            .paragraphs
+            .partition_point(|style| style.source.start <= region.end);
+        for style in &mut self.paragraphs[from..to] {
+            style.source = super::position::transform_source_range(style.source.clone(), edits);
+        }
+        for style in &mut self.paragraphs[to..] {
+            shift(&mut style.source);
+        }
+        let paragraphs = from..to;
+        let from = self
+            .inline
+            .partition_point(|style| style.source.end < region.start);
+        let to = self
+            .inline
+            .partition_point(|style| style.source.start <= region.end);
+        for style in &mut self.inline[to..] {
+            shift(&mut style.source);
+        }
+        // As in `transformed`, a replaced token's decoration goes with it.
+        let mut kept = from;
+        for ix in from..to {
+            let source =
+                super::position::transform_source_range(self.inline[ix].source.clone(), edits);
+            if !source.is_empty() {
+                self.inline[ix].source = source;
+                self.inline.swap(kept, ix);
+                kept += 1;
+            }
+        }
+        self.inline.drain(kept..to);
+        (paragraphs, from..kept)
+    }
+
+    #[cfg(debug_assertions)]
     pub(super) fn transformed(&self, edits: &[super::TextEdit]) -> Self {
         let mut styles = self.clone();
         for style in &mut styles.paragraphs {

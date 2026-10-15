@@ -226,43 +226,14 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         );
         self.model.reconcile_anchor_nodes();
         self.model.revision = self.model.revision.next();
-        for item in &mut self.layout_items[old_layout.end..] {
-            item.shift(source_delta, display_delta);
-        }
         // Keep matching measurements inside the changed fragment as well.
-        let old_items = &self.layout_items[old_layout.clone()];
-        let prefix = old_items
-            .iter()
-            .zip(&replacement)
-            .take_while(|(old, new)| old.same_layout_identity(new))
-            .count();
-        let suffix = old_items[prefix..]
-            .iter()
-            .rev()
-            .zip(replacement[prefix..].iter().rev())
-            .take_while(|(old, new)| old.same_layout_identity(new))
-            .count();
-        let changed = old_layout.start + prefix..old_layout.end - suffix;
-        let count = replacement.len() - prefix - suffix;
-        if !changed.is_empty() || count != 0 {
-            self.list_state.splice(changed, count);
-            self.list_state.clone().measure_all();
-        }
-        let split = replacement.len() - suffix;
-        let (head, tail) = replacement.split_at_mut(split);
-        for (old, new) in old_items[..prefix].iter().zip(head) {
-            new.keep_geometry(old);
-        }
-        for (old, new) in old_items[old_items.len() - suffix..].iter().zip(tail) {
-            new.keep_geometry(old);
-        }
-        forget_touched_geometry(
-            &old_items[prefix..old_items.len() - suffix],
-            &mut replacement,
-            prefix..split,
+        self.replace_layout_window(
+            old_layout,
+            replacement,
+            source_delta,
+            display_delta,
+            usize::MAX,
         );
-        self.layout_items.splice(old_layout, replacement);
-        self.layout_items_changed();
         if let Some(selection) = &selection {
             self.model.restore_active_selection(selection);
         }
@@ -275,11 +246,17 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         Ok(())
     }
 
-    fn layout_boundary(&self, region_ix: usize) -> usize {
+    pub(super) fn layout_boundary(&self, region_ix: usize) -> usize {
         let regions = self.model.regions.as_slice();
         let source = regions
             .get(region_ix)
             .map_or(self.model.text.len(), |region| region.range().start);
+        self.layout_boundary_at(region_ix, source)
+    }
+
+    /// The first layout item of node `region_ix` or a later node, among items
+    /// that place the node's start at `source`.
+    pub(super) fn layout_boundary_at(&self, region_ix: usize, source: usize) -> usize {
         let mut ix = self
             .layout_items
             .partition_point(|item| item.source_start() < source);
@@ -374,7 +351,7 @@ impl<I> DocumentLayoutItem<I> {
         }
     }
 
-    fn shift(&mut self, source_delta: isize, display_delta: isize) {
+    pub(super) fn shift(&mut self, source_delta: isize, display_delta: isize) {
         match self {
             Self::Text {
                 source,
@@ -535,4 +512,150 @@ impl<'a, I: Clone + Eq + Hash> TouchedNodes<'a, I> {
         self.last = Some((node.clone(), found));
         found
     }
+}
+
+/// What a host edit replacing source `edit` with `len` bytes leaves of the
+/// presentation around it, when only the display lines it touches can lay out
+/// differently: no block or anchored block is near, and every region, span and
+/// style is unchanged before the edit and moved with it after it.
+pub(super) struct HostEditPresentation<'a, I> {
+    pub(super) edit: Range<usize>,
+    pub(super) len: usize,
+    pub(super) regions: &'a [super::DocumentRegion<I>],
+    pub(super) projection: &'a super::DocumentProjection,
+    pub(super) blocks: &'a [DocumentBlock<I>],
+    pub(super) anchored_blocks: &'a [super::AnchoredBlock<I>],
+    pub(super) styles: &'a super::DocumentStyles,
+}
+
+impl<I: Eq> HostEditPresentation<'_, I> {
+    pub(super) fn keeps_lines_apart(&self, model: &DocumentModel<I>) -> bool {
+        let edit = &self.edit;
+        let delta = self.len as isize - edit.len() as isize;
+        let new_edit = edit.start..edit.start + self.len;
+        let touches = |source: Range<usize>, edit: &Range<usize>| {
+            source.start <= edit.end && edit.start <= source.end
+        };
+        // An offset before the edit stays, one after it moves, one inside
+        // stays inside.
+        let moved = |old: usize, new: usize| {
+            if old < edit.start {
+                new == old
+            } else if old > edit.end {
+                new as isize == old as isize + delta
+            } else {
+                new_edit.start <= new && new <= new_edit.end
+            }
+        };
+        let old_regions = model.regions.as_slice();
+        if old_regions.len() != self.regions.len()
+            || !old_regions.iter().zip(self.regions).all(|(old, new)| {
+                old.id() == new.id()
+                    && old.policy() == new.policy()
+                    && moved(old.range().start, new.range().start)
+                    && moved(old.range().end, new.range().end)
+                    // An empty editable region lays out a line of its own.
+                    && !(old.policy() == EditPolicy::Editable
+                        && (old.range().is_empty() || new.range().is_empty())
+                        && touches(new.range(), &new_edit))
+            })
+        {
+            return false;
+        }
+        if !model.anchored_blocks.is_empty()
+            || !self.anchored_blocks.is_empty()
+            || model
+                .blocks
+                .iter()
+                .any(|block| touches(block.source(), edit))
+            || self
+                .blocks
+                .iter()
+                .any(|block| touches(block.source(), &new_edit))
+            || !moved_with_edit(
+                &model.blocks,
+                self.blocks,
+                edit,
+                &new_edit,
+                |old, new, shift| {
+                    old.id() == new.id() && shifted(old.source(), shift) == new.source()
+                },
+                DocumentBlock::source,
+            )
+        {
+            return false;
+        }
+        moved_with_edit(
+            model.projection.spans(),
+            self.projection.spans(),
+            edit,
+            &new_edit,
+            |old, new, shift| {
+                let mut old = old.clone();
+                old.shift_source(shift);
+                old == *new
+            },
+            super::super::ProjectionSpan::source,
+        ) && moved_with_edit(
+            model.styles.paragraphs(),
+            self.styles.paragraphs(),
+            edit,
+            &new_edit,
+            |old, new, shift| {
+                shifted(old.source(), shift) == new.source()
+                    && old.text_style() == new.text_style()
+                    && old.hanging_marker() == new.hanging_marker()
+            },
+            super::DocumentParagraphStyle::source,
+        ) && moved_with_edit(
+            model.styles.inline(),
+            self.styles.inline(),
+            edit,
+            &new_edit,
+            |old, new, shift| {
+                shifted(old.source(), shift) == new.source()
+                    && old.highlight() == new.highlight()
+                    && old.font_family_override() == new.font_family_override()
+            },
+            super::DocumentInlineStyle::source,
+        )
+    }
+}
+
+/// Whether ordered, nonoverlapping `new` is `old` after an edit replaced
+/// `edit` with `new_edit`: items before the edit are the same, items after it
+/// moved, and items inside it may differ. An item across the edit fails.
+fn moved_with_edit<T>(
+    old: &[T],
+    new: &[T],
+    edit: &Range<usize>,
+    new_edit: &Range<usize>,
+    same: impl Fn(&T, &T, isize) -> bool,
+    source: impl Fn(&T) -> Range<usize>,
+) -> bool {
+    let delta = new_edit.len() as isize - edit.len() as isize;
+    let split = |items: &[T], edit: &Range<usize>| {
+        let before = items.partition_point(|item| source(item).end < edit.start);
+        let after = items.partition_point(|item| source(item).start <= edit.end);
+        let inside = items[before..after].iter().all(|item| {
+            let source = source(item);
+            edit.start <= source.start && source.end <= edit.end
+        });
+        inside.then_some((before, after))
+    };
+    let (Some((old_before, old_after)), Some((new_before, new_after))) =
+        (split(old, edit), split(new, new_edit))
+    else {
+        return false;
+    };
+    old_before == new_before
+        && old.len() - old_after == new.len() - new_after
+        && old[..old_before]
+            .iter()
+            .zip(&new[..new_before])
+            .all(|(old, new)| same(old, new, 0))
+        && old[old_after..]
+            .iter()
+            .zip(&new[new_after..])
+            .all(|(old, new)| same(old, new, delta))
 }

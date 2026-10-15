@@ -765,7 +765,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     }
 
     /// The text items of the display line that contains text item `ix`.
-    fn line_rows(&self, ix: usize) -> Range<usize> {
+    pub(super) fn line_rows(&self, ix: usize) -> Range<usize> {
         let DocumentLayoutItem::Text { line, node_id, .. } = &self.layout_items[ix] else {
             return ix..ix + 1;
         };

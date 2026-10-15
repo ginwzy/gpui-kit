@@ -125,14 +125,24 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
 
         self.capture_viewport_anchor();
         self.model.styles.inline.splice(from..to, styles);
-        self.model
+        let added = resolved.inline.len();
+        let mut restyled: Vec<Range<usize>> = self
+            .model
             .resolved_styles
             .inline
-            .splice(resolved_from..resolved_to, resolved.inline);
+            .splice(resolved_from..resolved_to, resolved.inline)
+            .map(|style| style.source)
+            .collect();
         if self.text_rows.is_some() {
-            // Rows depend on fonts, so a row's style can move its line's breaks.
-            let first = self.layout_item_for_source(source.start);
-            self.reconcile_layout_items_from(first);
+            // Only lines under an old or a new style change. Rows depend on
+            // fonts, so a restyled line can also move its breaks.
+            restyled.extend(
+                self.model.resolved_styles.inline[resolved_from..resolved_from + added]
+                    .iter()
+                    .map(|style| style.source.clone()),
+            );
+            restyled.sort_by_key(|range| range.start);
+            self.relayout_restyled_lines(&restyled);
             cx.emit(DocumentEvent::PresentationChanged);
             cx.notify();
             return Ok(true);

@@ -20,6 +20,12 @@ impl<I> DocumentBlock<I> {
     pub fn source(&self) -> Range<usize> {
         self.source.clone()
     }
+
+    /// Moves the block by `delta`, as an edit before it does.
+    pub(crate) fn shift(&mut self, delta: isize) {
+        let shift = |offset: usize| offset.checked_add_signed(delta).unwrap();
+        self.source = shift(self.source.start)..shift(self.source.end);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +126,7 @@ pub(crate) fn validate_blocks<I: Eq>(
     Ok(())
 }
 
+#[cfg(debug_assertions)]
 pub(crate) fn transform_blocks<I: Clone>(
     blocks: &[DocumentBlock<I>],
     edits: &[super::TextEdit],

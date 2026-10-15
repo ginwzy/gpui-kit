@@ -33,14 +33,14 @@ use crate::{
 
 use super::{
     Affinity, AnchorBias, AnchoredBlock, AnchoredBlockError, BlockError, DocumentAnchor,
-    DocumentBlock, DocumentElement, DocumentPosition, DocumentProjection, DocumentRegion,
-    DocumentRegions, DocumentRevision, DocumentSelection, DocumentStyleError, DocumentStyles,
-    EditDecision, EditOrigin, EditPolicy, EditTransaction, PositionError, ProjectionError,
-    RegionError, TextEdit, TransactionError,
+    DocumentBlock, DocumentElement, DocumentInlineStyle, DocumentParagraphStyle, DocumentPosition,
+    DocumentProjection, DocumentRegion, DocumentRegions, DocumentRevision, DocumentSelection,
+    DocumentStyleError, DocumentStyles, EditDecision, EditOrigin, EditPolicy, EditTransaction,
+    PositionError, ProjectionError, RegionError, TextEdit, TransactionError,
     anchored_block::display_offset as anchored_display_offset,
-    block::{transform_blocks, validate_blocks},
+    block::validate_blocks,
     element::DocumentChild,
-    position::{shift_offset, transform_offset},
+    position::{shift_offset, transform_offset, transform_source_range},
     projection::{ProjectionMap, partition_from},
 };
 
@@ -48,6 +48,7 @@ const DOCUMENT_INPUT_CONTEXT: &str = "Input";
 
 mod host;
 mod inline_styles;
+mod layout_window;
 mod text_rows;
 
 #[cfg(test)]
@@ -424,7 +425,7 @@ impl<I> StructureReplay<I> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct AnchorRecord<I> {
     offset: usize,
     bias: AnchorBias,
@@ -432,7 +433,7 @@ struct AnchorRecord<I> {
     affinity: Affinity,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct AnchorStore<I> {
     next_id: u64,
     anchors: BTreeMap<DocumentAnchor, AnchorRecord<I>>,
@@ -1056,13 +1057,66 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
     /// Layout items in document order. With `rows`, each line splits into the
     /// display rows last wrapped for its text and fonts; otherwise a line is one item.
     fn layout_items(&self, rows: Option<&text_rows::RowCache>) -> Vec<DocumentLayoutItem<I>> {
+        self.layout_items_of_nodes(0..self.regions.as_slice().len(), rows)
+    }
+
+    /// Whether the layout splits cleanly before node `ix`: its items start a
+    /// display line, after every item of earlier nodes. The document ends are
+    /// seams. Nodes between two seams lay out without the rest of the document.
+    fn is_layout_seam(&self, ix: usize) -> bool {
+        let regions = self.regions.as_slice();
+        if ix == 0 || ix >= regions.len() {
+            return true;
+        }
+        self.source_to_display(regions[ix].range().start, Affinity::Before)
+            .is_some_and(|display| {
+                display == 0 || self.display_text().as_bytes().get(display - 1) == Some(&b'\n')
+            })
+    }
+
+    /// The layout items of the nodes in `nodes`, which start and end at
+    /// layout seams ([`Self::is_layout_seam`]), as [`Self::layout_items`]
+    /// places them.
+    fn layout_items_of_nodes(
+        &self,
+        nodes: Range<usize>,
+        rows: Option<&text_rows::RowCache>,
+    ) -> Vec<DocumentLayoutItem<I>> {
+        let regions = self.regions.as_slice();
+        let all = nodes.start == 0 && nodes.end == regions.len();
         let display_text = self.display_text();
-        let mut display_cursor = 0;
-        let mut source_cursor = 0;
+        let (mut source_cursor, mut display_cursor) = match regions.get(nodes.start) {
+            Some(region) if nodes.start > 0 => {
+                let start = region.range().start;
+                let display = self
+                    .source_to_display(start, Affinity::Before)
+                    .expect("a node start maps to display");
+                (start, display)
+            }
+            _ => (0, 0),
+        };
+        let (source_end, display_end) = match regions.get(nodes.end) {
+            Some(region) => {
+                let end = region.range().start;
+                let display = self
+                    .source_to_display(end, Affinity::Before)
+                    .expect("a node start maps to display");
+                (end, display)
+            }
+            None => (self.text.len(), display_text.len()),
+        };
         let mut items = Vec::new();
         let mut cursor = LayoutCursor::default();
-        let mut blocks = self.blocks.iter().peekable();
-        for (region_ix, region) in self.regions.as_slice().iter().enumerate() {
+        // Blocks of earlier nodes start before the first node. Only empty nodes
+        // share a start, and they have no blocks.
+        let first_block = if nodes.start == 0 {
+            0
+        } else {
+            self.blocks
+                .partition_point(|block| block.source().start < source_cursor)
+        };
+        let mut blocks = self.blocks[first_block..].iter().peekable();
+        for (region_ix, region) in regions.iter().enumerate().take(nodes.end).skip(nodes.start) {
             let block = blocks
                 .peek()
                 .filter(|block| block.id() == region.id())
@@ -1113,11 +1167,13 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             display_cursor = display_end;
             source_cursor = source.end;
         }
+        // Only the document end has a line after its last line break; a seam
+        // starts the next node's first line.
         self.push_text_layout_items(
             &mut items,
-            display_cursor..display_text.len(),
-            source_cursor..self.text.len(),
-            true,
+            display_cursor..display_end,
+            source_cursor..source_end,
+            nodes.end == regions.len(),
             rows,
             &mut cursor,
         );
@@ -1126,17 +1182,18 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         }
         // Each anchored block goes before the first text or block item at or after
         // its offset, after anchored blocks at earlier offsets. Text and blocks
-        // are in document order, so one merge places them all.
-        let region_ix: HashMap<&I, usize> = self
-            .regions
-            .as_slice()
+        // are in document order, so one merge places them all. A block anchored
+        // at the end of the last node goes after every item here, which is
+        // before the first item of the next node.
+        let region_ix: HashMap<&I, usize> = regions[nodes.clone()]
             .iter()
-            .enumerate()
-            .map(|(ix, region)| (region.id(), ix))
+            .zip(nodes.clone())
+            .map(|(region, ix)| (region.id(), ix))
             .collect();
         let mut anchored: Vec<_> = self
             .anchored_blocks
             .iter()
+            .filter(|block| all || region_ix.contains_key(block.position().node_id()))
             .map(|block| {
                 let (source, display) = anchored_display_offset(
                     block,
@@ -1727,12 +1784,100 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         target: usize,
         transaction: &EditTransaction,
     ) -> Result<(), DocumentEditRejection> {
-        // Validate the resulting regions before mutating any text or anchors.
-        let mut net_delta = 0isize;
-        for edit in transaction.edits() {
-            let range = edit.range();
-            net_delta += edit.replacement().len() as isize - range.len() as isize;
+        let edits = transaction.edits();
+        let region = self.regions.as_slice()[target].range();
+        let delta = edits
+            .iter()
+            .map(|edit| edit.replacement().len() as isize - edit.range().len() as isize)
+            .sum::<isize>();
+        let end = shift_offset(region.end, delta);
+        let mut text = self.text.clone();
+        for edit in edits {
+            text.replace(edit.range(), edit.replacement());
         }
+        #[cfg(debug_assertions)]
+        let expected = self.edited_from_scratch(target, edits, &text);
+
+        // No projection span, block or paragraph style overlaps an editable
+        // region, and its text maps to display unchanged. Only its own text
+        // and inline styles change; everything after it moves by `delta`.
+        let old_text = self.text.slice(region.clone()).to_string();
+        self.projection_map
+            .replace_identity(region.clone(), &text.slice(region.start..end).to_string());
+        // A paragraph next to the region must still cover whole display lines.
+        let paragraphs = self.styles.paragraphs();
+        let touched = paragraphs.partition_point(|style| style.source().end < region.start)
+            ..paragraphs.partition_point(|style| style.source().start <= region.end);
+        let resolved = paragraphs[touched.clone()]
+            .iter()
+            .map(|style| {
+                let source = transform_source_range(style.source(), edits);
+                resolve_paragraph_style(&self.projection_map, source, style)
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let Ok(resolved) = resolved else {
+            self.projection_map
+                .replace_identity(region.start..end, &old_text);
+            #[cfg(debug_assertions)]
+            assert!(
+                expected.is_err(),
+                "a local edit rejects what a full one accepts"
+            );
+            return Err(DocumentEditRejection::InvalidPresentation);
+        };
+
+        for edit in edits {
+            self.anchors
+                .apply_edit(&edit.range(), edit.replacement().len());
+        }
+        self.text = text;
+        self.regions.resize(target, delta);
+        self.projection.edit_region(region.clone(), edits, delta);
+        let blocks = self
+            .blocks
+            .partition_point(|block| block.source().start < region.end);
+        for block in &mut self.blocks[blocks..] {
+            block.shift(delta);
+        }
+        let (_, inline) = self.styles.edit_region(region.clone(), edits, delta);
+        let shift = |range: &mut Range<usize>| {
+            *range = shift_offset(range.start, delta)..shift_offset(range.end, delta);
+        };
+        let paragraphs = &mut self.resolved_styles.paragraphs;
+        for style in &mut paragraphs[touched.end..] {
+            shift(&mut style.display);
+        }
+        paragraphs.splice(touched, resolved);
+        let resolved_inline = &mut self.resolved_styles.inline;
+        let from = resolved_inline.partition_point(|style| style.source.end < region.start);
+        let to = resolved_inline.partition_point(|style| style.source.start <= region.end);
+        for style in &mut resolved_inline[to..] {
+            shift(&mut style.source);
+            shift(&mut style.display);
+        }
+        let replacement = self.styles.inline[inline]
+            .iter()
+            .filter_map(|style| resolve_inline_style(&self.projection_map, style))
+            .collect::<Vec<_>>();
+        self.resolved_styles.inline.splice(from..to, replacement);
+        self.reconcile_anchor_nodes_in(region.start..end);
+        self.revision = self.revision.next();
+
+        #[cfg(debug_assertions)]
+        self.assert_edited_like(expected);
+        Ok(())
+    }
+
+    /// The model after an edit inside editable region `target`, derived
+    /// from the whole document, to check the local update against.
+    #[cfg(debug_assertions)]
+    fn edited_from_scratch(
+        &self,
+        target: usize,
+        edits: &[TextEdit],
+        text: &Rope,
+    ) -> Result<Self, DocumentEditRejection> {
+        let delta = text.len() as isize - self.text.len() as isize;
         let regions = self
             .regions
             .as_slice()
@@ -1741,44 +1886,65 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             .map(|(index, region)| {
                 let mut range = region.range();
                 if index == target {
-                    range.end = shift_offset(range.end, net_delta);
+                    range.end = shift_offset(range.end, delta);
                 } else if index > target {
-                    range.start = shift_offset(range.start, net_delta);
-                    range.end = shift_offset(range.end, net_delta);
+                    range.start = shift_offset(range.start, delta);
+                    range.end = shift_offset(range.end, delta);
                 }
                 DocumentRegion::new(region.id().clone(), range, region.policy())
             })
             .collect();
-        let regions = DocumentRegions::new(regions, shift_offset(self.text.len(), net_delta))
+        let regions = DocumentRegions::new(regions, text.len())
             .map_err(|_| DocumentEditRejection::InvalidRegions)?;
-        let mut text = self.text.clone();
-        for edit in transaction.edits() {
-            text.replace(edit.range(), edit.replacement());
-        }
-        let projection = self.projection.transformed(transaction.edits(), text.len());
-        let blocks = transform_blocks(&self.blocks, transaction.edits());
-        validate_projection(&projection, &regions, &text)
+        let projection = self.projection.transformed(edits, text.len());
+        let blocks = super::block::transform_blocks(&self.blocks, edits);
+        validate_projection(&projection, &regions, text)
             .map_err(|_| DocumentEditRejection::InvalidPresentation)?;
         validate_blocks(&blocks, &regions, &projection, text.len())
             .map_err(|_| DocumentEditRejection::InvalidPresentation)?;
-        let projection_map = ProjectionMap::new(&text, &projection);
-        let styles = self.styles.transformed(transaction.edits());
-        let resolved_styles = resolve_document_styles(&text, &regions, &projection_map, &styles)
+        let projection_map = ProjectionMap::new(text, &projection);
+        let styles = self.styles.transformed(edits);
+        let resolved_styles = resolve_document_styles(text, &regions, &projection_map, &styles)
             .map_err(|_| DocumentEditRejection::InvalidPresentation)?;
-        for edit in transaction.edits() {
-            self.anchors
+        let mut model = self.clone();
+        for edit in edits {
+            model
+                .anchors
                 .apply_edit(&edit.range(), edit.replacement().len());
         }
-        self.text = text;
-        self.projection = projection;
-        self.projection_map = projection_map;
-        self.blocks = blocks;
-        self.styles = styles;
-        self.resolved_styles = resolved_styles;
-        self.regions = regions;
-        self.reconcile_anchor_nodes();
-        self.revision = self.revision.next();
-        Ok(())
+        model.text = text.clone();
+        model.projection = projection;
+        model.projection_map = projection_map;
+        model.blocks = blocks;
+        model.styles = styles;
+        model.resolved_styles = resolved_styles;
+        model.regions = regions;
+        model.reconcile_anchor_nodes();
+        model.revision = model.revision.next();
+        Ok(model)
+    }
+
+    #[cfg(debug_assertions)]
+    fn assert_edited_like(&self, expected: Result<Self, DocumentEditRejection>) {
+        let expected = expected.expect("a local edit accepts what a full one rejects");
+        for (same, part) in [
+            (self.text == expected.text, "text"),
+            (self.regions == expected.regions, "regions"),
+            (self.projection == expected.projection, "projection"),
+            (
+                self.projection_map == expected.projection_map,
+                "projection map",
+            ),
+            (self.blocks == expected.blocks, "blocks"),
+            (self.styles == expected.styles, "styles"),
+            (
+                self.resolved_styles == expected.resolved_styles,
+                "resolved styles",
+            ),
+            (self.anchors == expected.anchors, "anchors"),
+        ] {
+            assert!(same, "a local edit differs from a full one in its {part}");
+        }
     }
 
     fn reconcile_anchor_nodes(&mut self) {
@@ -1795,6 +1961,36 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
                 } else {
                     record.node_id = None;
                 }
+            }
+        }
+    }
+
+    /// `reconcile_anchor_nodes` after an edit inside `edited`, the edited
+    /// region's new range: only anchors the edit moved onto it can have left
+    /// their node.
+    fn reconcile_anchor_nodes_in(&mut self, edited: Range<usize>) {
+        let regions = &self.regions;
+        for record in self.anchors.anchors.values_mut() {
+            if !edited.contains_inclusive(record.offset) {
+                continue;
+            }
+            let Some(id) = &record.node_id else {
+                continue;
+            };
+            let start = regions
+                .as_slice()
+                .partition_point(|region| region.range().end < record.offset);
+            let region = regions.as_slice()[start..]
+                .iter()
+                .take_while(|region| region.range().start <= record.offset)
+                .find(|region| region.id() == id)
+                .or_else(|| regions.as_slice().iter().find(|region| region.id() == id));
+            match region {
+                Some(region) => {
+                    let range = region.range();
+                    record.offset = record.offset.clamp(range.start, range.end);
+                }
+                None => record.node_id = None,
             }
         }
     }
@@ -1941,50 +2137,64 @@ fn resolve_document_styles<I: Eq>(
         true,
     )?;
 
-    let display_text = projection.display_text();
-    let mut paragraphs = Vec::with_capacity(styles.paragraphs().len());
-    for style in styles.paragraphs() {
-        let source = style.source();
-        let display = projection
-            .source_to_display(source.start, Affinity::Before)
-            .expect("validated style start must map")
-            ..projection
-                .source_to_display(source.end, Affinity::After)
-                .expect("validated style end must map");
-        let starts_line =
-            display.start == 0 || display_text.as_bytes().get(display.start - 1) == Some(&b'\n');
-        let ends_line = display.end == display_text.len()
-            || display.end > 0 && display_text.as_bytes().get(display.end - 1) == Some(&b'\n');
-        if !starts_line || !ends_line {
-            return Err(DocumentStyleError::ParagraphBoundary(source));
-        }
-        paragraphs.push(ResolvedParagraphStyle {
-            display,
-            text_style: style.text_style().clone(),
-            hanging_marker: style.hanging_marker().cloned(),
-        });
-    }
-
-    let mut inline = Vec::with_capacity(styles.inline().len());
-    for style in styles.inline() {
-        let source = style.source();
-        let display = projection
-            .source_to_display(source.start, Affinity::Before)
-            .expect("validated style start must map")
-            ..projection
-                .source_to_display(source.end, Affinity::After)
-                .expect("validated style end must map");
-        if display.is_empty() {
-            continue;
-        }
-        inline.push(ResolvedInlineStyle {
-            source,
-            display,
-            highlight: style.highlight(),
-            font_family: style.font_family_override().cloned(),
-        });
-    }
+    let paragraphs = styles
+        .paragraphs()
+        .iter()
+        .map(|style| resolve_paragraph_style(projection, style.source(), style))
+        .collect::<Result<_, _>>()?;
+    let inline = styles
+        .inline()
+        .iter()
+        .filter_map(|style| resolve_inline_style(projection, style))
+        .collect();
     Ok(ResolvedDocumentStyles { paragraphs, inline })
+}
+
+/// `style` placed at `source`, which must cover whole display lines.
+fn resolve_paragraph_style(
+    projection: &ProjectionMap,
+    source: Range<usize>,
+    style: &DocumentParagraphStyle,
+) -> Result<ResolvedParagraphStyle, DocumentStyleError> {
+    let display_text = projection.display_text();
+    let display = projection
+        .source_to_display(source.start, Affinity::Before)
+        .expect("validated style start must map")
+        ..projection
+            .source_to_display(source.end, Affinity::After)
+            .expect("validated style end must map");
+    let starts_line =
+        display.start == 0 || display_text.as_bytes().get(display.start - 1) == Some(&b'\n');
+    let ends_line = display.end == display_text.len()
+        || display.end > 0 && display_text.as_bytes().get(display.end - 1) == Some(&b'\n');
+    if !starts_line || !ends_line {
+        return Err(DocumentStyleError::ParagraphBoundary(source));
+    }
+    Ok(ResolvedParagraphStyle {
+        display,
+        text_style: style.text_style().clone(),
+        hanging_marker: style.hanging_marker().cloned(),
+    })
+}
+
+/// `style` in display text, unless its text is hidden.
+fn resolve_inline_style(
+    projection: &ProjectionMap,
+    style: &DocumentInlineStyle,
+) -> Option<ResolvedInlineStyle> {
+    let source = style.source();
+    let display = projection
+        .source_to_display(source.start, Affinity::Before)
+        .expect("validated style start must map")
+        ..projection
+            .source_to_display(source.end, Affinity::After)
+            .expect("validated style end must map");
+    (!display.is_empty()).then(|| ResolvedInlineStyle {
+        source,
+        display,
+        highlight: style.highlight(),
+        font_family: style.font_family_override().cloned(),
+    })
 }
 
 fn validate_style_ranges<I: Eq>(
@@ -2536,7 +2746,18 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         {
             return Err(StructureError::PrefixChanged);
         }
+        // An empty editable node keeps a line of its own for the caret.
+        let empty_line_changed = self
+            .model
+            .regions
+            .as_slice()
+            .iter()
+            .zip(regions.as_slice())
+            .any(|(old, new)| old.range().is_empty() && old.policy() != new.policy());
         self.model.regions = regions;
+        if empty_line_changed {
+            self.reconcile_presented_layout_items();
+        }
         self.undo.break_coalescing();
         cx.emit(DocumentEvent::PresentationChanged);
         cx.notify();
@@ -3342,8 +3563,19 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .map(|edit| self.layout_item_for_source(edit.range().start))
             .min()
             .unwrap_or(0);
+        // Only the edited node and its line neighbors lay out again.
+        let next_was_seam = target.is_some_and(|index| self.model.is_layout_seam(index + 1));
+        let lengths = (self.model.text.len(), self.model.display_text().len());
         match self.model.route_and_apply(&transaction, None) {
-            RoutingOutcome::Applied => self.reconcile_layout_items_from(first_changed_item),
+            RoutingOutcome::Applied => {
+                self.relayout_edited_node(
+                    target.expect("applied edits have a target region"),
+                    next_was_seam,
+                    self.model.text.len() as isize - lengths.0 as isize,
+                    self.model.display_text().len() as isize - lengths.1 as isize,
+                    first_changed_item,
+                );
+            }
             RoutingOutcome::Routed(region_id) => {
                 cx.emit(DocumentEvent::Routed(RoutedEdit {
                     region_id: region_id.clone(),
@@ -3642,6 +3874,23 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .map(|edit| self.layout_item_for_source(edit.range().start))
             .min()
             .unwrap_or(0);
+        // One edit that leaves the presentation around it alone changes only
+        // the display lines it touches.
+        let local_edit = match transaction.edits() {
+            [edit] => host::HostEditPresentation {
+                edit: edit.range(),
+                len: edit.replacement().len(),
+                regions: next_regions.as_slice(),
+                projection: &next_projection,
+                blocks: &next_blocks,
+                anchored_blocks: &next_anchored,
+                styles: &next_styles,
+            }
+            .keeps_lines_apart(&self.model)
+            .then(|| (edit.range(), edit.replacement().len())),
+            _ => None,
+        };
+        let display_len = self.model.display_text().len();
 
         self.capture_viewport_anchor();
         for edit in transaction.edits() {
@@ -3659,7 +3908,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.model.styles = next_styles;
         self.model.resolved_styles = next_resolved_styles;
         self.model.revision = self.model.revision.next();
-        self.reconcile_layout_items_from(first_changed_item);
+        let display_delta = self.model.display_text().len() as isize - display_len as isize;
+        if !local_edit.is_some_and(|(edit, len)| {
+            self.relayout_host_edit(edit, len, display_delta, first_changed_item)
+        }) {
+            self.reconcile_layout_items_from(first_changed_item);
+        }
         if let Some(selection) = &selection {
             self.model.restore_active_selection(selection);
         }

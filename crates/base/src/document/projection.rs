@@ -12,7 +12,7 @@ pub struct ProjectionSpan {
 }
 
 impl ProjectionSpan {
-    fn shift_source(&mut self, delta: isize) {
+    pub(crate) fn shift_source(&mut self, delta: isize) {
         self.source = shifted(self.source.clone(), delta);
         if let Some(mapping) = &mut self.mapping {
             for entry in mapping {
@@ -166,37 +166,62 @@ impl DocumentProjection {
         self.spans.is_empty()
     }
 
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn transformed(&self, edits: &[super::TextEdit], new_source_len: usize) -> Self {
-        // User edits cannot overlap projected source. Insertions at either edge
-        // belong to adjacent editable text, so spans and their mappings must not
-        // grow to consume them.
-        let spans = self
-            .spans
-            .iter()
-            .map(|span| {
-                let source = super::position::transform_source_range(span.source.clone(), edits);
-                let mapping = span.mapping.as_ref().map(|mapping| {
-                    mapping
-                        .iter()
-                        .map(|entry| {
-                            let source = super::position::transform_source_range(
-                                entry.source.clone(),
-                                edits,
-                            );
-                            ProjectionMapping::new(entry.display.clone(), source)
-                        })
-                        .collect()
-                });
-                ProjectionSpan {
-                    source,
-                    replacement: span.replacement.clone(),
-                    mapping,
-                }
-            })
-            .collect();
         Self {
             source_len: new_source_len,
-            spans,
+            spans: self
+                .spans
+                .iter()
+                .map(|span| span.transformed(edits))
+                .collect(),
+        }
+    }
+
+    /// Follows `edits` inside editable source `region`, which no span
+    /// overlaps: spans at its edges transform, later spans move by `delta`.
+    pub(crate) fn edit_region(
+        &mut self,
+        region: Range<usize>,
+        edits: &[super::TextEdit],
+        delta: isize,
+    ) {
+        let from = self
+            .spans
+            .partition_point(|span| span.source.end < region.start);
+        let to = self
+            .spans
+            .partition_point(|span| span.source.start <= region.end);
+        for span in &mut self.spans[from..to] {
+            *span = span.transformed(edits);
+        }
+        for span in &mut self.spans[to..] {
+            span.shift_source(delta);
+        }
+        self.source_len = self.source_len.checked_add_signed(delta).unwrap();
+    }
+}
+
+impl ProjectionSpan {
+    // User edits cannot overlap projected source. Insertions at either edge
+    // belong to adjacent editable text, so spans and their mappings must not
+    // grow to consume them.
+    fn transformed(&self, edits: &[super::TextEdit]) -> Self {
+        let source = super::position::transform_source_range(self.source.clone(), edits);
+        let mapping = self.mapping.as_ref().map(|mapping| {
+            mapping
+                .iter()
+                .map(|entry| {
+                    let source =
+                        super::position::transform_source_range(entry.source.clone(), edits);
+                    ProjectionMapping::new(entry.display.clone(), source)
+                })
+                .collect()
+        });
+        ProjectionSpan {
+            source,
+            replacement: self.replacement.clone(),
+            mapping,
         }
     }
 }
@@ -267,7 +292,7 @@ enum ProjectionRunKind {
     Replacement(Option<Vec<ProjectionMapping>>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct ProjectionRun {
     source: Range<usize>,
     display: Range<usize>,
@@ -290,7 +315,7 @@ impl ProjectionRun {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ProjectionMap {
     display: String,
     source_len: usize,
@@ -348,9 +373,56 @@ impl ProjectionMap {
         for run in &mut self.runs[to..] {
             run.shift(source_delta, display_delta);
         }
+        let inserted_len = inserted.len();
         self.runs.splice(from..to, inserted);
         self.display.replace_range(display, &replacement.display);
         self.source_len = self.source_len.checked_add_signed(source_delta).unwrap();
+        // Identity runs cut at the seams join again, as `new` builds them.
+        self.merge_identity_runs(from.saturating_sub(1)..from + inserted_len + 1);
+        // An empty document keeps one empty run.
+        if self.runs.is_empty() {
+            self.runs.push(ProjectionRun {
+                source: 0..0,
+                display: 0..0,
+                kind: ProjectionRunKind::Identity,
+            });
+        }
+    }
+
+    /// Joins adjacent identity runs among `runs`.
+    fn merge_identity_runs(&mut self, runs: Range<usize>) {
+        let mut ix = runs.start;
+        let mut end = runs.end;
+        while ix + 1 < self.runs.len() && ix < end {
+            let (left, right) = (&self.runs[ix], &self.runs[ix + 1]);
+            if left.kind == ProjectionRunKind::Identity
+                && right.kind == ProjectionRunKind::Identity
+                && left.source.end == right.source.start
+            {
+                let right = self.runs.remove(ix + 1);
+                self.runs[ix].source.end = right.source.end;
+                self.runs[ix].display.end = right.display.end;
+                end = end.saturating_sub(1);
+            } else {
+                ix += 1;
+            }
+        }
+    }
+
+    /// Replaces the text of `source`, which only identity runs cover, with
+    /// `text`.
+    pub(super) fn replace_identity(&mut self, source: Range<usize>, text: &str) {
+        let display = self
+            .source_to_display(source.start, Affinity::Before)
+            .expect("an edited range maps to display")
+            ..self
+                .source_to_display(source.end, Affinity::Before)
+                .expect("an edited range maps to display");
+        self.splice(
+            source,
+            display,
+            Self::new(&Rope::from(text), &DocumentProjection::identity(text.len())),
+        );
     }
 
     pub(crate) fn new(source: &Rope, projection: &DocumentProjection) -> Self {

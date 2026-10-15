@@ -88,6 +88,17 @@ impl<I> DocumentRegions<I> {
         self.regions
     }
 
+    /// Moves the end of region `index` and the regions after it by `delta`,
+    /// as an edit inside that region does.
+    pub(super) fn resize(&mut self, index: usize, delta: isize) {
+        let shift = |offset: usize| offset.checked_add_signed(delta).unwrap();
+        let region = &mut self.regions[index];
+        region.range.end = shift(region.range.end);
+        for region in &mut self.regions[index + 1..] {
+            region.range = shift(region.range.start)..shift(region.range.end);
+        }
+    }
+
     pub(super) fn splice(
         &mut self,
         range: Range<usize>,
