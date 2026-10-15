@@ -407,9 +407,11 @@ struct WrapResult {
     lines: Vec<WrappedLine>,
 }
 
-/// A line's wrap, for the line whose first row was item `item` when it began.
+/// A line's wrap, identified by its display range and text/font key. The old
+/// first-row index is only a lookup hint: another line's reflow can move it.
 struct WrappedLine {
     item: usize,
+    range: Range<usize>,
     key: u64,
     widths: (Pixels, Pixels),
     starts: Vec<u32>,
@@ -506,6 +508,7 @@ impl LineSpec {
     fn wrap(&self, text: &str, wrappers: &mut [LineWrapperHandle]) -> WrappedLine {
         WrappedLine {
             item: self.item,
+            range: self.range.clone(),
             key: self.key,
             widths: self.widths,
             starts: wrap_line(&text[self.range.clone()], &self.runs, wrappers, self.widths),
@@ -1044,6 +1047,22 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             settled.extend(now_settled);
             outdated.extend(now_outdated);
         }
+        // Both batches refer to the current layout. Freeze the background
+        // inputs before settling rows changes the indices of later lines.
+        let background = (scan_all
+            && !later.is_empty()
+            && self
+                .text_rows
+                .as_ref()
+                .is_some_and(|state| state.pending.is_none()))
+        .then(|| {
+            let mut fonts = FontTable::new(window);
+            let specs: Vec<_> = later
+                .iter()
+                .map(|line| self.line_spec(line, &mut fonts))
+                .collect();
+            (specs, fonts.wrappers(cx))
+        });
         self.settle_line_rows(settled, outdated, cx);
 
         let state = self.text_rows.as_mut().expect("text rows are on");
@@ -1053,15 +1072,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         }
         // Lines still stale wrap as they scroll into view.
         state.check = !later.is_empty();
-        if later.is_empty() || state.pending.is_some() {
+        let Some((specs, mut wrappers)) = background else {
             return;
-        }
-        let mut fonts = FontTable::new(window);
-        let specs: Vec<_> = later
-            .iter()
-            .map(|line| self.line_spec(line, &mut fonts))
-            .collect();
-        let mut wrappers = fonts.wrappers(cx);
+        };
         let text: Arc<str> = self.model.display_text().into();
         let task = cx.spawn(async move |this, cx| {
             let lines = cx
@@ -1100,19 +1113,23 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let mut settled = Vec::new();
         let mut outdated = Vec::new();
         for line in lines {
-            let Some(DocumentLayoutItem::Text {
-                display,
-                line: range,
-                line_key,
-                ..
-            }) = self.layout_items.get(line.item)
-            else {
-                continue;
+            let matches = |ix| {
+                matches!(self.layout_items.get(ix), Some(DocumentLayoutItem::Text {
+                    display, line: range, line_key, ..
+                }) if *range == line.range && *line_key == line.key && display.start == range.start)
             };
-            if *line_key != line.key || display.start != range.start {
-                continue;
-            }
-            let rows = self.line_rows(line.item);
+            let item = if matches(line.item) {
+                line.item
+            } else {
+                let Some(item) = self
+                    .items_around_display(line.range.start)
+                    .find(|ix| matches(*ix))
+                else {
+                    continue;
+                };
+                item
+            };
+            let rows = self.line_rows(item);
             let wrap = WrapKey {
                 generation,
                 widths: line.widths,
@@ -1925,28 +1942,36 @@ mod tests {
         let (document, mut cx, _) = framed_document(&paragraph, cx);
         draw(&mut cx);
         assert_declared_geometry(&document, &mut cx);
-        let before = line_rows(&document, "text", &mut cx).len();
+        let original = line_rows(&document, "text", &mut cx);
+        for (width, narrower) in [(150., true), (320., false), (160., true), (320., false)] {
+            let before = line_rows(&document, "text", &mut cx).len();
+            cx.simulate_resize(size(px(width), px(400.)));
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+            document.read_with(&cx, |document, _| {
+                assert!(document.text_rows.as_ref().unwrap().is_wrapping());
+            });
+            // In-frame reflow changes the indices of the lines still wrapping
+            // in the background, in both directions.
+            assert_declared_geometry(&document, &mut cx);
+            let partial = line_rows(&document, "text", &mut cx).len();
+            assert_ne!(partial, before);
+            assert_eq!(partial > before, narrower);
 
-        cx.simulate_resize(size(px(150.), px(400.)));
-        cx.update(|window, cx| {
-            window.refresh();
-            let _ = window.draw(cx);
-        });
-        document.read_with(&cx, |document, _| {
-            assert!(document.text_rows.as_ref().unwrap().is_wrapping());
-        });
-        // Rows in view took the new width; the rest keep their old rows, and
-        // the extent counts exactly the rows the document holds.
-        assert_declared_geometry(&document, &mut cx);
-        let partial = line_rows(&document, "text", &mut cx).len();
-        assert!(partial > before);
-
-        draw(&mut cx);
-        draw(&mut cx);
-        document.read_with(&cx, |document, _| {
-            assert!(!document.text_rows.as_ref().unwrap().is_wrapping());
-        });
-        assert_declared_geometry(&document, &mut cx);
-        assert!(line_rows(&document, "text", &mut cx).len() > partial);
+            draw(&mut cx);
+            draw(&mut cx);
+            document.read_with(&cx, |document, _| {
+                assert!(!document.text_rows.as_ref().unwrap().is_wrapping());
+            });
+            assert_declared_geometry(&document, &mut cx);
+            let after = line_rows(&document, "text", &mut cx);
+            assert_ne!(after.len(), partial);
+            assert_eq!(after.len() > partial, narrower);
+            if !narrower {
+                assert_eq!(after, original);
+            }
+        }
     }
 }
