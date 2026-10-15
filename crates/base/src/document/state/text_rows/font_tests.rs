@@ -181,6 +181,7 @@ fn item(
         line_key: 0,
         frame: Derived::default(),
         wrapped: Derived::default(),
+        prepared: Derived::default(),
     }
 }
 
@@ -272,7 +273,7 @@ fn paint_restyles_keep_wrapped_geometry_and_refresh_presentation(cx: &mut TestAp
         doc.set_selection(0..6, false, cx);
     });
     cx.simulate_resize(gpui::size(px(320.), px(400.)));
-    super::tests::draw(&mut cx);
+    super::tests::settle_rows(&document, &mut cx);
     let before = document.read_with(&cx, |doc, _| doc.layout_items.clone());
     assert!(before.len() > 10);
     for styles in [
@@ -296,7 +297,7 @@ fn paint_restyles_keep_wrapped_geometry_and_refresh_presentation(cx: &mut TestAp
             doc.set_node_inline_styles(&"source", styles.clone(), cx)
                 .unwrap();
             assert_eq!(doc.layout_items.len(), before.len());
-            for (old, new) in before.iter().zip(&doc.layout_items) {
+            for (old, new) in before.iter().zip(doc.layout_items.iter()) {
                 if let (
                     DocumentLayoutItem::Text {
                         display: a,
@@ -325,7 +326,7 @@ fn paint_restyles_keep_wrapped_geometry_and_refresh_presentation(cx: &mut TestAp
                 styles.is_empty()
             );
         });
-        super::tests::draw(&mut cx);
+        super::tests::settle_rows(&document, &mut cx);
         super::tests::assert_declared_geometry(&document, &mut cx);
     }
     document.update(&mut cx, |doc, cx| {
@@ -335,7 +336,7 @@ fn paint_restyles_keep_wrapped_geometry_and_refresh_presentation(cx: &mut TestAp
         assert_ne!(line_key(&doc.layout_items[0]), line_key(&before[0]));
         assert!(matches!(&doc.layout_items[0], DocumentLayoutItem::Text { wrapped, .. } if wrapped.0.is_none()));
     });
-    super::tests::draw(&mut cx);
+    super::tests::settle_rows(&document, &mut cx);
     cx.update(|window, cx| {
         document.read_with(cx, |doc, _| {
             let mut fonts = FontTable::new(window);
@@ -358,11 +359,11 @@ fn paint_restyles_keep_wrapped_geometry_and_refresh_presentation(cx: &mut TestAp
     });
     let wide = document.read_with(&cx, |doc, _| doc.layout_items.len());
     cx.simulate_resize(gpui::size(px(160.), px(400.)));
-    super::tests::draw(&mut cx);
+    super::tests::settle_rows(&document, &mut cx);
     let narrow = document.read_with(&cx, |doc, _| doc.layout_items.len());
     assert!(narrow > wide);
     cx.update(|window, _| window.set_rem_size(px(24.)));
-    super::tests::draw(&mut cx);
+    super::tests::settle_rows(&document, &mut cx);
     document.read_with(&cx, |doc, _| {
         assert!(doc.layout_items.len() > narrow);
         assert_eq!(doc.text(), text);

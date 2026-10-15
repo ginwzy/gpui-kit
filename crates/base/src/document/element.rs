@@ -18,6 +18,7 @@ pub(super) enum DocumentChild<I: 'static> {
         item_ix: usize,
         display: Range<usize>,
         text: SharedString,
+        prepared: Option<std::sync::Arc<gpui::PreparedLine>>,
         presentation: Box<DocumentTextPresentation>,
     },
     Block {
@@ -52,7 +53,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentElement<I> {
                 display,
                 text,
                 presentation,
-            } => DocumentTextElement::new(state, item_ix, display, text, *presentation)
+                prepared,
+            } => DocumentTextElement::new(state, item_ix, display, text, *presentation, prepared)
                 .into_any_element(),
             DocumentChild::Block {
                 item_ix,
@@ -113,6 +115,7 @@ impl<I: Clone + Eq + Hash + 'static> Element for DocumentElement<I> {
         });
         self.content.prepaint(window, cx);
         self.state.update(cx, |state, cx| {
+            state.finish_row_images(cx);
             state.extend_pointer_selection(cx);
         });
         hitbox
@@ -235,6 +238,7 @@ struct DocumentTextElement<I: 'static> {
     text: StyledText,
     text_style: Option<TextStyleRefinement>,
     indent: Option<DocumentTextIndent>,
+    image: Option<std::sync::Arc<gpui::PreparedLineImage>>,
 }
 
 impl<I: 'static> DocumentTextElement<I> {
@@ -244,16 +248,22 @@ impl<I: 'static> DocumentTextElement<I> {
         display: Range<usize>,
         text: SharedString,
         presentation: DocumentTextPresentation,
+        prepared: Option<std::sync::Arc<gpui::PreparedLine>>,
     ) -> Self {
+        let mut text = StyledText::new(text)
+            .with_highlights(presentation.highlights)
+            .with_font_family_overrides(presentation.font_family_overrides);
+        if let Some(prepared) = prepared {
+            text = text.with_prepared_line(prepared);
+        }
         Self {
             state,
             item_ix,
             display,
-            text: StyledText::new(text)
-                .with_highlights(presentation.highlights)
-                .with_font_family_overrides(presentation.font_family_overrides),
+            text,
             text_style: presentation.text_style,
             indent: presentation.indent,
+            image: None,
         }
     }
 }
@@ -327,6 +337,11 @@ impl<I: Clone + Eq + Hash + 'static> Element for DocumentTextElement<I> {
         self.text
             .prepaint(global_id, inspector_id, bounds, &mut (), window, cx);
         let layout = self.text.layout().clone();
+        if let Some(request) = layout.prepared_paint_request(window) {
+            self.image = self.state.update(cx, |state, _| {
+                state.request_row_image(self.display.clone(), request)
+            });
+        }
         self.state.update(cx, |state, cx| {
             state.update_text_layout(self.item_ix, self.display.clone(), layout, bounds, cx);
         });
@@ -351,15 +366,21 @@ impl<I: Clone + Eq + Hash + 'static> Element for DocumentTextElement<I> {
             paint_selection(&layout, selected_range, selection_color, window);
         }
 
-        self.text.paint(
-            global_id,
-            inspector_id,
-            bounds,
-            &mut (),
-            &mut (),
-            window,
-            cx,
-        );
+        if let Some(image) = &self.image {
+            if let Err(error) = image.paint(window) {
+                tracing::error!("paint document text image: {error:#}");
+            }
+        } else {
+            self.text.paint(
+                global_id,
+                inspector_id,
+                bounds,
+                &mut (),
+                &mut (),
+                window,
+                cx,
+            );
+        }
 
         if show_cursor
             && let Some(cursor) = cursor

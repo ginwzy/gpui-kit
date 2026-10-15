@@ -48,8 +48,10 @@ const DOCUMENT_INPUT_CONTEXT: &str = "Input";
 
 mod host;
 mod inline_styles;
+mod layout_items;
 mod layout_window;
 mod text_rows;
+use layout_items::LayoutItems;
 
 #[cfg(test)]
 mod style_tests;
@@ -807,6 +809,7 @@ enum DocumentLayoutItem<I> {
         frame: Derived<Option<text_rows::RowFrame>>,
         /// What the line's rows were wrapped for, once text rows wrapped it.
         wrapped: Derived<Option<text_rows::WrapKey>>,
+        prepared: Derived<Option<std::sync::Arc<gpui::PreparedLine>>>,
     },
     Block {
         id: I,
@@ -1265,8 +1268,8 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
                 cursor,
             );
             let line_key = text_rows::line_key(&whole);
-            let starts = rows.map_or(&[][..], |rows| rows.row_starts(line_key));
-            if starts.is_empty() {
+            let starts = rows.and_then(|rows| rows.row_starts(line_key));
+            if starts.is_none_or(|starts| starts.is_empty()) {
                 if let DocumentLayoutItem::Text { line_key: key, .. } = &mut whole {
                     *key = line_key;
                 }
@@ -1275,7 +1278,7 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             }
             // The rows start where the line did.
             *cursor = line_cursor;
-            for row in text_rows::rows_of_line(line.clone(), starts) {
+            for row in text_rows::rows_of_line(line.clone(), starts.unwrap().starts()) {
                 items.push(self.text_layout_item_from(
                     display_text,
                     row,
@@ -1402,6 +1405,7 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             line_key,
             frame: Derived::default(),
             wrapped: Derived::default(),
+            prepared: Derived::default(),
         }
     }
 
@@ -2366,7 +2370,7 @@ impl RangeExt for Range<usize> {
 
 pub struct DocumentState<I> {
     model: DocumentModel<I>,
-    layout_items: Vec<DocumentLayoutItem<I>>,
+    layout_items: LayoutItems<I>,
     list_state: ListState,
     focus_handle: FocusHandle,
     blink_cursor: gpui::Entity<BlinkCursor>,
@@ -2398,7 +2402,7 @@ pub struct DocumentState<I> {
     text_frame_resolver: Option<TextFrameResolver<I>>,
     block_height_resolver: Option<BlockHeightResolver<I>>,
     /// Display rows, when the host asked for them.
-    text_rows: Option<text_rows::TextRowsState>,
+    text_rows: Option<text_rows::TextRowsState<I>>,
 }
 
 struct TextLayoutRecord {
@@ -2510,7 +2514,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         ];
         Ok(Self {
             model,
-            layout_items,
+            layout_items: layout_items.into(),
             list_state,
             focus_handle,
             blink_cursor,
@@ -2624,7 +2628,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.text_layouts.clear();
         self.block_layouts.clear();
         self.trailer_layout = None;
-        self.layout_items = self.next_layout_items();
+        let items = self.next_layout_items().into();
+        let retired = std::mem::replace(&mut self.layout_items, items);
+        self.retire_text_layout_items(retired);
         self.list_state.reset(self.layout_items.len());
         self.layout_items_changed();
         cx.emit(DocumentEvent::PresentationChanged);
@@ -3019,6 +3025,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let offset = self.resolve_position(position)?;
         self.stop_following(cx);
         self.clear_pending_viewport_anchor();
+        let item_ix = self
+            .text_rows
+            .as_ref()
+            .and_then(|_| self.text_item_for_position(position))
+            .filter(|ix| matches!(&self.layout_items[*ix], DocumentLayoutItem::Text { node_id, .. } if node_id.as_ref() == Some(position.node_id())))
+            .unwrap_or_else(|| self.layout_item_for_source(offset));
         if self
             .text_rows
             .as_ref()
@@ -3036,18 +3048,17 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 viewport_y: self.list_state.viewport_bounds().top(),
                 reveal_on_wrap: true,
             });
+            // Only already-declared geometry can be addressed immediately.
+            // Fresh text rows have no frame yet; their index must wait for
+            // List's next layout. Keep the intent for later row publications.
+            if matches!(&self.layout_items[item_ix], DocumentLayoutItem::Text { source, display, line, frame: Derived(Some(_)), wrapped, .. }
+                if wrapped.0.is_some() || (offset == source.start && display.start == line.start))
+            {
+                self.list_state.scroll_to_reveal_item(item_ix);
+            }
         } else {
             // At a soft-wrap boundary, affinity chooses the owning display row.
             // A block's positions belong to the block, not to text beside it.
-            let item_ix = self
-                .text_rows
-                .as_ref()
-                .and_then(|_| self.text_item_for_position(position))
-                .filter(|ix| {
-                    matches!(&self.layout_items[*ix], DocumentLayoutItem::Text { node_id, .. }
-                        if node_id.as_ref() == Some(position.node_id()))
-                })
-                .unwrap_or_else(|| self.layout_item_for_source(offset));
             self.list_state.scroll_to_reveal_item(item_ix);
         }
         cx.notify();
@@ -3225,18 +3236,27 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         // Retained items keep the geometry layout derived for them.
         let split = next.len() - suffix;
         let (head, tail) = next.split_at_mut(split);
-        for (old, new) in self.layout_items[..prefix].iter().zip(head) {
+        for (old, new) in self.layout_items.range(0..prefix).zip(head) {
             new.keep_geometry(old);
         }
-        for (old, new) in self.layout_items[old_end..].iter().zip(tail) {
+        for (old, new) in self
+            .layout_items
+            .range(old_end..self.layout_items.len())
+            .zip(tail)
+        {
             new.keep_geometry(old);
         }
         host::forget_touched_geometry(
-            &self.layout_items[prefix..old_end],
+            &self
+                .layout_items
+                .range(prefix..old_end)
+                .cloned()
+                .collect::<Vec<_>>(),
             &mut next,
             prefix..split,
         );
-        self.layout_items = next;
+        let retired = std::mem::replace(&mut self.layout_items, next.into());
+        self.retire_text_layout_items(retired);
     }
 
     fn next_layout_items(&self) -> Vec<DocumentLayoutItem<I>> {
@@ -3566,6 +3586,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         // Only the edited node and its line neighbors lay out again.
         let next_was_seam = target.is_some_and(|index| self.model.is_layout_seam(index + 1));
         let lengths = (self.model.text.len(), self.model.display_text().len());
+        let wrap_edit = self.text_row_edit(&transaction);
         match self.model.route_and_apply(&transaction, None) {
             RoutingOutcome::Applied => {
                 self.relayout_edited_node(
@@ -3575,6 +3596,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     self.model.display_text().len() as isize - lengths.1 as isize,
                     first_changed_item,
                 );
+                self.set_text_row_edit(wrap_edit);
             }
             RoutingOutcome::Routed(region_id) => {
                 cx.emit(DocumentEvent::Routed(RoutedEdit {
@@ -4680,13 +4702,18 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             // Each document item is one logical line. Choose the nearest caret
             // boundary, not the containing glyph; Err also carries a valid
             // index at either edge of the actual soft-wrapped row.
-            record.layout.line_layout_for_index(0).map_or(0, |line| {
-                closest_caret_index(
-                    &line,
-                    point - record.bounds.origin,
-                    record.layout.line_height(),
-                )
-            })
+            record
+                .layout
+                .closest_prepared_caret_index(point - record.bounds.origin)
+                .unwrap_or_else(|| {
+                    record.layout.line_layout_for_index(0).map_or(0, |line| {
+                        closest_caret_index(
+                            &line,
+                            point - record.bounds.origin,
+                            record.layout.line_height(),
+                        )
+                    })
+                })
         };
         let affinity = if local == record.display.len() && local > 0 {
             Affinity::Before
@@ -4891,8 +4918,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     ) -> Option<usize> {
         let mut fallback = None;
         let mut owned = None;
-        for (ix, item) in self.layout_items[items.clone()]
-            .iter()
+        for (ix, item) in self
+            .layout_items
+            .range(items.clone())
             .enumerate()
             .map(|(ix, item)| (items.start + ix, item))
         {
@@ -4927,7 +4955,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .text_layouts
             .iter()
             .find(|record| record.item_ix == item_ix)?;
-        let local = display.clamp(record.display.start, record.display.end) - record.display.start;
+        if !record.display.contains_inclusive(display) {
+            return None;
+        }
+        let local = display - record.display.start;
         record.layout.position_for_index(local).map(|position| {
             (
                 position,
@@ -4980,8 +5011,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         affinity: Affinity,
         items: Range<usize>,
     ) -> Option<usize> {
-        let mut matches = self.layout_items[items.clone()]
-            .iter()
+        let mut matches = self
+            .layout_items
+            .range(items.clone())
             .enumerate()
             .map(|(ix, item)| (items.start + ix, item))
             .filter_map(|(ix, item)| match item {
@@ -5436,6 +5468,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.text_layouts.clear();
         self.block_layouts.clear();
         self.trailer_layout = None;
+        if let Some(rows) = self.text_rows.as_mut() {
+            rows.paint.begin_frame();
+        }
     }
 
     pub(super) fn update_trailer_layout(&mut self, item_ix: usize, bounds: Bounds<Pixels>) {
@@ -5576,6 +5611,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 presentation,
                 line,
                 frame,
+                wrapped,
+                prepared,
                 ..
             } => {
                 if let Some(node_id) = node_id {
@@ -5592,6 +5629,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     });
                 }
                 let mut presentation = presentation.as_deref().cloned().unwrap_or_default();
+                self.retained_row_style(wrapped.0, &mut presentation);
                 if self.text_rows.is_some() {
                     // A display row is one line; its wrap was decided with the geometry.
                     presentation.text_style.get_or_insert_default().white_space =
@@ -5604,11 +5642,27 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                         text_top = frame.0.map(|frame| frame.text_top(display, line));
                     }
                 }
+                let display = self.pending_row_paint_range(display.clone(), wrapped.0);
+                presentation.highlights.retain_mut(|(range, _)| {
+                    range.end = range.end.min(display.len());
+                    range.start < range.end
+                });
+                presentation.font_family_overrides.retain_mut(|(range, _)| {
+                    range.end = range.end.min(display.len());
+                    range.start < range.end
+                });
                 DocumentChild::Text {
                     item_ix,
                     display: display.clone(),
                     // Rows hold no text; only the rows in view slice it.
-                    text: self.model.display_text()[display.clone()].to_owned().into(),
+                    text: prepared
+                        .0
+                        .as_ref()
+                        .map(|line| line.text().clone())
+                        .unwrap_or_else(|| {
+                            self.model.display_text()[display.clone()].to_owned().into()
+                        }),
+                    prepared: prepared.0.clone(),
                     presentation: Box::new(presentation),
                 }
             }

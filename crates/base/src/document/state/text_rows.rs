@@ -16,7 +16,10 @@ use std::{
     collections::HashMap,
     hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher},
     ops::Range,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use gpui::{
@@ -29,7 +32,10 @@ use super::{Derived, DocumentLayoutItem, DocumentState, DocumentTextContext};
 use crate::document::DocumentRegion;
 
 mod font_runs;
+mod paint;
+mod wrap;
 use font_runs::{FontOverride, font_runs};
+use wrap::{Breaks, Previous, Wrap};
 
 /// Lines never wrapped before all wrap within the frame when they total up to
 /// this many bytes, so a text of this size shows its final rows and extent in
@@ -183,6 +189,7 @@ pub(in crate::document) struct RowFrame {
 
 impl RowFrame {
     /// How far below the top of `row` its text starts.
+    #[cfg(debug_assertions)]
     pub(in crate::document) fn text_top(&self, row: &Range<usize>, line: &Range<usize>) -> Pixels {
         if self.hidden || row.start != line.start {
             px(0.)
@@ -253,6 +260,7 @@ pub(in crate::document) struct WrapKey {
 #[derive(Default)]
 pub(in crate::document) struct RowCache {
     lines: HashMap<u64, CachedRows, BuildHasherDefault<KeyHasher>>,
+    previous: HashMap<usize, u64>,
 }
 
 /// Line keys are hashes already.
@@ -279,19 +287,26 @@ struct CachedRows {
     generation: u64,
     widths: (Pixels, Pixels),
     /// Where rows after the first start, relative to the line.
-    starts: Arc<[u32]>,
+    starts: Breaks,
+    input: Option<Previous>,
+    prepared: PreparedRows,
 }
+
+type PreparedRows = Arc<[(Range<usize>, Arc<gpui::PreparedLine>)]>;
 
 impl RowCache {
     /// Where rows after the first start in the line keyed `key`, relative to
     /// the line, as last wrapped. Empty for a line never wrapped.
-    pub(in crate::document) fn row_starts(&self, key: u64) -> &[u32] {
-        self.lines.get(&key).map_or(&[], |rows| &rows.starts)
+    pub(in crate::document) fn row_starts(&self, key: u64) -> Option<&Breaks> {
+        self.lines.get(&key).map(|rows| &rows.starts)
     }
 
     /// Records a wrap. A one-row line only updates an entry it had.
-    fn record(&mut self, key: u64, wrap: WrapKey, starts: &[u32]) {
-        if starts.is_empty() && !self.lines.contains_key(&key) {
+    fn record(&mut self, key: u64, wrap: WrapKey, starts: Breaks, input: Option<Previous>) {
+        if starts.is_empty()
+            && !self.lines.contains_key(&key)
+            && input.as_ref().is_none_or(|input| input.range.len() <= 2048)
+        {
             return;
         }
         self.lines.insert(
@@ -299,7 +314,9 @@ impl RowCache {
             CachedRows {
                 generation: wrap.generation,
                 widths: wrap.widths,
-                starts: starts.into(),
+                starts,
+                input,
+                prepared: Default::default(),
             },
         );
     }
@@ -404,7 +421,7 @@ impl RowsStyle {
     }
 }
 
-pub(in crate::document) struct TextRowsState {
+pub(in crate::document) struct TextRowsState<I> {
     rows: TextRows,
     pub(in crate::document) cache: RowCache,
     /// Advances change with the base style; wraps of older generations are stale.
@@ -420,12 +437,39 @@ pub(in crate::document) struct TextRowsState {
     /// The widest printable ASCII character in the base font, once a wrap needs it.
     ascii_advance: Option<Pixels>,
     pending: Option<Task<()>>,
+    pub(super) paint: paint::PaintPreparation,
     ready: Option<WrapResult>,
+    request: u64,
+    cancel: Arc<AtomicBool>,
+    publishing: Option<RowPublication<I>>,
+    publication_task: Option<Task<()>>,
+    retired: Vec<(super::LayoutItems<I>, gpui::PreparedListItems)>,
+    invalid_frames: std::collections::HashSet<(Option<I>, Range<usize>)>,
+    frames: HashMap<(Option<I>, Range<usize>), RowFrame>,
+    previous_styles: HashMap<u64, RowsStyle>,
+    edit: Option<LineEdit>,
+}
+
+/// Unchanged extents relative to one cached line, composed directly from the
+/// existing transaction stream. This is a pending layout hint, not history.
+pub(super) struct LineEdit {
+    line_start: usize,
+    key: u64,
+    prefix: usize,
+    suffix: usize,
+    current_len: usize,
 }
 
 struct WrapResult {
     generation: u64,
-    lines: Vec<WrappedLine>,
+    request: u64,
+    lines: std::collections::VecDeque<WrappedLine>,
+}
+
+impl<I> Drop for TextRowsState<I> {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 /// A line's wrap, identified by its display range and text/font key. The old
@@ -435,10 +479,28 @@ struct WrappedLine {
     range: Range<usize>,
     key: u64,
     widths: (Pixels, Pixels),
-    starts: Vec<u32>,
+    starts: Breaks,
+    input: Previous,
+    prepared: PreparedRows,
 }
 
-impl TextRowsState {
+impl<I: Clone> TextRowsState<I> {
+    fn invalidate(&mut self) {
+        self.paint.invalidate();
+        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.request += 1;
+        // Keep the one worker until it acknowledges cancellation. A platform
+        // shaping call may not be interruptible; dropping its handle here
+        // would allow each resize to start another simultaneous call.
+        self.ready = None;
+        self.publication_task = None;
+        if let Some(work) = self.publishing.take() {
+            self.retired.push((work.items, work.heights));
+        }
+        self.check = true;
+        self.scan_all = true;
+    }
     fn new(rows: TextRows) -> Self {
         Self {
             rows,
@@ -451,14 +513,28 @@ impl TextRowsState {
             scan_all: true,
             ascii_advance: None,
             pending: None,
+            paint: Default::default(),
             ready: None,
+            request: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+            publishing: None,
+            publication_task: None,
+            retired: Vec::new(),
+            invalid_frames: std::collections::HashSet::new(),
+            frames: HashMap::new(),
+            previous_styles: HashMap::new(),
+            edit: None,
         }
     }
 
     /// Whether row geometry is still settling: items wait for layout to frame
     /// or wrap them, or lines out of view wait for a background wrap.
     pub(in crate::document) fn is_wrapping(&self) -> bool {
-        self.resolve || self.check || self.pending.is_some() || self.ready.is_some()
+        self.resolve
+            || self.check
+            || self.pending.is_some()
+            || self.ready.is_some()
+            || self.publishing.is_some()
     }
 }
 
@@ -471,6 +547,10 @@ struct LineSpec {
     /// entirely in the base font.
     runs: Vec<(usize, usize)>,
     widths: (Pixels, Pixels),
+    previous: Option<Previous>,
+    fonts_key: u64,
+    priority: bool,
+    prepared: PreparedRows,
 }
 
 /// The fonts lines wrap in. The base style's font is the first.
@@ -514,7 +594,16 @@ impl FontTable {
 
 /// A line whose rows differ from its wrap: its items, what it was wrapped for,
 /// and where its rows start.
-type OutdatedLine = (Range<usize>, WrapKey, Arc<[u32]>);
+type OutdatedLine = (Range<usize>, WrapKey, Breaks);
+
+/// A candidate tree is built in bounded batches while the published tree
+/// remains usable. Each line is attached atomically, never one row at a time.
+struct RowPublication<I> {
+    lines: std::collections::VecDeque<OutdatedLine>,
+    items: super::LayoutItems<I>,
+    heights: gpui::PreparedListItems,
+    row: usize,
+}
 
 /// A line whose rows lag behind the wrap its width and fonts need.
 struct StaleLine {
@@ -526,18 +615,186 @@ struct StaleLine {
 }
 
 impl LineSpec {
-    fn wrap(&self, text: &str, wrappers: &mut [LineWrapperHandle]) -> WrappedLine {
+    fn wrap(&self, text: Arc<str>, wrappers: &mut [LineWrapperHandle]) -> WrappedLine {
+        let mut work = Wrap::new(
+            &text[self.range.clone()],
+            &self.runs,
+            self.widths,
+            self.previous.clone(),
+        );
+        let cancel = AtomicBool::new(false);
+        while !work.step(
+            &text[self.range.clone()],
+            &self.runs,
+            wrappers,
+            REWRAP_IN_FRAME_BYTES,
+            &cancel,
+        ) {}
+        self.result(text, work.finish())
+    }
+
+    fn result(&self, text: Arc<str>, starts: Breaks) -> WrappedLine {
+        // A cached line must not pin the whole document revision. A single
+        // huge source line can share the input directly; other lines retain
+        // only their own immutable text.
+        let text: Arc<str> = if self.range == (0..text.len()) {
+            text
+        } else {
+            text[self.range.clone()].into()
+        };
+        let range = 0..text.len();
         WrappedLine {
             item: self.item,
             range: self.range.clone(),
             key: self.key,
             widths: self.widths,
-            starts: wrap_line(&text[self.range.clone()], &self.runs, wrappers, self.widths),
+            input: Previous {
+                text,
+                range,
+                breaks: starts.clone(),
+                runs: self.runs.clone().into(),
+                widths: self.widths,
+                fonts_key: self.fonts_key,
+                change: None,
+            },
+            starts,
+            prepared: self.prepared.clone(),
         }
+    }
+
+    fn prepare_rows(
+        &self,
+        text: &str,
+        starts: &Breaks,
+        fonts: &[(Font, Pixels)],
+        text_system: &gpui::TextSystem,
+        cancel: &AtomicBool,
+    ) -> PreparedRows {
+        let mut prepared = Vec::new();
+        let mut begin = 0;
+        for end in starts
+            .starts()
+            .map(|ix| ix as usize)
+            .chain([self.range.len()])
+        {
+            if cancel.load(Ordering::Relaxed) {
+                return Default::default();
+            }
+            if end - begin > 2048 {
+                let range = begin..end;
+                let previous = self.prepared.iter().find(|(old, _)| *old == range);
+                let row = if let Some((_, previous)) = previous {
+                    previous.clone()
+                } else {
+                    let mut runs = Vec::new();
+                    let mut offset = begin;
+                    let mut size = fonts[0].1;
+                    while offset < end {
+                        let (stop, font) = self
+                            .runs
+                            .get(self.runs.partition_point(|(stop, _)| *stop <= offset))
+                            .copied()
+                            .unwrap_or((end, 0));
+                        size = fonts[font].1;
+                        runs.push(gpui::TextRun {
+                            len: stop.min(end) - offset,
+                            font: fonts[font].0.clone(),
+                            ..Default::default()
+                        });
+                        offset = stop.min(end);
+                    }
+                    Arc::new(
+                        text_system.prepare_line(
+                            text[self.range.start + begin..self.range.start + end]
+                                .to_owned()
+                                .into(),
+                            size,
+                            &runs,
+                        ),
+                    )
+                };
+                prepared.push((range, row));
+            }
+            begin = end;
+        }
+        prepared.into()
     }
 }
 
 impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
+    pub(super) fn retire_layout_items(&mut self, items: super::LayoutItems<I>) {
+        if let Some(state) = self.text_rows.as_mut() {
+            state.retired.push((items, gpui::PreparedListItems::new()));
+        }
+    }
+    /// Whether exact text-row geometry is still being prepared. The current
+    /// geometry remains internally consistent, but may be a bounded initial
+    /// placeholder or the preceding complete wrap. Includes preparation of
+    /// visible rows whose glyph counts require background composition.
+    pub fn is_laying_out_text(&self) -> bool {
+        self.text_rows
+            .as_ref()
+            .is_some_and(|rows| rows.is_wrapping() || rows.paint.is_pending())
+    }
+
+    pub(super) fn retained_row_style(
+        &self,
+        wrap: Option<WrapKey>,
+        presentation: &mut super::DocumentTextPresentation,
+    ) {
+        let Some(state) = &self.text_rows else {
+            return;
+        };
+        let Some(style) = wrap.and_then(|wrap| state.previous_styles.get(&wrap.generation)) else {
+            return;
+        };
+        let mut retained = TextStyleRefinement {
+            font_family: Some(style.font.family.clone()),
+            font_features: Some(style.font.features.clone()),
+            font_fallbacks: style.font.fallbacks.clone(),
+            font_weight: Some(style.font.weight),
+            font_style: Some(style.font.style),
+            font_size: Some(style.font_size.into()),
+            line_height: Some(style.line_height.into()),
+            ..Default::default()
+        };
+        if let Some(original) = &presentation.text_style {
+            retained.refine(original);
+            if let Some(size) = original.font_size {
+                retained.font_size = Some(size.to_pixels(style.rem_size).into());
+            }
+            if let Some(height) = original.line_height {
+                retained.line_height = Some(
+                    height
+                        .to_pixels(retained.font_size.unwrap(), style.rem_size)
+                        .into(),
+                );
+            }
+        }
+        presentation.text_style = Some(retained);
+    }
+
+    /// A new line has no exact row geometry yet. Paint a bounded prefix, with
+    /// its real source offsets, until its complete wrap is published. Finding
+    /// the prefix itself must not traverse an unbounded grapheme cluster.
+    pub(super) fn pending_row_paint_range(
+        &self,
+        display: Range<usize>,
+        wrapped: Option<WrapKey>,
+    ) -> Range<usize> {
+        const PREFIX_BYTES: usize = 2048;
+        if self.text_rows.is_none() || wrapped.is_some() || display.len() <= PREFIX_BYTES {
+            return display;
+        }
+        let text = &self.model.display_text()[display.clone()];
+        let end = text.floor_char_boundary(PREFIX_BYTES);
+        let end = text[..end]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(ix, _)| ix);
+        display.start..display.start + end
+    }
+
     /// Lay text out as display rows, or `None` to return to one measured item
     /// per line.
     ///
@@ -570,9 +827,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 self.reconcile_layout_items_from(0);
                 // Geometry belongs to the rows that derived it. Without any,
                 // rows that come back need not clear it before their first layout.
-                for item in &mut self.layout_items {
-                    item.forget_geometry();
-                }
+                self.layout_items
+                    .map_range(0..self.layout_items.len(), |item| {
+                        item.forget_geometry();
+                    });
                 // Every item returns to measurement, including retained blocks.
                 self.list_state
                     .set_item_heights(0, std::iter::repeat_n(None, self.layout_items.len()));
@@ -615,24 +873,42 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let Some(state) = self.text_rows.as_mut() else {
             return false;
         };
+        state.invalidate();
         let mut cleared = false;
-        for item in &mut self.layout_items {
-            match item {
-                DocumentLayoutItem::Text { node_id, frame, .. } if owned(node_id.as_ref()) => {
-                    frame.0 = None;
-                    cleared = true;
+        let mut ix = 0;
+        while ix < self.layout_items.len() {
+            match &self.layout_items[ix] {
+                DocumentLayoutItem::Text { node_id, line, .. } => {
+                    if owned(node_id.as_ref()) {
+                        self.text_rows
+                            .as_mut()
+                            .unwrap()
+                            .invalid_frames
+                            .insert((node_id.clone(), line.clone()));
+                        cleared = true;
+                    }
+                    ix = self.line_rows(ix).end;
                 }
-                DocumentLayoutItem::Block { id, height, .. }
-                | DocumentLayoutItem::AnchoredBlock { id, height, .. }
+                DocumentLayoutItem::Block { id, .. }
+                | DocumentLayoutItem::AnchoredBlock { id, .. }
                     if owned(Some(id)) =>
                 {
-                    height.0 = BlockGeometry::Unresolved;
+                    self.layout_items.update(ix, |item| match item {
+                        DocumentLayoutItem::Block { height, .. }
+                        | DocumentLayoutItem::AnchoredBlock { height, .. } => {
+                            height.0 = BlockGeometry::Unresolved
+                        }
+                        _ => unreachable!(),
+                    });
                     cleared = true;
+                    ix += 1;
                 }
-                DocumentLayoutItem::Trailer => cleared = true,
-                _ => {}
+                _ => {
+                    ix += 1;
+                }
             }
         }
+        let state = self.text_rows.as_mut().unwrap();
         state.resolve |= cleared;
         state.check |= cleared;
         state.scan_all |= cleared;
@@ -642,9 +918,62 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// Layout items were added or replaced; layout resolves and wraps them.
     pub(super) fn layout_items_changed(&mut self) {
         if let Some(state) = self.text_rows.as_mut() {
+            state.invalidate();
+            state.edit = None;
             state.resolve = true;
             state.check = true;
             state.scan_all = true;
+        }
+    }
+
+    pub(super) fn text_row_edit(&self, transaction: &super::EditTransaction) -> Option<LineEdit> {
+        let [edit] = transaction.edits() else {
+            return None;
+        };
+        if edit.replacement().contains('\n') {
+            return None;
+        }
+        let state = self.text_rows.as_ref()?;
+        let source = edit.range();
+        let start = self
+            .model
+            .source_to_display(source.start, super::Affinity::After)?;
+        let end = self
+            .model
+            .source_to_display(source.end, super::Affinity::Before)?;
+        let DocumentLayoutItem::Text { line, line_key, .. } = self
+            .layout_items
+            .get(self.layout_item_for_source(source.start))?
+        else {
+            return None;
+        };
+        if start < line.start || end > line.end || start > end {
+            return None;
+        }
+        let key = *state.cache.previous.get(&line.start)?;
+        let cached = state.cache.lines.get(&key)?.input.as_ref()?;
+        let mut prefix = start - line.start;
+        let mut suffix = line.end - end;
+        if let Some(previous) = state.edit.as_ref().filter(|edit| {
+            edit.key == key && edit.line_start == line.start && edit.current_len == line.len()
+        }) {
+            prefix = prefix.min(previous.prefix);
+            suffix = suffix.min(previous.suffix);
+        } else if key != *line_key || cached.range.len() != line.len() {
+            return None;
+        }
+        Some(LineEdit {
+            line_start: line.start,
+            key,
+            prefix,
+            suffix,
+            current_len: line.len() - (end - start) + edit.replacement().len(),
+        })
+    }
+
+    pub(super) fn set_text_row_edit(&mut self, edit: Option<LineEdit>) {
+        if let Some(state) = self.text_rows.as_mut() {
+            state.edit = edit;
         }
     }
 
@@ -663,7 +992,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         if state.style.as_ref() != Some(&style) {
             // Before the first style, rows have derived no geometry to clear.
             state.ascii_advance = None;
-            if state.style.replace(style).is_some() {
+            if let Some(old_style) = state.style.replace(style) {
+                state.previous_styles.insert(state.generation, old_style);
                 state.generation += 1;
                 self.clear_row_geometry(|_| true);
             }
@@ -672,6 +1002,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             return;
         };
         if state.width != Some(bounds.size.width) {
+            state.invalidate();
             state.width = Some(bounds.size.width);
             state.check = true;
             state.scan_all = true;
@@ -680,18 +1011,72 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             state.resolve = false;
             self.resolve_row_geometry(window, cx);
         }
-        if let Some(state) = self.text_rows.as_mut()
-            && let Some(result) = state.ready.take()
+        self.consume_ready_rows(cx);
+        if self
+            .text_rows
+            .as_ref()
+            .is_some_and(|state| state.publishing.is_none() && state.check)
+        {
+            self.wrap_stale_lines(bounds, window, cx);
+        }
+        if self
+            .text_rows
+            .as_ref()
+            .is_some_and(|state| state.publishing.is_some())
+        {
+            self.advance_row_publication(cx);
+        }
+        self.retire_row_geometry(cx);
+    }
+
+    fn consume_ready_rows(&mut self, cx: &mut Context<Self>) {
+        if self
+            .text_rows
+            .as_ref()
+            .is_some_and(|state| state.publishing.is_none())
+            && let Some(state) = self.text_rows.as_mut()
+            && let Some(result) = state.ready.as_mut()
         {
             state.check = true;
-            state.scan_all = true;
-            if result.generation == state.generation {
-                let (settled, outdated) = self.take_wrapped(result.generation, result.lines);
+            state.scan_all = state.pending.is_none();
+            if result.generation == state.generation && result.request == state.request {
+                let generation = result.generation;
+                let lines = result.lines.drain(..result.lines.len().min(64)).collect();
+                if result.lines.is_empty() {
+                    state.ready = None;
+                }
+                let (settled, outdated) = self.take_wrapped(generation, lines);
                 self.settle_line_rows(settled, outdated, cx);
+            } else {
+                state.ready = None;
             }
         }
-        if self.text_rows.as_ref().is_some_and(|state| state.check) {
-            self.wrap_stale_lines(bounds, window, cx);
+    }
+
+    fn retire_row_geometry(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.text_rows.as_mut() {
+            let mut budget = 512;
+            while let Some((items, heights)) = state.retired.last_mut() {
+                if budget == 0 {
+                    break;
+                }
+                let count = items.len().max(heights.len()).min(budget);
+                items.retire(count);
+                heights.retire(count);
+                budget -= count;
+                if items.len() == 0 && heights.is_empty() {
+                    state.retired.pop();
+                }
+            }
+            if !state.retired.is_empty() {
+                cx.notify();
+            }
+        }
+    }
+
+    pub(super) fn retire_text_layout_items(&mut self, items: super::LayoutItems<I>) {
+        if let Some(state) = self.text_rows.as_mut() {
+            state.retired.push((items, gpui::PreparedListItems::new()));
         }
     }
 
@@ -702,13 +1087,28 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         // Without a resolver, every unstyled line has the same frame.
         let mut plain_frame = None;
         let mut heights: Vec<(usize, Option<Pixels>)> = Vec::new();
+        let mut frames = Vec::new();
         let mut ix = 0;
         while ix < self.layout_items.len() {
             match &self.layout_items[ix] {
-                DocumentLayoutItem::Text { frame, .. } if frame.0.is_some() => ix += 1,
+                DocumentLayoutItem::Text {
+                    frame,
+                    line,
+                    node_id,
+                    ..
+                } if frame.0.is_some()
+                    && !self
+                        .text_rows
+                        .as_ref()
+                        .unwrap()
+                        .invalid_frames
+                        .contains(&(node_id.clone(), line.clone())) =>
+                {
+                    ix = self.line_rows(ix).end
+                }
                 DocumentLayoutItem::Text { .. } => {
                     // The first row without a frame frames its whole line.
-                    let rows = self.line_rows(ix);
+                    let mut rows = self.line_rows(ix);
                     {
                         let plain = self.text_frame_resolver.is_none()
                             && matches!(
@@ -729,17 +1129,82 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                                 frame
                             }
                         };
-                        for row_ix in rows.clone() {
-                            if let DocumentLayoutItem::Text {
+                        let DocumentLayoutItem::Text {
+                            node_id,
+                            line,
+                            frame: old_frame,
+                            wrapped,
+                            ..
+                        } = &self.layout_items[rows.start]
+                        else {
+                            unreachable!()
+                        };
+                        let key = (node_id.clone(), line.clone());
+                        let state = self.text_rows.as_mut().unwrap();
+                        state.invalid_frames.remove(&key);
+                        let keep_old = wrapped
+                            .0
+                            .is_some_and(|wrap| wrap.generation != state.generation);
+                        if keep_old {
+                            state.frames.insert(key, resolved);
+                        } else {
+                            state.frames.remove(&key);
+                        }
+                        if !keep_old && rows.len() > 1 && old_frame.0 != Some(resolved) {
+                            // The host has changed its frame/decoration. Its
+                            // renderer cannot reproduce the old decoration;
+                            // use one explicit pending row until reflow lands.
+                            let DocumentLayoutItem::Text {
+                                source: first,
+                                line_key,
+                                ..
+                            } = &self.layout_items[rows.start]
+                            else {
+                                unreachable!()
+                            };
+                            let DocumentLayoutItem::Text { source: last, .. } =
+                                &self.layout_items[rows.end - 1]
+                            else {
+                                unreachable!()
+                            };
+                            let mut item = self.model.text_layout_item(
+                                self.model.display_text(),
+                                line.clone(),
+                                first.start..last.end,
+                                line.clone(),
+                                *line_key,
+                            );
+                            if let DocumentLayoutItem::Text { frame, .. } = &mut item {
+                                frame.0 = Some(resolved);
+                            }
+                            let mut heights = gpui::PreparedListItems::new();
+                            heights.extend([Some(resolved.row_height(line, line))]);
+                            let old = self
+                                .layout_items
+                                .splice_prepared(rows.clone(), vec![item].into());
+                            let old_heights =
+                                self.list_state.splice_prepared(rows.clone(), heights);
+                            self.text_rows
+                                .as_mut()
+                                .unwrap()
+                                .retired
+                                .push((old, old_heights));
+                            rows.end = rows.start + 1;
+                        }
+                        // Existing complete rows keep their old geometry until
+                        // the candidate is published. Only a placeholder has
+                        // its height installed immediately.
+                        if rows.len() == 1
+                            && let DocumentLayoutItem::Text {
                                 display,
                                 line,
-                                frame,
+                                wrapped,
                                 ..
-                            } = &mut self.layout_items[row_ix]
-                            {
-                                frame.0 = Some(resolved);
-                                heights.push((row_ix, Some(resolved.row_height(display, line))));
-                            }
+                            } = &self.layout_items[rows.start]
+                            && (!keep_old || wrapped.0.is_none())
+                        {
+                            frames.push((rows.start, resolved));
+                            heights.push((rows.start, Some(resolved.row_height(display, line))));
                         }
                     }
                     ix = rows.end;
@@ -756,12 +1221,13 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                             },
                             None => BlockGeometry::Measured,
                         };
-                        if let DocumentLayoutItem::Block { height, .. }
-                        | DocumentLayoutItem::AnchoredBlock { height, .. } =
-                            &mut self.layout_items[ix]
-                        {
-                            height.0 = geometry;
-                        }
+                        self.layout_items.update(ix, |item| {
+                            if let DocumentLayoutItem::Block { height, .. }
+                            | DocumentLayoutItem::AnchoredBlock { height, .. } = item
+                            {
+                                height.0 = geometry;
+                            }
+                        });
                         heights.push((ix, geometry.height()));
                     }
                     ix += 1;
@@ -771,6 +1237,22 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     ix += 1;
                 }
             }
+        }
+        // Consecutive source lines must not split the persistent tree once
+        // per item. Resolve their initial placeholders in one contiguous run.
+        let mut frames = frames.into_iter().peekable();
+        while let Some((start, frame)) = frames.next() {
+            let mut run = vec![frame];
+            while let Some((_, frame)) = frames.next_if(|(next, _)| *next == start + run.len()) {
+                run.push(frame);
+            }
+            let end = start + run.len();
+            let mut run = run.into_iter();
+            self.layout_items.map_range(start..end, |item| {
+                if let DocumentLayoutItem::Text { frame, .. } = item {
+                    frame.0 = run.next();
+                }
+            });
         }
         // One update per run of adjacent items.
         let mut heights = heights.into_iter().peekable();
@@ -790,21 +1272,48 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
 
     /// The text items of the display line that contains text item `ix`.
     pub(super) fn line_rows(&self, ix: usize) -> Range<usize> {
-        let DocumentLayoutItem::Text { line, node_id, .. } = &self.layout_items[ix] else {
+        let DocumentLayoutItem::Text {
+            display,
+            line,
+            node_id,
+            ..
+        } = &self.layout_items[ix]
+        else {
             return ix..ix + 1;
         };
+        if display == line {
+            return ix..ix + 1;
+        }
         let same_line = |item: &DocumentLayoutItem<I>| {
             matches!(item, DocumentLayoutItem::Text { line: other, node_id: other_node, .. }
                 if other == line && other_node == node_id)
         };
-        let mut start = ix;
-        while start > 0 && same_line(&self.layout_items[start - 1]) {
-            start -= 1;
+        let mut lo = if display.start == line.start { ix } else { 0 };
+        let mut hi = ix;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if same_line(&self.layout_items[mid]) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
         }
-        let mut end = ix + 1;
-        while end < self.layout_items.len() && same_line(&self.layout_items[end]) {
-            end += 1;
+        let start = lo;
+        lo = ix + 1;
+        hi = if display.end == line.end {
+            ix + 1
+        } else {
+            self.layout_items.len()
+        };
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if same_line(&self.layout_items[mid]) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
+        let end = lo;
         start..end
     }
 
@@ -966,6 +1475,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 line,
                 line_key,
                 presentation,
+                node_id,
                 frame: Derived(Some(frame)),
                 wrapped,
                 ..
@@ -976,14 +1486,25 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             };
             let rows = self.line_rows(ix);
             ix = rows.end;
-            if frame.hidden || line.is_empty() {
-                continue;
-            }
+            let frame = state
+                .frames
+                .get(&(node_id.clone(), line.clone()))
+                .unwrap_or(frame);
             let wrap = WrapKey {
                 generation,
                 widths: frame.widths(width),
             };
-            if wrapped.0 == Some(wrap) {
+            if wrapped.0 == Some(wrap)
+                && matches!(&self.layout_items[rows.start], DocumentLayoutItem::Text { frame: Derived(Some(old)), .. } if old == frame)
+            {
+                continue;
+            }
+            if frame.hidden || line.is_empty() {
+                if rows.len() == 1 {
+                    settled.push((rows, wrap));
+                } else {
+                    outdated.push((rows, wrap, Breaks::default()));
+                }
                 continue;
             }
             // Wrapping cannot break a line that never reaches its width.
@@ -999,7 +1520,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 if rows.len() == 1 {
                     settled.push((rows, wrap));
                 } else {
-                    outdated.push((rows, wrap, Arc::from([])));
+                    outdated.push((rows, wrap, Breaks::default()));
                 }
                 continue;
             }
@@ -1035,17 +1556,30 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             0
         };
         let mut rewrap_budget = REWRAP_IN_FRAME_BYTES;
+        // Priority changes ordering, never the execution budget. Unicode is
+        // always background work: even one cluster can be expensive to shape.
+        let focus = self
+            .pending_viewport_anchor
+            .as_ref()
+            .and_then(|pending| self.model.position_for_anchor(pending.anchor).ok())
+            .and_then(|position| self.resolve_position(&position).ok())
+            .unwrap_or_else(|| self.model.cursor());
+        let focus = self.model.source_to_display(focus, super::Affinity::After);
+        for line in &mut stale {
+            line.in_view |= matches!(&self.layout_items[line.items.start], DocumentLayoutItem::Text { line, .. } if focus.is_some_and(|offset| line.start <= offset && offset <= line.end));
+        }
+        stale.sort_by_key(|line| {
+            let focused = matches!(&self.layout_items[line.items.start], DocumentLayoutItem::Text { line, .. } if focus.is_some_and(|offset| line.start <= offset && offset <= line.end));
+            (!focused, !line.in_view)
+        });
         let (now, later): (Vec<_>, Vec<_>) = stale.into_iter().partition(|line| {
             let budget = if line.wrapped_before {
                 &mut rewrap_budget
             } else {
                 &mut first_budget
             };
-            if line.in_view {
-                *budget = budget.saturating_sub(line.bytes);
-                return true;
-            }
-            if line.bytes <= *budget {
+            let ascii = line.bytes <= REWRAP_IN_FRAME_BYTES && matches!(&self.layout_items[line.items.start], DocumentLayoutItem::Text { line, .. } if self.model.display_text()[line.clone()].bytes().all(|byte| (b' '..=b'~').contains(&byte)));
+            if ascii && line.bytes <= *budget {
                 *budget -= line.bytes;
                 return true;
             }
@@ -1059,10 +1593,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .map(|line| self.line_spec(line, &mut fonts))
                 .collect();
             let mut wrappers = fonts.wrappers(cx);
-            let text = self.model.display_text();
+            let text: Arc<str> = self.model.display_text().into();
             let lines = specs
                 .iter()
-                .map(|spec| spec.wrap(text, &mut wrappers))
+                .map(|spec| spec.wrap(text.clone(), &mut wrappers))
                 .collect();
             let (now_settled, now_outdated) = self.take_wrapped(generation, lines);
             settled.extend(now_settled);
@@ -1082,7 +1616,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .iter()
                 .map(|line| self.line_spec(line, &mut fonts))
                 .collect();
-            (specs, fonts.wrappers(cx))
+            let wrappers = fonts.wrappers(cx);
+            (specs, wrappers, fonts.fonts)
         });
         self.settle_line_rows(settled, outdated, cx);
 
@@ -1093,19 +1628,92 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         }
         // Lines still stale wrap as they scroll into view.
         state.check = !later.is_empty();
-        let Some((specs, mut wrappers)) = background else {
+        let Some((specs, mut wrappers, fonts)) = background else {
             return;
         };
         let text: Arc<str> = self.model.display_text().into();
+        let request = state.request;
+        let cancel = state.cancel.clone();
+        let text_system = cx.text_system().clone();
         let task = cx.spawn(async move |this, cx| {
-            let lines = cx
-                .background_spawn(async move {
-                    specs
-                        .iter()
-                        .map(|spec| spec.wrap(&text, &mut wrappers))
-                        .collect()
-                })
-                .await;
+            let (sender, receiver) = smol::channel::bounded(2);
+            let worker = cx.background_spawn(async move {
+                let mut lines = Vec::new();
+                for spec in specs {
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let mut work = Wrap::new(
+                        &text[spec.range.clone()],
+                        &spec.runs,
+                        spec.widths,
+                        spec.previous.clone(),
+                    );
+                    loop {
+                        if cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if work.step(
+                            &text[spec.range.clone()],
+                            &spec.runs,
+                            &mut wrappers,
+                            16 * 1024,
+                            &cancel,
+                        ) {
+                            break;
+                        }
+                        smol::future::yield_now().await;
+                    }
+                    let starts = work.finish();
+                    let prepared = spec.prepare_rows(&text, &starts, &fonts, &text_system, &cancel);
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let mut result = spec.result(text.clone(), starts);
+                    result.prepared = prepared;
+                    lines.push(result);
+                    if (spec.priority || lines.len() == 64)
+                        && sender.send(std::mem::take(&mut lines)).await.is_err()
+                    {
+                        return;
+                    }
+                }
+                if !lines.is_empty() {
+                    let _ = sender.send(lines).await;
+                }
+            });
+            while let Ok(lines) = receiver.recv().await {
+                if this
+                    .update(cx, |this, cx| {
+                        let Some(state) = this
+                            .text_rows
+                            .as_mut()
+                            .filter(|state| state.request == request)
+                        else {
+                            // Drain the bounded channel until the cancelled
+                            // worker returns, then release the single slot.
+                            return true;
+                        };
+                        state
+                            .ready
+                            .get_or_insert_with(|| WrapResult {
+                                generation,
+                                request,
+                                lines: Default::default(),
+                            })
+                            .lines
+                            .extend(lines);
+                        this.schedule_row_publication(cx);
+                        cx.notify();
+                        true
+                    })
+                    .ok()
+                    != Some(true)
+                {
+                    return;
+                }
+            }
+            worker.await;
             let _ = this.update(cx, |this, cx| {
                 let Some(state) = this.text_rows.as_mut() else {
                     return;
@@ -1114,8 +1722,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 if let Some(task) = state.pending.take() {
                     task.detach();
                 }
-                // Width and font are known only during layout, which validates it.
-                state.ready = Some(WrapResult { generation, lines });
+                state.check = true;
+                state.scan_all = true;
                 cx.notify();
             });
         });
@@ -1157,12 +1765,24 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             };
             let matches = self.rows_match(rows.clone(), &line.starts);
             if let Some(state) = self.text_rows.as_mut() {
-                state.cache.record(line.key, wrap, &line.starts);
+                if let Some(old) = state.cache.previous.insert(line.range.start, line.key)
+                    && old != line.key
+                {
+                    // Retain one derived input per source-line position, not
+                    // every historical 8 MiB snapshot after successive edits.
+                    state.cache.lines.remove(&old);
+                }
+                state
+                    .cache
+                    .record(line.key, wrap, line.starts.clone(), Some(line.input));
+                if let Some(cached) = state.cache.lines.get_mut(&line.key) {
+                    cached.prepared = line.prepared;
+                }
             }
             if matches {
                 settled.push((rows, wrap));
             } else {
-                outdated.push((rows, wrap, line.starts.into()));
+                outdated.push((rows, wrap, line.starts));
             }
         }
         (settled, outdated)
@@ -1177,11 +1797,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) {
         for (rows, wrap) in settled {
-            for item in &mut self.layout_items[rows] {
-                if let DocumentLayoutItem::Text { wrapped, .. } = item {
-                    wrapped.0 = Some(wrap);
-                }
-            }
+            // These are one-row lines. Publishing their frame and wrap is
+            // subject to the same batch budget as multirow results.
+            debug_assert_eq!(rows.len(), 1);
+            outdated.push((rows, wrap, Breaks::default()));
         }
         if outdated.is_empty() {
             return;
@@ -1192,17 +1811,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     }
 
     /// Whether the rows of line items `rows` start where `starts` says.
-    fn rows_match(&self, rows: Range<usize>, starts: &[u32]) -> bool {
-        if rows.len() != starts.len() + 1 {
-            return false;
-        }
-        self.layout_items[rows][1..]
-            .iter()
-            .zip(starts)
-            .all(|(item, start)| {
-                matches!(item, DocumentLayoutItem::Text { display, line, .. }
-                    if display.start - line.start == *start as usize)
-            })
+    fn rows_match(&self, rows: Range<usize>, starts: &Breaks) -> bool {
+        // Completed multirow wraps are recognized by WrapKey during the scan.
+        // Comparing every old break on the UI thread would undo bounded work.
+        rows.len() == 1 && starts.is_empty()
     }
 
     /// The widest printable ASCII character in the base font.
@@ -1237,24 +1849,70 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         else {
             unreachable!("line rows are text items");
         };
-        let spec = |runs| LineSpec {
-            item: line.items.start,
-            key: *line_key,
-            range: display.clone(),
-            runs,
-            widths: line.widths,
+        let spec = |runs: Vec<(usize, usize)>, fonts: &FontTable| {
+            let mut hash = DefaultHasher::new();
+            for font in std::iter::once(0).chain(runs.iter().map(|(_, font)| *font)) {
+                fonts.fonts[font].0.hash(&mut hash);
+                f32::from(fonts.fonts[font].1).to_bits().hash(&mut hash);
+            }
+            let fonts_key = hash.finish();
+            LineSpec {
+                item: line.items.start,
+                key: *line_key,
+                range: display.clone(),
+                runs,
+                widths: line.widths,
+                previous: self.text_rows.as_ref().and_then(|state| {
+                    let key = state.cache.previous.get(&display.start)?;
+                    let cached = state.cache.lines.get(key)?;
+                    (cached.generation == state.generation)
+                        .then(|| cached.input.clone())
+                        .flatten()
+                        .filter(|input| input.fonts_key == fonts_key)
+                        .map(|mut input| {
+                            input.change = state
+                                .edit
+                                .as_ref()
+                                .filter(|edit| {
+                                    edit.key == *key
+                                        && edit.line_start == display.start
+                                        && edit.current_len == display.len()
+                                })
+                                .map(|edit| (edit.prefix, edit.suffix));
+                            input
+                        })
+                }),
+                fonts_key,
+                priority: line.in_view,
+                prepared: self
+                    .text_rows
+                    .as_ref()
+                    .and_then(|state| {
+                        state.cache.lines.get(line_key).filter(|cached| {
+                            cached
+                                .input
+                                .as_ref()
+                                .is_some_and(|input| input.fonts_key == fonts_key)
+                        })
+                    })
+                    .map(|cached| cached.prepared.clone())
+                    .unwrap_or_default(),
+            }
         };
         // Unstyled lines wrap in the base font.
-        if self.layout_items[line.items.clone()].iter().all(|item| {
-            matches!(
-                item,
-                DocumentLayoutItem::Text {
-                    presentation: None,
-                    ..
-                }
-            )
-        }) {
-            return spec(Vec::new());
+        let inline = &self.model.resolved_styles.inline;
+        let from = inline.partition_point(|style| style.display.end <= display.start);
+        if matches!(
+            &self.layout_items[line.items.start],
+            DocumentLayoutItem::Text {
+                presentation: None,
+                ..
+            }
+        ) && inline
+            .get(from)
+            .is_none_or(|style| style.display.start >= display.end)
+        {
+            return spec(Vec::new(), fonts);
         }
         let whole = self.model.text_layout_item(
             self.model.display_text(),
@@ -1268,7 +1926,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             ..
         } = &whole
         else {
-            return spec(Vec::new());
+            return spec(Vec::new(), fonts);
         };
         let mut style = fonts.base_style.clone();
         if let Some(refinement) = font_refinement(presentation) {
@@ -1283,115 +1941,283 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 (range.end, fonts.index(font, size))
             })
             .collect();
-        spec(runs)
+        spec(runs, fonts)
     }
 
     /// Replaces the rows of each line in `lines`, given in ascending order by
     /// their items, with the rows of its wrap, keeping the visible text in place.
     fn replace_line_rows(&mut self, lines: Vec<OutdatedLine>, cx: &mut Context<Self>) {
-        // Layout has not placed this frame's rows yet, so keep the top row by
-        // its text rather than by last frame's geometry.
-        let top = self.list_state.logical_scroll_top();
-        let top_offset = match self.layout_items.get(top.item_ix) {
-            Some(DocumentLayoutItem::Text { display, .. }) => Some(display.start),
-            _ => None,
-        };
-        let mut top_row = None;
-        let reanchor = self
-            .pending_viewport_anchor
-            .as_ref()
-            .filter(|pending| !pending.reveal_on_wrap)
-            .and_then(|pending| {
-                let position = self.model.position_for_anchor(pending.anchor).ok()?;
-                // A replaced source can leave an anchor with no current geometry.
-                self.text_position_for_position(&position)?;
-                self.resolve_position(&position).ok()
-            });
-        if self.text_rows.is_none() {
+        let state = self.text_rows.as_mut().expect("text rows enabled");
+        state.publishing = Some(RowPublication {
+            lines: lines.into_iter().rev().collect(),
+            items: super::LayoutItems::default(),
+            heights: gpui::PreparedListItems::new(),
+            row: 0,
+        });
+        self.advance_row_publication(cx);
+        self.schedule_row_publication(cx);
+    }
+
+    fn schedule_row_publication(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self
+            .text_rows
+            .as_mut()
+            .filter(|state| state.publication_task.is_none())
+        else {
             return;
-        }
-        let display_text = self.model.display_text();
-        let old_len = self.layout_items.len();
-        let mut old = std::mem::take(&mut self.layout_items).into_iter();
-        let mut items = Vec::with_capacity(old_len);
-        let mut splices = Vec::with_capacity(lines.len());
-        let mut moved = 0;
-        for (rows, wrap, starts) in lines {
-            items.extend(old.by_ref().take(rows.start - moved));
-            let replaced: Vec<_> = old.by_ref().take(rows.len()).collect();
-            moved = rows.end;
-            let (
-                DocumentLayoutItem::Text {
-                    source: first_source,
-                    line,
-                    line_key,
-                    frame,
-                    ..
-                },
-                DocumentLayoutItem::Text {
-                    source: last_source,
-                    ..
-                },
-            ) = (&replaced[0], &replaced[replaced.len() - 1])
-            else {
-                unreachable!("line rows are text items");
+        };
+        let request = state.request;
+        state.publication_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                // Yield to the platform event loop as well as other executor
+                // tasks. Completion is not limited to one batch per vsync.
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1))
+                    .await;
+                let ongoing = this
+                    .update(cx, |this, cx| {
+                        if !this
+                            .text_rows
+                            .as_ref()
+                            .is_some_and(|state| state.request == request)
+                        {
+                            return false;
+                        }
+                        this.consume_ready_rows(cx);
+                        this.advance_row_publication(cx);
+                        this.retire_row_geometry(cx);
+                        let state = this.text_rows.as_mut().unwrap();
+                        let ongoing = state.publishing.is_some()
+                            || state.ready.is_some()
+                            || !state.retired.is_empty();
+                        if !ongoing && let Some(task) = state.publication_task.take() {
+                            task.detach();
+                        }
+                        cx.notify();
+                        ongoing
+                    })
+                    .unwrap_or(false);
+                if !ongoing {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Build a bounded batch, keeping published geometry usable until the
+    /// complete candidate subtree can be attached without visiting its rows.
+    fn advance_row_publication(&mut self, cx: &mut Context<Self>) {
+        const ROW_BATCH: usize = 512;
+        let Some(mut work) = self
+            .text_rows
+            .as_mut()
+            .and_then(|state| state.publishing.take())
+        else {
+            return;
+        };
+        let mut budget = ROW_BATCH;
+        while budget > 0 {
+            if self.publish_single_rows(&mut work, &mut budget) {
+                continue;
+            }
+            let Some((rows, wrap, starts)) = work.lines.front() else {
+                break;
             };
-            let segment = first_source.start..last_source.end;
-            let new_start = items.len();
-            let mut heights = Vec::new();
-            for row in rows_of_line(line.clone(), &starts) {
-                let mut item = self.model.text_layout_item(
-                    display_text,
-                    row.clone(),
-                    segment.clone(),
-                    line.clone(),
-                    *line_key,
-                );
+            let DocumentLayoutItem::Text {
+                source: first,
+                line,
+                line_key,
+                node_id,
+                frame,
+                ..
+            } = &self.layout_items[rows.start]
+            else {
+                unreachable!()
+            };
+            let DocumentLayoutItem::Text { source: last, .. } = &self.layout_items[rows.end - 1]
+            else {
+                unreachable!()
+            };
+            let segment = first.start..last.end;
+            let frame = self
+                .text_rows
+                .as_ref()
+                .unwrap()
+                .frames
+                .get(&(node_id.clone(), line.clone()))
+                .copied()
+                .or(frame.0);
+            let count = (starts.len() + 1 - work.row).min(budget);
+            let mut items = Vec::with_capacity(count);
+            let mut heights = Vec::with_capacity(count);
+            for row_ix in work.row..work.row + count {
+                let begin = if row_ix == 0 {
+                    0
+                } else {
+                    starts.start(row_ix - 1)
+                };
+                let end = if row_ix == starts.len() {
+                    line.len()
+                } else {
+                    starts.start(row_ix)
+                };
+                let range = line.start + begin..line.start + end;
+                let mut item = if rows.len() == 1 && starts.is_empty() {
+                    // Empty editable nodes can share this display boundary
+                    // with another node. Preserve their explicit ownership.
+                    self.layout_items[rows.start].clone()
+                } else {
+                    self.model.text_layout_item(
+                        self.model.display_text(),
+                        range.clone(),
+                        segment.clone(),
+                        line.clone(),
+                        *line_key,
+                    )
+                };
                 if let DocumentLayoutItem::Text {
                     frame: row_frame,
                     wrapped,
+                    prepared,
                     ..
                 } = &mut item
                 {
-                    *row_frame = *frame;
-                    wrapped.0 = Some(wrap);
+                    row_frame.0 = frame;
+                    wrapped.0 = Some(*wrap);
+                    prepared.0 = self.prepared_row(*line_key, begin..end);
                 }
-                heights.push(frame.0.map(|frame| frame.row_height(&row, line)));
+                heights.push(frame.map(|frame| frame.row_height(&range, line)));
                 items.push(item);
             }
-            if let Some(offset) = top_offset.filter(|_| rows.contains(&top.item_ix)) {
-                let row = items[new_start..]
-                    .iter()
-                    .rposition(|item| {
-                        matches!(item, DocumentLayoutItem::Text { display, .. } if display.start <= offset)
-                    })
-                    .unwrap_or(0);
-                top_row = Some(new_start + row);
+            work.items.extend(items);
+            work.heights.extend(heights);
+            work.row += count;
+            budget -= count;
+            if work.row <= starts.len() {
+                break;
             }
-            splices.push((rows, heights));
+            // Capture the viewport at publication, respecting intervening scrolls.
+            let top = self.list_state.logical_scroll_top();
+            let top_offset = match self.layout_items.get(top.item_ix) {
+                Some(DocumentLayoutItem::Text { display, .. }) if rows.contains(&top.item_ix) => {
+                    Some(display.start)
+                }
+                _ => None,
+            };
+            let new_top = top_offset.map(|offset| rows.start + work.items.partition_point(|item| matches!(item, DocumentLayoutItem::Text { display, .. } if display.start <= offset)).saturating_sub(1));
+            let old_items = self
+                .layout_items
+                .splice_prepared(rows.clone(), std::mem::take(&mut work.items));
+            let old_heights = self
+                .list_state
+                .splice_prepared(rows.clone(), std::mem::take(&mut work.heights));
+            if let Some(item_ix) = new_top {
+                self.list_state.scroll_to(gpui::ListOffset {
+                    item_ix,
+                    offset_in_item: top.offset_in_item,
+                });
+            }
+            if let Some(pending) = self
+                .pending_viewport_anchor
+                .as_ref()
+                .filter(|pending| !pending.reveal_on_wrap)
+                && let Ok(position) = self.model.position_for_anchor(pending.anchor)
+                && let Ok(offset) = self.resolve_position(&position)
+                && segment.contains(&offset)
+            {
+                self.list_state.scroll_to(gpui::ListOffset {
+                    item_ix: self.layout_item_for_source(offset),
+                    offset_in_item: px(0.),
+                });
+            }
+            self.text_rows
+                .as_mut()
+                .unwrap()
+                .retired
+                .push((old_items, old_heights));
+            work.row = 0;
+            work.lines.pop_front();
         }
-        items.extend(old);
-        self.layout_items = items;
-        // Splice from the end so earlier ranges keep their indices.
-        for (rows, heights) in splices.into_iter().rev() {
-            self.list_state.splice_with_heights(rows, heights);
+        if !work.lines.is_empty() {
+            self.text_rows.as_mut().unwrap().publishing = Some(work);
+        } else {
+            self.prune_row_cache();
         }
-        if let Some(item_ix) = top_row {
-            self.list_state.scroll_to(gpui::ListOffset {
-                item_ix,
-                offset_in_item: top.offset_in_item,
-            });
-        }
-        // Re-index a retained visible anchor so its geometry can be restored.
-        // Explicit reveals wait until layout supplies the new viewport height.
-        if let Some(offset) = reanchor {
-            self.list_state.scroll_to(gpui::ListOffset {
-                item_ix: self.layout_item_for_source(offset),
-                offset_in_item: px(0.),
-            });
-        }
-        self.prune_row_cache();
         cx.notify();
+    }
+
+    fn publish_single_rows(&mut self, work: &mut RowPublication<I>, budget: &mut usize) -> bool {
+        if work.row != 0 {
+            return false;
+        }
+        let Some((rows, _, starts)) = work
+            .lines
+            .front()
+            .filter(|(rows, _, starts)| rows.len() == 1 && starts.is_empty())
+        else {
+            return false;
+        };
+        debug_assert!(starts.is_empty());
+        let end = rows.end;
+        let mut start = end;
+        let mut values = Vec::new();
+        while values.len() < *budget {
+            let Some((rows, wrap, _)) = work.lines.front().filter(|(rows, _, starts)| {
+                rows.len() == 1 && rows.end == start && starts.is_empty()
+            }) else {
+                break;
+            };
+            let DocumentLayoutItem::Text {
+                node_id,
+                line,
+                frame,
+                line_key,
+                ..
+            } = &self.layout_items[rows.start]
+            else {
+                unreachable!()
+            };
+            let frame = self
+                .text_rows
+                .as_ref()
+                .unwrap()
+                .frames
+                .get(&(node_id.clone(), line.clone()))
+                .copied()
+                .or(frame.0);
+            values.push((*wrap, frame, self.prepared_row(*line_key, 0..line.len())));
+            start = rows.start;
+            work.lines.pop_front();
+        }
+        *budget -= values.len();
+        let mut heights = Vec::with_capacity(values.len());
+        self.layout_items.map_range(start..end, |item| {
+            let (wrap, value, prepared_line) = values.pop().unwrap();
+            if let DocumentLayoutItem::Text {
+                display,
+                line,
+                frame,
+                wrapped,
+                prepared,
+                ..
+            } = item
+            {
+                frame.0 = value;
+                wrapped.0 = Some(wrap);
+                prepared.0 = prepared_line;
+                heights.push(value.map(|frame| frame.row_height(display, line)));
+            }
+        });
+        self.list_state.set_item_heights(start, heights);
+        true
+    }
+
+    fn prepared_row(&self, key: u64, range: Range<usize>) -> Option<Arc<gpui::PreparedLine>> {
+        let rows = &self.text_rows.as_ref()?.cache.lines.get(&key)?.prepared;
+        let ix = rows.partition_point(|(row, _)| row.start < range.start);
+        rows.get(ix)
+            .filter(|(row, _)| *row == range)
+            .map(|(_, line)| line.clone())
     }
 
     /// Drops the cached wraps of lines no longer in the document once they
@@ -1418,12 +2244,13 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
 /// The display rows of `line`, split at `starts`, which are relative to the line.
 pub(in crate::document) fn rows_of_line(
     line: Range<usize>,
-    starts: &[u32],
-) -> impl Iterator<Item = Range<usize>> + '_ {
+    starts: impl IntoIterator<Item: std::borrow::Borrow<u32>, IntoIter: Clone>,
+) -> impl Iterator<Item = Range<usize>> {
+    use std::borrow::Borrow as _;
     let end = line.end;
     let starts = starts
-        .iter()
-        .map(move |start| line.start + *start as usize)
+        .into_iter()
+        .map(move |start| line.start + *start.borrow() as usize)
         .filter(move |start| *start < end);
     let row_starts = std::iter::once(line.start).chain(starts.clone());
     let row_ends = starts.chain(std::iter::once(end));
@@ -1440,6 +2267,7 @@ pub(in crate::document) fn rows_of_line(
 /// to the next tab stop from the row's start. Rows therefore never split a
 /// cluster. A tab exactly at a stop counts a whole tab, so a row is never
 /// estimated narrower than drawn.
+#[cfg(test)]
 fn wrap_line(
     line: &str,
     runs: &[(usize, usize)],
@@ -1498,6 +2326,11 @@ fn fits_unwrapped(line: &str, ascii_advance: Pixels, width: Pixels) -> bool {
 /// How far `cluster` advances a row already `x` wide.
 fn advance(wrapper: &mut LineWrapper, cluster: &str, x: Pixels) -> Pixels {
     if cluster != "\t" {
+        // Such clusters only reach the background wrapper. Isolate expensive
+        // shaping from the font context used by foreground text and glyphs.
+        if cluster.len() > 1024 {
+            return wrapper.cluster_width_in_background(cluster);
+        }
         return wrapper.cluster_width(cluster);
     }
     let tab = wrapper.char_width('\t');
@@ -1526,6 +2359,236 @@ mod tests {
         DocumentBlock, DocumentParagraphStyle, DocumentProjection, DocumentSnapshot,
         DocumentStyles, EditPolicy, ProjectionSpan,
     };
+
+    #[gpui::test]
+    fn visible_long_line_obeys_budget_and_rejects_superseded_results(cx: &mut TestAppContext) {
+        let (document, mut cx) = super::super::tests::document_view(cx);
+        let text: Arc<str> = "word ".repeat(100_000).into();
+        document.update(&mut cx, |doc, cx| {
+            doc.reset(
+                DocumentSnapshot::new(
+                    text.to_string(),
+                    vec![DocumentRegion::new(
+                        "source",
+                        0..text.len(),
+                        EditPolicy::Readonly,
+                    )],
+                    DocumentProjection::identity(text.len()),
+                    vec![],
+                    DocumentStyles::default(),
+                ),
+                cx,
+            )
+            .unwrap();
+            doc.set_text_rows(Some(TextRows::new()), cx);
+        });
+        cx.update(|window, cx| {
+            document.update(cx, |doc, cx| {
+                let bounds = |width| Bounds::new(gpui::point(px(0.), px(0.)), size(px(width), px(400.)));
+                doc.prepare_text_rows(bounds(320.), window, cx);
+                assert_eq!(doc.layout_items.len(), 1);
+                let state = doc.text_rows.as_ref().unwrap();
+                assert!(state.pending.is_some(), "visibility must not bypass the budget");
+                let request = state.request;
+                let generation = state.generation;
+                let cancel = state.cancel.clone();
+                assert!(doc.pending_row_paint_range(0..text.len(), None).len() <= 2048);
+                doc.prepare_text_rows(bounds(160.), window, cx);
+                assert!(cancel.load(Ordering::Relaxed));
+                let DocumentLayoutItem::Text { line_key, .. } = &doc.layout_items[0] else { unreachable!() };
+                let input = Previous { text: text.clone(), range: 0..text.len(), breaks: Breaks::default(), runs: Arc::from([]), widths: (px(320.), px(320.)), fonts_key: 0, change: None };
+                doc.text_rows.as_mut().unwrap().ready = Some(WrapResult {
+                    generation, request,
+                    lines: vec![WrappedLine { item: 0, range: 0..text.len(), key: *line_key, widths: input.widths, starts: Breaks::default(), input, prepared: Default::default() }].into(),
+                });
+                doc.prepare_text_rows(bounds(160.), window, cx);
+                assert!(matches!(&doc.layout_items[0], DocumentLayoutItem::Text { wrapped, .. } if wrapped.0.is_none()), "a late result cannot publish even when text and font still match");
+            });
+        });
+        settle_rows(&document, &mut cx);
+        assert_declared_geometry(&document, &mut cx);
+    }
+
+    #[gpui::test]
+    fn resumed_and_incremental_wraps_match_complete_algorithm(cx: &mut TestAppContext) {
+        let mut wrappers = vec![
+            cx.text_system()
+                .line_wrapper(gpui::font("Zed Mono"), px(16.)),
+            cx.text_system()
+                .line_wrapper(gpui::font("Zed Mono").bold(), px(19.)),
+        ];
+        let cancelled = AtomicBool::new(false);
+        for text in [
+            String::new(),
+            "   words and tabs\tmore\t".repeat(80),
+            "中e\u{301}👩\u{200d}💻🇨🇳 \t尾".repeat(100),
+        ] {
+            for widths in [(px(90.), px(60.)), (px(0.), px(0.)), (px(200.), px(200.))] {
+                for runs in [
+                    Vec::new(),
+                    vec![
+                        (text.floor_char_boundary(text.len() / 2), 1),
+                        (text.len(), 0),
+                    ],
+                ] {
+                    let expected = wrap_line(&text, &runs, &mut wrappers, widths);
+                    for budget in [1, 7, 1024] {
+                        let mut work = Wrap::new(&text, &runs, widths, None);
+                        while !work.step(&text, &runs, &mut wrappers, budget, &cancelled) {}
+                        assert_eq!(work.finish().starts().collect::<Vec<_>>(), expected);
+                    }
+                }
+            }
+        }
+        let old: Arc<str> = "word 中e\u{301}👩\u{200d}💻 \t tail ".repeat(3000).into();
+        let widths = (px(91.), px(73.));
+        let mut initial = Wrap::new(&old, &[], widths, None);
+        while !initial.step(&old, &[], &mut wrappers, 256, &cancelled) {}
+        let breaks = initial.finish();
+        for insertion in ["x", " xyz ", "\t", "\u{301}", "👩\u{200d}"] {
+            let mut text = old.to_string();
+            let at = text.floor_char_boundary(text.len() / 3);
+            text.insert_str(at, insertion);
+            let previous = Previous {
+                text: old.clone(),
+                range: 0..old.len(),
+                breaks: breaks.clone(),
+                runs: Arc::from([]),
+                widths,
+                fonts_key: 0,
+                change: Some((at, old.len() - at)),
+            };
+            let mut work = Wrap::new(&text, &[], widths, Some(previous));
+            while !work.step(&text, &[], &mut wrappers, 256, &cancelled) {}
+            assert!(
+                work.reused > 100,
+                "must reuse the converged suffix for {insertion:?}"
+            );
+            assert!(
+                work.processed < text.len() / 10,
+                "local edit must not rewrap the prefix or suffix"
+            );
+            assert_eq!(
+                work.finish().starts().collect::<Vec<_>>(),
+                wrap_line(&text, &[], &mut wrappers, widths)
+            );
+        }
+        let runs = vec![(old.floor_char_boundary(old.len() / 2), 1), (old.len(), 0)];
+        let mut initial = Wrap::new(&old, &runs, widths, None);
+        while !initial.step(&old, &runs, &mut wrappers, 1024, &cancelled) {}
+        let breaks = initial.finish();
+        for replacement in ["", "a", "中\t", "e\u{301}👩\u{200d}💻"] {
+            let mut text = old.to_string();
+            let start = text.floor_char_boundary(text.len() / 3);
+            let end = text.ceil_char_boundary(start + 7);
+            text.replace_range(start..end, replacement);
+            let delta = text.len() as isize - old.len() as isize;
+            let next_runs: Vec<_> = runs
+                .iter()
+                .map(|(end, font)| (end.checked_add_signed(delta).unwrap(), *font))
+                .collect();
+            let previous = Previous {
+                text: old.clone(),
+                range: 0..old.len(),
+                breaks: breaks.clone(),
+                runs: runs.clone().into(),
+                widths,
+                fonts_key: 0,
+                change: Some((start, old.len() - end)),
+            };
+            let mut work = Wrap::new(&text, &next_runs, widths, Some(previous));
+            while !work.step(&text, &next_runs, &mut wrappers, 1024, &cancelled) {}
+            assert!(work.reused > 100);
+            assert_eq!(
+                work.finish().starts().collect::<Vec<_>>(),
+                wrap_line(&text, &next_runs, &mut wrappers, widths)
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn transaction_deltas_seed_line_checkpoints_without_a_text_diff(cx: &mut TestAppContext) {
+        use crate::document::{EditDecision, EditOrigin, EditTransaction, TextEdit};
+        let (document, mut cx) = super::super::tests::document_view(cx);
+        let text = "word ".repeat(10_000);
+        document.update(&mut cx, |doc, cx| {
+            doc.reset(
+                DocumentSnapshot::new(
+                    text.clone(),
+                    vec![DocumentRegion::new(
+                        "draft",
+                        0..text.len(),
+                        EditPolicy::Editable,
+                    )],
+                    DocumentProjection::identity(text.len()),
+                    vec![],
+                    DocumentStyles::default(),
+                ),
+                cx,
+            )
+            .unwrap();
+            doc.set_text_rows(Some(TextRows::new()), cx);
+        });
+        settle_rows(&document, &mut cx);
+        cx.update(|window, cx| {
+            document.update(cx, |doc, cx| {
+                let widths = match &doc.layout_items[0] {
+                    DocumentLayoutItem::Text { frame, .. } => frame
+                        .0
+                        .unwrap()
+                        .widths(doc.text_rows.as_ref().unwrap().width.unwrap()),
+                    _ => unreachable!(),
+                };
+                for (at, insert) in [(100, "x"), (200, "y")] {
+                    let transaction = EditTransaction::new(
+                        doc.model.revision,
+                        EditOrigin::User,
+                        vec![TextEdit::new(at..at + 1, insert)],
+                        doc.model.text.len(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        doc.commit_user_transaction(transaction, None, cx),
+                        EditDecision::Apply
+                    );
+                }
+                let hint = doc.text_rows.as_ref().unwrap().edit.as_ref().unwrap();
+                assert_eq!(
+                    (hint.prefix, hint.suffix, hint.current_len),
+                    (100, text.len() - 201, text.len())
+                );
+                let stale = StaleLine {
+                    items: 0..1,
+                    in_view: true,
+                    bytes: text.len(),
+                    wrapped_before: true,
+                    widths,
+                };
+                let mut fonts = FontTable::new(window);
+                let spec = doc.line_spec(&stale, &mut fonts);
+                assert_eq!(
+                    spec.previous.as_ref().unwrap().change,
+                    Some((100, text.len() - 201))
+                );
+                let mut wrappers = fonts.wrappers(cx);
+                let source = doc.model.display_text();
+                let mut work = Wrap::new(source, &spec.runs, spec.widths, spec.previous.clone());
+                while !work.step(
+                    source,
+                    &spec.runs,
+                    &mut wrappers,
+                    1024,
+                    &AtomicBool::new(false),
+                ) {}
+                assert!(work.processed < 1024);
+                assert!(work.reused > 100);
+                assert_eq!(
+                    work.finish().starts().collect::<Vec<_>>(),
+                    wrap_line(source, &spec.runs, &mut wrappers, spec.widths)
+                );
+            });
+        });
+    }
 
     #[test]
     fn rows_split_lines_at_starts_relative_to_the_line() {
@@ -1757,6 +2820,19 @@ mod tests {
         });
     }
 
+    pub(super) fn settle_rows(
+        document: &Entity<DocumentState<&'static str>>,
+        cx: &mut VisualTestContext,
+    ) {
+        for _ in 0..10000 {
+            draw(cx);
+            if document.read_with(cx, |doc, _| !doc.is_laying_out_text()) {
+                return;
+            }
+        }
+        panic!("text-row work failed to settle");
+    }
+
     /// Every item's list height is what its frame or block declares, and the
     /// list extent is their sum.
     pub(super) fn assert_declared_geometry(
@@ -1939,7 +3015,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let (document, mut cx, _) = framed_document(&paragraph, cx);
-        draw(&mut cx);
+        settle_rows(&document, &mut cx);
         assert_declared_geometry(&document, &mut cx);
         let original = line_rows(&document, "text", &mut cx);
         for (width, narrower) in [(150., true), (320., false), (160., true), (320., false)] {
@@ -1959,8 +3035,7 @@ mod tests {
             assert_ne!(partial, before);
             assert_eq!(partial > before, narrower);
 
-            draw(&mut cx);
-            draw(&mut cx);
+            settle_rows(&document, &mut cx);
             document.read_with(&cx, |document, _| {
                 assert!(!document.text_rows.as_ref().unwrap().is_wrapping());
             });

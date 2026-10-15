@@ -172,7 +172,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 *line_key = key;
             }
             if !self.layout_items[ix].same_layout_identity(&next) {
-                self.layout_items[ix] = next;
+                self.layout_items.update(ix, |item| *item = next);
                 match &mut remeasure {
                     Some(range) if range.end == ix => range.end = ix + 1,
                     pending => {

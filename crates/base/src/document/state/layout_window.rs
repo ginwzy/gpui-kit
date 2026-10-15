@@ -122,13 +122,14 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     } else {
                         refit = true;
                     }
-                    self.layout_items[ix] = new;
+                    self.layout_items.update(ix, |item| *item = new);
                 }
                 continue;
             }
             refit = true;
             self.list_state.splice(items.clone(), replacement.len());
-            self.layout_items.splice(items, replacement);
+            let retired = self.layout_items.splice(items, replacement);
+            self.retire_text_layout_items(retired);
         }
         if refit {
             self.list_state.clone().measure_all();
@@ -217,18 +218,19 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         display_delta: isize,
         keep_prefix: usize,
     ) {
-        for item in &mut self.layout_items[old.end..] {
-            item.shift(source_delta, display_delta);
-        }
-        let old_items = &self.layout_items[old.clone()];
+        self.layout_items
+            .map_range(old.end..self.layout_items.len(), |item| {
+                item.shift(source_delta, display_delta);
+            });
+        let old_items = self.layout_items.clone();
         let prefix = old_items
-            .iter()
+            .range(old.clone())
             .zip(&replacement)
             .take(keep_prefix)
             .take_while(|(old, new)| old.same_layout_identity(new))
             .count();
-        let suffix = old_items[prefix..]
-            .iter()
+        let suffix = old_items
+            .range(old.start + prefix..old.end)
             .rev()
             .zip(replacement[prefix..].iter().rev())
             .take_while(|(old, new)| old.same_layout_identity(new))
@@ -241,18 +243,27 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         }
         let split = replacement.len() - suffix;
         let (head, tail) = replacement.split_at_mut(split);
-        for (old, new) in old_items[..prefix].iter().zip(head) {
+        for (old, new) in old_items.range(old.start..old.start + prefix).zip(head) {
             new.keep_geometry(old);
         }
-        for (old, new) in old_items[old_items.len() - suffix..].iter().zip(tail) {
+        for (old, new) in old_items.range(old.end - suffix..old.end).zip(tail) {
             new.keep_geometry(old);
         }
-        forget_touched_geometry(
-            &old_items[prefix..old_items.len() - suffix],
-            &mut replacement,
-            prefix..split,
-        );
-        self.layout_items.splice(old, replacement);
+        // Geometry invalidation asks only which nodes were touched. One
+        // representative per semantic line is sufficient, even when that
+        // line previously occupied hundreds of thousands of display rows.
+        let mut touched = Vec::new();
+        let mut ix = old.start + prefix;
+        while ix < old.end - suffix {
+            touched.push(old_items[ix].clone());
+            ix = match &old_items[ix] {
+                DocumentLayoutItem::Text { .. } => self.line_rows(ix).end,
+                _ => ix + 1,
+            };
+        }
+        forget_touched_geometry(&touched, &mut replacement, prefix..split);
+        let removed = self.layout_items.splice_prepared(old, replacement.into());
+        self.retire_layout_items(removed);
         self.layout_items_changed();
     }
 
@@ -266,7 +277,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             "the list has one item per layout item"
         );
         let document = self.next_layout_items();
-        let actual = layout_lines(&self.layout_items);
+        let retained: Vec<_> = self.layout_items.iter().cloned().collect();
+        let actual = layout_lines(&retained);
         let expected = layout_lines(&document);
         if let Some(ix) =
             (0..actual.len().max(expected.len())).find(|ix| actual.get(*ix) != expected.get(*ix))
