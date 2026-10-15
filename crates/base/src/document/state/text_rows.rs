@@ -1492,8 +1492,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             0
         };
         let mut rewrap_budget = REWRAP_IN_FRAME_BYTES;
-        // Priority changes ordering, never the execution budget. Unicode is
-        // always background work: even one cluster can be expensive to shape.
+        // Priority changes ordering, never the execution budget. Display
+        // bounds every cluster's shaping (`MAX_DISPLAY_CLUSTER_CHARS`), so a
+        // line's cost follows its bytes whatever its script: a short Unicode
+        // line wraps in the frame like ASCII, and a long one in the background.
         let focus = self
             .pending_viewport_anchor
             .as_ref()
@@ -1514,8 +1516,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             } else {
                 &mut first_budget
             };
-            let ascii = line.bytes <= REWRAP_IN_FRAME_BYTES && matches!(&self.layout_items[line.items.start], DocumentLayoutItem::Text { line, .. } if self.model.display_text()[line.clone()].bytes().all(|byte| (b' '..=b'~').contains(&byte)));
-            if ascii && line.bytes <= *budget {
+            if line.bytes <= REWRAP_IN_FRAME_BYTES && line.bytes <= *budget {
                 *budget -= line.bytes;
                 return true;
             }
@@ -2306,6 +2307,72 @@ mod tests {
             });
         });
         settle_rows(&document, &mut cx);
+        assert_declared_geometry(&document, &mut cx);
+    }
+
+    #[gpui::test]
+    fn editing_a_wrapped_unicode_paragraph_keeps_its_rows_in_the_same_frame(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::document::{EditDecision, EditOrigin, EditTransaction, TextEdit};
+        let (document, mut cx) = document_view(cx);
+        let text = "中文段落内容，e\u{301}👩\u{200d}💻 ".repeat(40);
+        document.update(&mut cx, |doc, cx| {
+            doc.reset(
+                DocumentSnapshot::new(
+                    text.clone(),
+                    vec![DocumentRegion::new(
+                        "draft",
+                        0..text.len(),
+                        EditPolicy::Editable,
+                    )],
+                    DocumentProjection::identity(text.len()),
+                    vec![],
+                    DocumentStyles::default(),
+                ),
+                cx,
+            )
+            .unwrap();
+            doc.set_text_rows(Some(TextRows::new()), cx);
+        });
+        cx.simulate_resize(size(px(320.), px(400.)));
+        settle_rows(&document, &mut cx);
+        assert!(document.read_with(&cx, |doc, _| doc.layout_items.len()) > 1);
+
+        document.update(&mut cx, |doc, cx| {
+            let transaction = EditTransaction::new(
+                doc.model.revision,
+                EditOrigin::User,
+                vec![TextEdit::new(3..3, "字")],
+                doc.model.text.len(),
+            )
+            .unwrap();
+            assert_eq!(
+                doc.commit_user_transaction(transaction, None, cx),
+                EditDecision::Apply
+            );
+        });
+        // The frame drawn right after the keystroke, before background work runs.
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let drawn = document.read_with(&cx, |doc, _| {
+            assert!(
+                doc.layout_items.iter().all(|item| !matches!(
+                    item,
+                    DocumentLayoutItem::Text { wrapped, .. } if wrapped.0.is_none()
+                )),
+                "the edited paragraph showed unwrapped rows"
+            );
+            doc.layout_items.len()
+        });
+        assert!(drawn > 1, "the edited paragraph collapsed to one row");
+        settle_rows(&document, &mut cx);
+        assert_eq!(
+            document.read_with(&cx, |doc, _| doc.layout_items.len()),
+            drawn
+        );
         assert_declared_geometry(&document, &mut cx);
     }
 
