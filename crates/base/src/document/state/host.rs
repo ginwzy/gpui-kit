@@ -302,15 +302,9 @@ impl<I> DocumentLayoutItem<I> {
     /// Drops the geometry layout derived for this item.
     pub(super) fn forget_geometry(&mut self) {
         match self {
-            Self::Text {
-                frame,
-                wrapped,
-                prepared,
-                ..
-            } => {
+            Self::Text { frame, wrapped, .. } => {
                 frame.0 = None;
                 wrapped.0 = None;
-                prepared.0 = None;
             }
             Self::Block { height, .. } | Self::AnchoredBlock { height, .. } => {
                 height.0 = Default::default()
@@ -323,22 +317,15 @@ impl<I> DocumentLayoutItem<I> {
     pub(super) fn keep_geometry(&mut self, old: &Self) {
         match (self, old) {
             (
-                Self::Text {
-                    frame,
-                    wrapped,
-                    prepared,
-                    ..
-                },
+                Self::Text { frame, wrapped, .. },
                 Self::Text {
                     frame: old_frame,
                     wrapped: old_wrapped,
-                    prepared: old_prepared,
                     ..
                 },
             ) => {
                 *frame = *old_frame;
                 *wrapped = *old_wrapped;
-                prepared.0 = old_prepared.0.clone();
             }
             (
                 Self::Block { height, .. } | Self::AnchoredBlock { height, .. },

@@ -12,7 +12,7 @@ use std::{
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use super::advance;
+use super::{MAX_ROW_BYTES, advance};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Checkpoint {
@@ -257,11 +257,14 @@ impl Wrap {
             } else {
                 self.widths.1
             };
-            let broke = self.point.x + amount > width && ix > self.point.row;
+            let end = ix + cluster.len();
+            let broke = (self.point.x + amount > width || end - self.point.row > MAX_ROW_BYTES)
+                && ix > self.point.row;
             if broke {
+                let row = self.point.row;
                 let start = self
                     .candidate
-                    .filter(|start| *start > self.point.row)
+                    .filter(|start| *start > row && end - start <= MAX_ROW_BYTES)
                     .unwrap_or(ix);
                 self.point.row = start;
                 self.candidate = None;

@@ -809,7 +809,6 @@ enum DocumentLayoutItem<I> {
         frame: Derived<Option<text_rows::RowFrame>>,
         /// What the line's rows were wrapped for, once text rows wrapped it.
         wrapped: Derived<Option<text_rows::WrapKey>>,
-        prepared: Derived<Option<std::sync::Arc<gpui::PreparedLine>>>,
     },
     Block {
         id: I,
@@ -1405,7 +1404,6 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             line_key,
             frame: Derived::default(),
             wrapped: Derived::default(),
-            prepared: Derived::default(),
         }
     }
 
@@ -4702,18 +4700,13 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             // Each document item is one logical line. Choose the nearest caret
             // boundary, not the containing glyph; Err also carries a valid
             // index at either edge of the actual soft-wrapped row.
-            record
-                .layout
-                .closest_prepared_caret_index(point - record.bounds.origin)
-                .unwrap_or_else(|| {
-                    record.layout.line_layout_for_index(0).map_or(0, |line| {
-                        closest_caret_index(
-                            &line,
-                            point - record.bounds.origin,
-                            record.layout.line_height(),
-                        )
-                    })
-                })
+            record.layout.line_layout_for_index(0).map_or(0, |line| {
+                closest_caret_index(
+                    &line,
+                    point - record.bounds.origin,
+                    record.layout.line_height(),
+                )
+            })
         };
         let affinity = if local == record.display.len() && local > 0 {
             Affinity::Before
@@ -5468,9 +5461,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.text_layouts.clear();
         self.block_layouts.clear();
         self.trailer_layout = None;
-        if let Some(rows) = self.text_rows.as_mut() {
-            rows.paint.begin_frame();
-        }
     }
 
     pub(super) fn update_trailer_layout(&mut self, item_ix: usize, bounds: Bounds<Pixels>) {
@@ -5612,7 +5602,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 line,
                 frame,
                 wrapped,
-                prepared,
                 ..
             } => {
                 if let Some(node_id) = node_id {
@@ -5655,14 +5644,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     item_ix,
                     display: display.clone(),
                     // Rows hold no text; only the rows in view slice it.
-                    text: prepared
-                        .0
-                        .as_ref()
-                        .map(|line| line.text().clone())
-                        .unwrap_or_else(|| {
-                            self.model.display_text()[display.clone()].to_owned().into()
-                        }),
-                    prepared: prepared.0.clone(),
+                    text: self.model.display_text()[display.clone()].to_owned().into(),
                     presentation: Box::new(presentation),
                 }
             }

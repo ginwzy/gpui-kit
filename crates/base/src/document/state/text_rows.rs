@@ -32,10 +32,16 @@ use super::{Derived, DocumentLayoutItem, DocumentState, DocumentTextContext};
 use crate::document::DocumentRegion;
 
 mod font_runs;
-mod paint;
 mod wrap;
 use font_runs::{FontOverride, font_runs};
 use wrap::{Breaks, Previous, Wrap};
+
+/// A display row holds at most this many bytes. A row of zero-advance text
+/// never reaches its width, so without this bound one row could hold a whole
+/// line, and showing it would shape every character. Only a single grapheme
+/// cluster may exceed the bound; GPUI shapes a bounded prefix of such a
+/// cluster (`MAX_DISPLAY_CLUSTER_CHARS`). Text and positions are unaffected.
+const MAX_ROW_BYTES: usize = 4096;
 
 /// Lines never wrapped before all wrap within the frame when they total up to
 /// this many bytes, so a text of this size shows its final rows and extent in
@@ -289,10 +295,7 @@ struct CachedRows {
     /// Where rows after the first start, relative to the line.
     starts: Breaks,
     input: Option<Previous>,
-    prepared: PreparedRows,
 }
-
-type PreparedRows = Arc<[(Range<usize>, Arc<gpui::PreparedLine>)]>;
 
 impl RowCache {
     /// Where rows after the first start in the line keyed `key`, relative to
@@ -316,7 +319,6 @@ impl RowCache {
                 widths: wrap.widths,
                 starts,
                 input,
-                prepared: Default::default(),
             },
         );
     }
@@ -437,7 +439,6 @@ pub(in crate::document) struct TextRowsState<I> {
     /// The widest printable ASCII character in the base font, once a wrap needs it.
     ascii_advance: Option<Pixels>,
     pending: Option<Task<()>>,
-    pub(super) paint: paint::PaintPreparation,
     ready: Option<WrapResult>,
     request: u64,
     cancel: Arc<AtomicBool>,
@@ -481,18 +482,15 @@ struct WrappedLine {
     widths: (Pixels, Pixels),
     starts: Breaks,
     input: Previous,
-    prepared: PreparedRows,
 }
 
 impl<I: Clone> TextRowsState<I> {
     fn invalidate(&mut self) {
-        self.paint.invalidate();
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = Arc::new(AtomicBool::new(false));
         self.request += 1;
-        // Keep the one worker until it acknowledges cancellation. A platform
-        // shaping call may not be interruptible; dropping its handle here
-        // would allow each resize to start another simultaneous call.
+        // Keep the one worker until it acknowledges cancellation, so each
+        // resize cannot start another simultaneous wrap.
         self.ready = None;
         self.publication_task = None;
         if let Some(work) = self.publishing.take() {
@@ -513,7 +511,6 @@ impl<I: Clone> TextRowsState<I> {
             scan_all: true,
             ascii_advance: None,
             pending: None,
-            paint: Default::default(),
             ready: None,
             request: 0,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -550,7 +547,6 @@ struct LineSpec {
     previous: Option<Previous>,
     fonts_key: u64,
     priority: bool,
-    prepared: PreparedRows,
 }
 
 /// The fonts lines wrap in. The base style's font is the first.
@@ -658,66 +654,7 @@ impl LineSpec {
                 change: None,
             },
             starts,
-            prepared: self.prepared.clone(),
         }
-    }
-
-    fn prepare_rows(
-        &self,
-        text: &str,
-        starts: &Breaks,
-        fonts: &[(Font, Pixels)],
-        text_system: &gpui::TextSystem,
-        cancel: &AtomicBool,
-    ) -> PreparedRows {
-        let mut prepared = Vec::new();
-        let mut begin = 0;
-        for end in starts
-            .starts()
-            .map(|ix| ix as usize)
-            .chain([self.range.len()])
-        {
-            if cancel.load(Ordering::Relaxed) {
-                return Default::default();
-            }
-            if end - begin > 2048 {
-                let range = begin..end;
-                let previous = self.prepared.iter().find(|(old, _)| *old == range);
-                let row = if let Some((_, previous)) = previous {
-                    previous.clone()
-                } else {
-                    let mut runs = Vec::new();
-                    let mut offset = begin;
-                    let mut size = fonts[0].1;
-                    while offset < end {
-                        let (stop, font) = self
-                            .runs
-                            .get(self.runs.partition_point(|(stop, _)| *stop <= offset))
-                            .copied()
-                            .unwrap_or((end, 0));
-                        size = fonts[font].1;
-                        runs.push(gpui::TextRun {
-                            len: stop.min(end) - offset,
-                            font: fonts[font].0.clone(),
-                            ..Default::default()
-                        });
-                        offset = stop.min(end);
-                    }
-                    Arc::new(
-                        text_system.prepare_line(
-                            text[self.range.start + begin..self.range.start + end]
-                                .to_owned()
-                                .into(),
-                            size,
-                            &runs,
-                        ),
-                    )
-                };
-                prepared.push((range, row));
-            }
-            begin = end;
-        }
-        prepared.into()
     }
 }
 
@@ -729,12 +666,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     }
     /// Whether exact text-row geometry is still being prepared. The current
     /// geometry remains internally consistent, but may be a bounded initial
-    /// placeholder or the preceding complete wrap. Includes preparation of
-    /// visible rows whose glyph counts require background composition.
+    /// placeholder or the preceding complete wrap.
     pub fn is_laying_out_text(&self) -> bool {
         self.text_rows
             .as_ref()
-            .is_some_and(|rows| rows.is_wrapping() || rows.paint.is_pending())
+            .is_some_and(|rows| rows.is_wrapping())
     }
 
     pub(super) fn retained_row_style(
@@ -1617,7 +1553,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .map(|line| self.line_spec(line, &mut fonts))
                 .collect();
             let wrappers = fonts.wrappers(cx);
-            (specs, wrappers, fonts.fonts)
+            (specs, wrappers)
         });
         self.settle_line_rows(settled, outdated, cx);
 
@@ -1628,13 +1564,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         }
         // Lines still stale wrap as they scroll into view.
         state.check = !later.is_empty();
-        let Some((specs, mut wrappers, fonts)) = background else {
+        let Some((specs, mut wrappers)) = background else {
             return;
         };
         let text: Arc<str> = self.model.display_text().into();
         let request = state.request;
         let cancel = state.cancel.clone();
-        let text_system = cx.text_system().clone();
         let task = cx.spawn(async move |this, cx| {
             let (sender, receiver) = smol::channel::bounded(2);
             let worker = cx.background_spawn(async move {
@@ -1665,13 +1600,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                         smol::future::yield_now().await;
                     }
                     let starts = work.finish();
-                    let prepared = spec.prepare_rows(&text, &starts, &fonts, &text_system, &cancel);
-                    if cancel.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let mut result = spec.result(text.clone(), starts);
-                    result.prepared = prepared;
-                    lines.push(result);
+                    lines.push(spec.result(text.clone(), starts));
                     if (spec.priority || lines.len() == 64)
                         && sender.send(std::mem::take(&mut lines)).await.is_err()
                     {
@@ -1775,9 +1704,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 state
                     .cache
                     .record(line.key, wrap, line.starts.clone(), Some(line.input));
-                if let Some(cached) = state.cache.lines.get_mut(&line.key) {
-                    cached.prepared = line.prepared;
-                }
             }
             if matches {
                 settled.push((rows, wrap));
@@ -1884,19 +1810,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 }),
                 fonts_key,
                 priority: line.in_view,
-                prepared: self
-                    .text_rows
-                    .as_ref()
-                    .and_then(|state| {
-                        state.cache.lines.get(line_key).filter(|cached| {
-                            cached
-                                .input
-                                .as_ref()
-                                .is_some_and(|input| input.fonts_key == fonts_key)
-                        })
-                    })
-                    .map(|cached| cached.prepared.clone())
-                    .unwrap_or_default(),
             }
         };
         // Unstyled lines wrap in the base font.
@@ -2078,13 +1991,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 if let DocumentLayoutItem::Text {
                     frame: row_frame,
                     wrapped,
-                    prepared,
                     ..
                 } = &mut item
                 {
                     row_frame.0 = frame;
                     wrapped.0 = Some(*wrap);
-                    prepared.0 = self.prepared_row(*line_key, begin..end);
                 }
                 heights.push(frame.map(|frame| frame.row_height(&range, line)));
                 items.push(item);
@@ -2171,7 +2082,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 node_id,
                 line,
                 frame,
-                line_key,
                 ..
             } = &self.layout_items[rows.start]
             else {
@@ -2185,39 +2095,29 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .get(&(node_id.clone(), line.clone()))
                 .copied()
                 .or(frame.0);
-            values.push((*wrap, frame, self.prepared_row(*line_key, 0..line.len())));
+            values.push((*wrap, frame));
             start = rows.start;
             work.lines.pop_front();
         }
         *budget -= values.len();
         let mut heights = Vec::with_capacity(values.len());
         self.layout_items.map_range(start..end, |item| {
-            let (wrap, value, prepared_line) = values.pop().unwrap();
+            let (wrap, value) = values.pop().unwrap();
             if let DocumentLayoutItem::Text {
                 display,
                 line,
                 frame,
                 wrapped,
-                prepared,
                 ..
             } = item
             {
                 frame.0 = value;
                 wrapped.0 = Some(wrap);
-                prepared.0 = prepared_line;
                 heights.push(value.map(|frame| frame.row_height(display, line)));
             }
         });
         self.list_state.set_item_heights(start, heights);
         true
-    }
-
-    fn prepared_row(&self, key: u64, range: Range<usize>) -> Option<Arc<gpui::PreparedLine>> {
-        let rows = &self.text_rows.as_ref()?.cache.lines.get(&key)?.prepared;
-        let ix = rows.partition_point(|(row, _)| row.start < range.start);
-        rows.get(ix)
-            .filter(|(row, _)| *row == range)
-            .map(|(_, line)| line.clone())
     }
 
     /// Drops the cached wraps of lines no longer in the document once they
@@ -2266,7 +2166,8 @@ pub(in crate::document) fn rows_of_line(
 /// width in its run's font (a ZWJ sequence is one glyph), and a tab advances
 /// to the next tab stop from the row's start. Rows therefore never split a
 /// cluster. A tab exactly at a stop counts a whole tab, so a row is never
-/// estimated narrower than drawn.
+/// estimated narrower than drawn. A row also ends before it would exceed
+/// [`MAX_ROW_BYTES`], unless it is a single cluster.
 #[cfg(test)]
 fn wrap_line(
     line: &str,
@@ -2294,8 +2195,11 @@ fn wrap_line(
         }
         indented |= first != ' ';
         let mut cluster_advance = advance(&mut wrappers[font_at(ix)], cluster, x);
-        if x + cluster_advance > width && ix > row_start {
-            let start = candidate.filter(|start| *start > row_start).unwrap_or(ix);
+        let end = ix + cluster.len();
+        if (x + cluster_advance > width || end - row_start > MAX_ROW_BYTES) && ix > row_start {
+            let start = candidate
+                .filter(|start| *start > row_start && end - start <= MAX_ROW_BYTES)
+                .unwrap_or(ix);
             starts.push(start as u32);
             row_start = start;
             width = widths.1;
@@ -2319,18 +2223,14 @@ fn wrap_line(
 /// wider than its length times the widest one. Half a pixel absorbs rounding
 /// in the wrap's running sum.
 fn fits_unwrapped(line: &str, ascii_advance: Pixels, width: Pixels) -> bool {
-    ascii_advance * line.len() as f32 <= width - px(0.5)
+    line.len() <= MAX_ROW_BYTES
+        && ascii_advance * line.len() as f32 <= width - px(0.5)
         && line.bytes().all(|byte| (b' '..=b'~').contains(&byte))
 }
 
 /// How far `cluster` advances a row already `x` wide.
 fn advance(wrapper: &mut LineWrapper, cluster: &str, x: Pixels) -> Pixels {
     if cluster != "\t" {
-        // Such clusters only reach the background wrapper. Isolate expensive
-        // shaping from the font context used by foreground text and glyphs.
-        if cluster.len() > 1024 {
-            return wrapper.cluster_width_in_background(cluster);
-        }
         return wrapper.cluster_width(cluster);
     }
     let tab = wrapper.char_width('\t');
@@ -2399,7 +2299,7 @@ mod tests {
                 let input = Previous { text: text.clone(), range: 0..text.len(), breaks: Breaks::default(), runs: Arc::from([]), widths: (px(320.), px(320.)), fonts_key: 0, change: None };
                 doc.text_rows.as_mut().unwrap().ready = Some(WrapResult {
                     generation, request,
-                    lines: vec![WrappedLine { item: 0, range: 0..text.len(), key: *line_key, widths: input.widths, starts: Breaks::default(), input, prepared: Default::default() }].into(),
+                    lines: vec![WrappedLine { item: 0, range: 0..text.len(), key: *line_key, widths: input.widths, starts: Breaks::default(), input }].into(),
                 });
                 doc.prepare_text_rows(bounds(160.), window, cx);
                 assert!(matches!(&doc.layout_items[0], DocumentLayoutItem::Text { wrapped, .. } if wrapped.0.is_none()), "a late result cannot publish even when text and font still match");
@@ -2407,6 +2307,38 @@ mod tests {
         });
         settle_rows(&document, &mut cx);
         assert_declared_geometry(&document, &mut cx);
+    }
+
+    #[gpui::test]
+    fn rows_hold_bounded_bytes_unless_they_are_one_cluster(cx: &mut TestAppContext) {
+        let mut wrappers = vec![
+            cx.text_system()
+                .line_wrapper(gpui::font("Zed Mono"), px(16.)),
+        ];
+        let cancelled = AtomicBool::new(false);
+        let widths = (px(1e7), px(1e7));
+        let cluster = format!("a{}", "\u{301}".repeat(MAX_ROW_BYTES));
+        for text in [
+            // Zero-advance text never reaches the row width.
+            "\u{200b}".repeat(3 * MAX_ROW_BYTES),
+            // Word boundaries are preferred within the byte bound.
+            "word ".repeat(2 * MAX_ROW_BYTES),
+            // An oversized cluster is a row of its own.
+            format!("x{cluster}y{cluster}"),
+        ] {
+            let mut work = Wrap::new(&text, &[], widths, None);
+            while !work.step(&text, &[], &mut wrappers, 1024, &cancelled) {}
+            let starts: Vec<_> = work.finish().starts().collect();
+            assert_eq!(starts, wrap_line(&text, &[], &mut wrappers, widths));
+            assert!(!starts.is_empty());
+            for row in rows_of_line(0..text.len(), &starts) {
+                assert!(
+                    row.len() <= MAX_ROW_BYTES || text[row.clone()].graphemes(true).count() == 1,
+                    "row {row:?} of {} bytes",
+                    row.len()
+                );
+            }
+        }
     }
 
     #[gpui::test]
@@ -2422,6 +2354,8 @@ mod tests {
             String::new(),
             "   words and tabs\tmore\t".repeat(80),
             "中e\u{301}👩\u{200d}💻🇨🇳 \t尾".repeat(100),
+            // Breaks only at the row byte bound.
+            "\u{200b}".repeat(2000),
         ] {
             for widths in [(px(90.), px(60.)), (px(0.), px(0.)), (px(200.), px(200.))] {
                 for runs in [
