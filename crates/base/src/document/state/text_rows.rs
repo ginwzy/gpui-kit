@@ -28,6 +28,9 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use super::{Derived, DocumentLayoutItem, DocumentState, DocumentTextContext};
 use crate::document::DocumentRegion;
 
+mod font_runs;
+use font_runs::{FontOverride, font_runs};
+
 /// Lines never wrapped before all wrap within the frame when they total up to
 /// this many bytes, so a text of this size shows its final rows and extent in
 /// its first frame. Beyond it, only lines in view do.
@@ -307,6 +310,7 @@ impl RowCache {
 pub(in crate::document) fn line_key<I>(item: &DocumentLayoutItem<I>) -> u64 {
     let DocumentLayoutItem::Text {
         fingerprint,
+        display,
         presentation,
         ..
     } = item
@@ -319,27 +323,44 @@ pub(in crate::document) fn line_key<I>(item: &DocumentLayoutItem<I>) -> u64 {
     };
     let mut hasher = DefaultHasher::new();
     fingerprint.hash(&mut hasher);
-    {
-        if let Some(style) = &presentation.text_style {
-            hash_font_refinement(style, &mut hasher);
-        }
-        if let Some(indent) = &presentation.indent {
-            indent.marker.hash(&mut hasher);
-            indent.hanging.hash(&mut hasher);
-        }
-        for (range, highlight) in &presentation.highlights {
-            if highlight.font_weight.is_some() || highlight.font_style.is_some() {
-                range.hash(&mut hasher);
-                highlight
-                    .font_weight
-                    .map(|weight| weight.0.to_bits())
-                    .hash(&mut hasher);
-                highlight.font_style.hash(&mut hasher);
-            }
-        }
-        presentation.font_family_overrides.hash(&mut hasher);
+    let mut styled = false;
+    if let Some(style) = font_refinement(presentation) {
+        0u8.hash(&mut hasher);
+        hash_font_refinement(style, &mut hasher);
+        styled = true;
     }
-    hasher.finish()
+    if let Some(indent) = &presentation.indent {
+        1u8.hash(&mut hasher);
+        indent.marker.hash(&mut hasher);
+        indent.hanging.hash(&mut hasher);
+        styled = true;
+    }
+    for (range, font) in font_runs(presentation, display.len()) {
+        if font != FontOverride::default() {
+            2u8.hash(&mut hasher);
+            range.hash(&mut hasher);
+            font.hash(&mut hasher);
+            styled = true;
+        }
+    }
+    // A paint-only presentation (including a default/colored paragraph) has
+    // exactly the same font inputs as no presentation at all.
+    if styled {
+        hasher.finish()
+    } else {
+        *fingerprint
+    }
+}
+
+fn font_refinement(presentation: &super::DocumentTextPresentation) -> Option<&TextStyleRefinement> {
+    presentation.text_style.as_ref().filter(|style| {
+        style.font_family.is_some()
+            || style.font_features.is_some()
+            || style.font_fallbacks.is_some()
+            || style.font_size.is_some()
+            || style.font_weight.is_some()
+            || style.font_style.is_some()
+    })
 }
 
 fn hash_font_refinement(style: &TextStyleRefinement, hasher: &mut DefaultHasher) {
@@ -1250,41 +1271,16 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             return spec(Vec::new());
         };
         let mut style = fonts.base_style.clone();
-        if let Some(refinement) = &presentation.text_style {
+        if let Some(refinement) = font_refinement(presentation) {
             style.refine(refinement);
         }
         let size = style.font_size.to_pixels(fonts.rem_size);
         let base = style.font();
-        let mut boundaries = vec![0, display.len()];
-        for (range, _) in &presentation.highlights {
-            boundaries.extend([range.start, range.end]);
-        }
-        for (range, _) in &presentation.font_family_overrides {
-            boundaries.extend([range.start, range.end]);
-        }
-        boundaries.sort_unstable();
-        boundaries.dedup();
-        let runs = boundaries
-            .windows(2)
-            .map(|run| {
-                let covers = |range: &Range<usize>| range.start <= run[0] && run[1] <= range.end;
+        let runs = font_runs(presentation, display.len())
+            .map(|(range, overrides)| {
                 let mut font = base.clone();
-                for (range, highlight) in &presentation.highlights {
-                    if covers(range) {
-                        if let Some(weight) = highlight.font_weight {
-                            font.weight = weight;
-                        }
-                        if let Some(font_style) = highlight.font_style {
-                            font.style = font_style;
-                        }
-                    }
-                }
-                for (range, family) in &presentation.font_family_overrides {
-                    if covers(range) {
-                        font.family = family.clone();
-                    }
-                }
-                (run[1], fonts.index(font, size))
+                overrides.apply(&mut font);
+                (range.end, fonts.index(font, size))
             })
             .collect();
         spec(runs)
@@ -1512,6 +1508,9 @@ fn advance(wrapper: &mut LineWrapper, cluster: &str, x: Pixels) -> Pixels {
     let stops = ((x + px(0.01)) / tab).floor();
     tab * (stops + 1.) - x
 }
+
+#[cfg(test)]
+mod font_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1750,7 +1749,7 @@ mod tests {
         (document, cx, rendered)
     }
 
-    fn draw(cx: &mut VisualTestContext) {
+    pub(super) fn draw(cx: &mut VisualTestContext) {
         cx.run_until_parked();
         cx.update(|window, cx| {
             window.refresh();
@@ -1760,7 +1759,7 @@ mod tests {
 
     /// Every item's list height is what its frame or block declares, and the
     /// list extent is their sum.
-    fn assert_declared_geometry(
+    pub(super) fn assert_declared_geometry(
         document: &Entity<DocumentState<&'static str>>,
         cx: &mut VisualTestContext,
     ) {
