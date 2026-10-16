@@ -1064,7 +1064,21 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         // Replaced items resolve now, or with a whole-document pass.
         if state.resolve {
             state.resolve = false;
-            self.resolve_row_geometry(0..usize::MAX, window, cx);
+            let (_, whole) = self.resolve_row_geometry(0..usize::MAX, window, cx);
+            // Every line just took its frame and wrap: a whole wrap check
+            // would only confirm it.
+            if whole
+                && let Some(state) = self.text_rows.as_mut()
+                && state.scan_all
+                && !state.resize_pending
+                && state.pending.is_none()
+                && state.ready.is_none()
+                && state.publishing.is_none()
+            {
+                state.scan_all = false;
+                state.check = false;
+                state.dirty = None;
+            }
         } else if let Some(dirty) = state.dirty.clone() {
             self.resolve_row_geometry(dirty, window, cx);
         }
@@ -1146,13 +1160,15 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
 
     /// Resolves the frame of every line and the height of every block in
     /// `items` that lacks one, and declares their heights to the list.
-    /// Returns where `items` ends once changed lines collapse to placeholders.
+    /// Returns where `items` ends once changed lines collapse to placeholders,
+    /// and whether every line in it is now a single row its frame shows whole
+    /// with its wrap recorded, so no line there needs a wrap check.
     fn resolve_row_geometry(
         &mut self,
         items: Range<usize>,
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> usize {
+    ) -> (usize, bool) {
         /// Adjacent single rows taking the same frame and wrap: their first
         /// item and count. Uniform text needs a handful, not one per line.
         struct Singles {
@@ -1179,6 +1195,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         // Lines whose rows collapse to one pending row, and frame map keys.
         let mut collapses = Vec::new();
         let mut keys = Vec::new();
+        let mut whole = true;
         let mut blocks = Vec::new();
         let mut trailer = None;
         // Read every item once, in order; changes apply afterwards.
@@ -1212,6 +1229,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                         && (invalid.is_empty()
                             || !invalid.contains(&(node_id.clone(), line.clone())))
                     {
+                        whole = false;
                         continue;
                     }
                     // The first row without a frame frames its whole line.
@@ -1236,11 +1254,13 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                         // The host changed the frame, and its renderer cannot
                         // reproduce the old one: one pending row until reflow.
                         collapses.push((rows, resolved));
+                        whole = false;
                         continue;
                     }
                     // Existing complete rows keep their old geometry until
                     // the candidate is published.
                     if count > 1 || keep_old && wrapped.0.is_some() {
+                        whole = false;
                         continue;
                     }
                     // As the wrap check decides it, without a second pass.
@@ -1258,6 +1278,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                                 });
                         whole.then_some(WrapKey { generation, widths })
                     });
+                    whole &= wrap.is_some();
                     match singles.last_mut() {
                         Some(last)
                             if last.start + last.count == rows.start
@@ -1418,7 +1439,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             self.list_state
                 .set_item_heights(moved(ix), [Some(self.trailer_item_height(window))]);
         }
-        moved(end)
+        (moved(end), whole)
     }
 
     pub(super) fn trailer_item_height(&self, window: &Window) -> Pixels {
