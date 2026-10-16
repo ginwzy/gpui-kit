@@ -2254,11 +2254,21 @@ fn validate_style_ranges<I: Eq>(
 // Include the final caret as a real candidate. GPUI 0.3.5's closest-index
 // helper returns EOF for every x after the last glyph start; rounding an
 // absolute caret back into local coordinates can otherwise advance a column.
+/// The caret boundary nearest `position` in `line`, which lays out `text`.
+/// Glyphs inside a grapheme cluster (combining marks, ZWJ parts) are not
+/// caret boundaries, so a click never splits a cluster.
 fn closest_caret_index(
     line: &gpui::WrappedLineLayout,
     position: Point<Pixels>,
     line_height: Pixels,
+    text: &str,
 ) -> usize {
+    let is_boundary = |index: usize| {
+        index >= text.len()
+            || unicode_segmentation::GraphemeCursor::new(index, text.len(), true)
+                .is_boundary(text, 0)
+                .unwrap_or(true)
+    };
     let row = ((position.y / line_height).max(0.) as usize).min(line.wrap_boundaries().len());
     let position = point(position.x - line.indent.for_row(row), position.y);
     let boundary = |boundary: &gpui::WrapBoundary| {
@@ -2282,7 +2292,7 @@ fn closest_caret_index(
             continue;
         }
         let delta = (glyph.position.x - origin_x - position.x).abs();
-        if delta < distance {
+        if delta < distance && is_boundary(glyph.index) {
             closest = glyph.index;
             distance = delta;
         }
@@ -4701,11 +4711,18 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             // Each document item is one logical line. Choose the nearest caret
             // boundary, not the containing glyph; Err also carries a valid
             // index at either edge of the actual soft-wrapped row.
+            // A record can predate the text; without it, every glyph counts.
+            let text = self
+                .model
+                .display_text()
+                .get(record.display.clone())
+                .unwrap_or_default();
             record.layout.line_layout_for_index(0).map_or(0, |line| {
                 closest_caret_index(
                     &line,
                     point - record.bounds.origin,
                     record.layout.line_height(),
+                    text,
                 )
             })
         };
