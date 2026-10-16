@@ -1186,6 +1186,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         } else {
             end
         };
+        let (start, plain_whole) =
+            self.resolve_plain_lines(start..end, &base_style, ascii_advance, window, cx);
         let state = self.text_rows.as_ref().unwrap();
         let (generation, invalid, width) = (state.generation, &state.invalid_frames, state.width);
         let keyed = !invalid.is_empty() || !state.frames.is_empty();
@@ -1439,7 +1441,91 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             self.list_state
                 .set_item_heights(moved(ix), [Some(self.trailer_item_height(window))]);
         }
-        (moved(end), whole)
+        (moved(end), whole && plain_whole)
+    }
+
+    /// [`Self::resolve_row_geometry`] for the lines a document opens with:
+    /// unstyled, unframed and one row each, without a frame resolver. They
+    /// share one frame, so each is framed, keyed and declared in one pass over
+    /// the items rather than a read and then a write. Stops at the first other
+    /// item, which starts a line; returns its index and whether every framed
+    /// line also recorded its wrap.
+    fn resolve_plain_lines(
+        &mut self,
+        items: Range<usize>,
+        base_style: &gpui::TextStyle,
+        ascii_advance: Option<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> (usize, bool) {
+        fn is_plain<I>(item: &DocumentLayoutItem<I>) -> bool {
+            matches!(
+                item,
+                DocumentLayoutItem::Text { display, line, frame, wrapped, presentation, .. }
+                    if display == line
+                        && frame.0.is_none()
+                        && wrapped.0.is_none()
+                        && presentation.is_none()
+            )
+        }
+        let state = self.text_rows.as_ref().unwrap();
+        if items.is_empty()
+            || self.text_frame_resolver.is_some()
+            || !state.invalid_frames.is_empty()
+            || !state.frames.is_empty()
+        {
+            return (items.start, true);
+        }
+        let (generation, width) = (state.generation, state.width);
+        let Some(first) = self
+            .layout_items
+            .get(items.start)
+            .filter(|item| is_plain(item))
+            .cloned()
+        else {
+            return (items.start, true);
+        };
+        let frame = self.resolve_line_frame(&first, &first, base_style, window, cx);
+        let widths = width.map(|width| frame.widths(width));
+        let display_text = self.model.display_text();
+        let mut heights = Vec::new();
+        let mut whole = true;
+        let mut stopped = false;
+        self.layout_items.map_range(items.clone(), |item| {
+            if stopped || !is_plain(item) {
+                stopped = true;
+                return;
+            }
+            let DocumentLayoutItem::Text {
+                display,
+                line,
+                frame: line_frame,
+                wrapped,
+                ..
+            } = item
+            else {
+                unreachable!("plain items are text");
+            };
+            let (display, line) = (&*display, &*line);
+            line_frame.0 = Some(frame);
+            // As the wrap check decides it, without a second pass.
+            wrapped.0 = widths
+                .filter(|widths| {
+                    frame.hidden
+                        || line.is_empty()
+                        || ascii_advance.is_some_and(|advance| {
+                            fits_unwrapped(&display_text[line.clone()], advance, widths.0)
+                        })
+                })
+                .map(|widths| WrapKey { generation, widths });
+            whole &= wrapped.0.is_some();
+            heights.push(Some(frame.row_height(display, line)));
+        });
+        let framed = heights.len();
+        if framed > 0 {
+            self.list_state.set_item_heights(items.start, heights);
+        }
+        (items.start + framed, whole)
     }
 
     pub(super) fn trailer_item_height(&self, window: &Window) -> Pixels {
@@ -3543,6 +3629,82 @@ mod tests {
         draw(&mut cx);
         assert_declared_geometry(&document, &mut cx);
         assert!(line_rows(&document, "text", &mut cx).len() > narrow.len());
+    }
+
+    #[gpui::test]
+    fn plain_lines_frame_in_one_pass_before_the_general_path(cx: &mut TestAppContext) {
+        // Plain lines open in one pass; from the styled heading on, lines and
+        // blocks take the general path, in the same first frame.
+        let (document, mut cx) = document_view(cx);
+        let wide = "words that wrap ".repeat(40);
+        let plain = format!("short\n{wide}\n中文的段落\n\n");
+        let source = format!("{plain}Heading\nafter\n{OBJECT}tail");
+        let text_end = source.len() - OBJECT.len() - "tail".len();
+        let fixed = text_end..text_end + OBJECT.len();
+        let heading = DocumentParagraphStyle::new(
+            plain.len()..plain.len() + "Heading\n".len(),
+            gpui::TextStyleRefinement {
+                font_size: Some(px(24.).into()),
+                ..Default::default()
+            },
+        );
+        document.update(&mut cx, |document, cx| {
+            document.set_block_renderer(|_, _, _| div().w_full().h(px(40.)).into_any_element(), cx);
+            document.set_block_height_resolver(|_, _, _| Some(px(40.).into()), cx);
+            document.set_text_rows(Some(TextRows::new()), cx);
+            document
+                .reset(
+                    DocumentSnapshot::new(
+                        source.clone(),
+                        vec![
+                            DocumentRegion::new("text", 0..text_end, EditPolicy::Readonly),
+                            DocumentRegion::new("fixed", fixed.clone(), EditPolicy::Atomic),
+                            DocumentRegion::new(
+                                "draft",
+                                fixed.end..source.len(),
+                                EditPolicy::Editable,
+                            ),
+                        ],
+                        DocumentProjection::new(
+                            source.len(),
+                            vec![ProjectionSpan::hide(fixed.clone())],
+                        )
+                        .unwrap(),
+                        vec![DocumentBlock::new("fixed", fixed)],
+                        DocumentStyles::new(vec![heading], Vec::new()),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.simulate_resize(size(px(320.), px(400.)));
+        draw(&mut cx);
+        assert_declared_geometry(&document, &mut cx);
+        let line_height = |text: &str, cx: &mut VisualTestContext| {
+            document.read_with(cx, |document, _| {
+                document
+                    .layout_items
+                    .iter()
+                    .find_map(|item| match item {
+                        DocumentLayoutItem::Text { display, frame, .. }
+                            if &document.display_text()[display.clone()] == text =>
+                        {
+                            frame.0.map(|frame| frame.line_height)
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            })
+        };
+        assert!(line_height("Heading", &mut cx) > line_height("short", &mut cx));
+        assert_eq!(line_height("after", &mut cx), line_height("short", &mut cx));
+
+        settle_rows(&document, &mut cx);
+        assert_declared_geometry(&document, &mut cx);
+        let rows = line_rows(&document, "text", &mut cx);
+        assert_eq!(rows[0], "short");
+        assert!(rows.len() > 7, "the wide line wraps: {rows:?}");
+        assert_eq!(rows.concat(), source[..text_end].replace('\n', ""));
     }
 
     #[gpui::test]
