@@ -68,64 +68,107 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// keeps its rows is replaced in place and keeps its geometry unless its
     /// fonts changed; the list only changes for lines whose rows did.
     pub(super) fn relayout_restyled_lines(&mut self, restyled: &[Range<usize>]) {
-        let rows = self.text_rows.as_ref().map(|rows| &rows.cache);
+        let rows_cache = self.text_rows.as_ref().map(|rows| &rows.cache);
         let mut lines = Vec::new();
         let mut next = 0;
+        // Lines arrive in document order: one lookup per range, then a walk.
+        let mut cursor = super::LayoutCursor::default();
         for source in restyled {
-            let mut ix = self.layout_item_for_source(source.start).max(next);
-            while let Some(item) = self.layout_items.get(ix)
+            let mut ix = self
+                .layout_items
+                .partition_point_from(next, |item| item.source_end() < source.start);
+            if matches!(
+                self.layout_items.get(ix),
+                Some(DocumentLayoutItem::Text { .. })
+            ) {
+                // A range can start inside a wrapped line; take it whole once.
+                ix = self.line_rows(ix).start.max(next);
+            }
+            let mut items = self.layout_items.iter_from(ix).peekable();
+            while let Some(item) = items.next()
                 && item.source_start() <= source.end
             {
-                let DocumentLayoutItem::Text { line, .. } = item else {
+                let DocumentLayoutItem::Text {
+                    line,
+                    node_id,
+                    source: first,
+                    ..
+                } = item
+                else {
                     ix += 1;
                     continue;
                 };
-                let items = self.line_rows(ix);
+                let mut last = first;
+                let mut count = 1;
+                while let Some(DocumentLayoutItem::Text { source, .. }) = items.next_if(|next| {
+                    matches!(next, DocumentLayoutItem::Text { line: other, node_id: other_node, .. }
+                        if other == line && other_node == node_id)
+                }) {
+                    last = source;
+                    count += 1;
+                }
+                let rows = ix..ix + count;
                 // An empty line carries no inline style.
                 if !line.is_empty() {
-                    let (
-                        DocumentLayoutItem::Text { source: first, .. },
-                        DocumentLayoutItem::Text { source: last, .. },
-                    ) = (
-                        &self.layout_items[items.start],
-                        &self.layout_items[items.end - 1],
-                    )
-                    else {
-                        unreachable!("line rows are text items");
-                    };
-                    let mut replacement = Vec::with_capacity(items.len());
+                    let mut replacement = Vec::with_capacity(count);
                     self.model.push_text_layout_items(
                         &mut replacement,
                         line.clone(),
                         first.start..last.end,
                         true,
-                        rows,
-                        &mut super::LayoutCursor::default(),
+                        rows_cache,
+                        &mut cursor,
                     );
-                    lines.push((items.clone(), replacement));
+                    lines.push((rows.clone(), replacement));
                 }
-                ix = items.end;
+                ix = rows.end;
                 next = ix;
             }
         }
         let mut refit = false;
-        // From the end, so earlier lines keep their indices.
-        for (items, replacement) in lines.into_iter().rev() {
+        // Lines that keep their rows update in place, one run of adjacent
+        // items at a time; lines whose rows change splice afterwards.
+        let mut updates = Vec::new();
+        let mut splices = Vec::new();
+        for (items, replacement) in lines {
             if replacement.len() == items.len() {
-                for (ix, mut new) in items.zip(replacement) {
-                    let old = &self.layout_items[ix];
-                    if old.same_layout_identity(&new) {
-                        continue;
-                    }
-                    if line_key_of(old) == line_key_of(&new) {
-                        new.keep_geometry(old);
-                    } else {
-                        refit = true;
-                    }
-                    self.layout_items.update(ix, |item| *item = new);
-                }
-                continue;
+                updates.extend(items.zip(replacement));
+            } else {
+                splices.push((items, replacement));
             }
+        }
+        // Nearby updates share one pass: items between them are visited and
+        // left as they are, which costs less than another tree splice.
+        const MAX_GAP: usize = 256;
+        let mut updates = updates.into_iter().peekable();
+        while let Some((start, first)) = updates.next() {
+            let mut end = start + 1;
+            let mut run = vec![(start, first)];
+            while let Some(next) = updates.next_if(|(ix, _)| *ix <= end + MAX_GAP) {
+                end = next.0 + 1;
+                run.push(next);
+            }
+            let mut run = run.into_iter().peekable();
+            let mut ix = start;
+            self.layout_items.map_range(start..end, |old| {
+                let here = ix;
+                ix += 1;
+                let Some((_, mut new)) = run.next_if(|(at, _)| *at == here) else {
+                    return;
+                };
+                if old.same_layout_identity(&new) {
+                    return;
+                }
+                if line_key_of(old) == line_key_of(&new) {
+                    new.keep_geometry(old);
+                } else {
+                    refit = true;
+                }
+                *old = new;
+            });
+        }
+        // From the end, so earlier lines keep their indices.
+        for (items, replacement) in splices.into_iter().rev() {
             refit = true;
             self.list_state.splice(items.clone(), replacement.len());
             let retired = self.layout_items.splice(items, replacement);

@@ -155,6 +155,40 @@ impl<I: Clone> LayoutItems<I> {
         }
         lo
     }
+    /// The partition point at or after `from`, for a predicate that holds
+    /// for items before it: it gallops forward from `from`, so its cost
+    /// follows the distance moved rather than the document's length. When the
+    /// predicate fails at `from`, `from` is returned.
+    pub fn partition_point_from(
+        &self,
+        from: usize,
+        mut predicate: impl FnMut(&DocumentLayoutItem<I>) -> bool,
+    ) -> usize {
+        let len = self.len();
+        if from >= len || !predicate(&self[from]) {
+            return from.min(len);
+        }
+        let (mut lo, mut step) = (from + 1, 1);
+        let mut hi = len;
+        while from + step < len {
+            let probe = from + step;
+            if !predicate(&self[probe]) {
+                hi = probe;
+                break;
+            }
+            lo = probe + 1;
+            step *= 2;
+        }
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if predicate(&self[mid]) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
     pub fn extend(&mut self, items: impl IntoIterator<Item = DocumentLayoutItem<I>>) {
         let mut items = items.into_iter();
         loop {
@@ -382,6 +416,38 @@ mod tests {
             actual.map_range(from..to, mark);
             expected[from..to].iter_mut().for_each(mark);
             assert_eq!(actual, expected, "map {step} {from}..{to}");
+        }
+    }
+
+    #[test]
+    fn galloping_partition_matches_bisection() {
+        let row = |start: usize| DocumentLayoutItem::<usize>::Block {
+            id: 0,
+            source: start..start + 1,
+            height: super::super::Derived::default(),
+        };
+        let items: Vec<_> = (0..2000).map(|ix| row(ix * 3)).collect();
+        let tree: LayoutItems<_> = items.clone().into();
+        for target in [0, 1, 7, 300, 2999, 5998, 6000, 10_000] {
+            let before = |item: &DocumentLayoutItem<usize>| item.source_start() < target;
+            let point = items.partition_point(before);
+            for from in [
+                0,
+                1,
+                50,
+                point.saturating_sub(1),
+                point,
+                point + 5,
+                1999,
+                2000,
+                2500,
+            ] {
+                assert_eq!(
+                    tree.partition_point_from(from, before),
+                    point.max(from).min(items.len()),
+                    "target {target} from {from}"
+                );
+            }
         }
     }
 

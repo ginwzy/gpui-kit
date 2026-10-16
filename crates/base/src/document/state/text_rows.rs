@@ -53,6 +53,8 @@ const REWRAP_IN_FRAME_BYTES: usize = 32 * 1024;
 /// At most this many lines go to one background wrap. Preparing them reads
 /// the model on the UI thread; the rest go to the next wrap once it lands.
 const BACKGROUND_LINES_PER_WRAP: usize = 4096;
+/// Frames the width must hold before a resize's whole pass runs.
+const RESIZE_QUIET_FRAMES: u8 = 2;
 /// How far past the viewport, in viewport heights, rows count as in view.
 const VIEW_MARGIN: f32 = 1.;
 
@@ -459,8 +461,11 @@ pub(in crate::document) struct TextRowsState<I> {
     /// lines beyond the view within the frame budget. Later passes, which
     /// pick up background results, leave lines out of view to the background.
     nearby: bool,
-    /// The width changed in the last laid-out frame.
-    resizing: bool,
+    /// A drag's width changes await their whole pass, which runs once the
+    /// width has held for `RESIZE_QUIET_FRAMES` frames.
+    resize_pending: bool,
+    /// Frames laid out since the width last changed.
+    quiet_frames: u8,
 }
 
 /// Unchanged extents relative to one cached line, composed directly from the
@@ -536,7 +541,8 @@ impl<I: Clone> TextRowsState<I> {
             edit: None,
             dirty: None,
             nearby: true,
-            resizing: false,
+            resize_pending: false,
+            quiet_frames: u8::MAX,
         }
     }
 
@@ -1038,13 +1044,22 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             state.check = true;
             state.scan_all = true;
         }
-        // While the width changes frame after frame, only the view is checked:
-        // the rest keeps its complete earlier wrap, and one whole pass and
-        // background wrap follow once the width holds.
-        let defer = resized && state.resizing;
-        state.resizing = resized;
+        // While the width keeps changing, only the view is checked: the rest
+        // keeps its complete earlier wrap. A width change soon after another
+        // is a drag; its whole pass and background wrap follow once the width
+        // has held for a few frames, even when other redraws interleave. A
+        // lone change takes its whole pass at once.
+        if resized {
+            state.resize_pending |= state.quiet_frames < RESIZE_QUIET_FRAMES;
+            state.quiet_frames = 0;
+        } else {
+            state.quiet_frames = state.quiet_frames.saturating_add(1);
+        }
+        let defer = state.resize_pending && state.quiet_frames < RESIZE_QUIET_FRAMES;
         if defer {
             cx.notify();
+        } else {
+            state.resize_pending = false;
         }
         // Replaced items resolve now, or with a whole-document pass.
         if state.resolve {
@@ -1713,7 +1728,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 }
                 if frame.hidden || line.is_empty() {
                     if rows.len() == 1 {
-                        settled.push((rows, wrap));
+                        push_settled(&mut settled, rows, wrap);
                     } else {
                         outdated.push((rows, wrap, Breaks::default()));
                     }
@@ -1730,7 +1745,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     })
                 {
                     if rows.len() == 1 {
-                        settled.push((rows, wrap));
+                        push_settled(&mut settled, rows, wrap);
                     } else {
                         outdated.push((rows, wrap, Breaks::default()));
                     }
@@ -1742,7 +1757,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                         if cached.generation == generation && cached.widths == wrap.widths =>
                     {
                         if self.rows_match(rows.clone(), &cached.starts) {
-                            settled.push((rows, wrap));
+                            push_settled(&mut settled, rows, wrap);
                         } else {
                             outdated.push((rows, wrap, cached.starts.clone()));
                         }
@@ -2034,46 +2049,61 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// rows do not change, so they update in place, a run of adjacent lines
     /// at a time, without waiting for a publication.
     fn mark_settled_rows(&mut self, mut settled: Vec<(Range<usize>, WrapKey)>) {
+        // Nearby lines share one pass: items between them are visited and
+        // left as they are, which costs less than another tree splice.
+        const MAX_GAP: usize = 256;
         settled.sort_by_key(|(rows, _)| rows.start);
         let mut settled = settled.into_iter().peekable();
-        while let Some((rows, wrap)) = settled.next() {
-            debug_assert_eq!(rows.len(), 1);
-            let mut run = vec![wrap];
-            while let Some((_, wrap)) =
-                settled.next_if(|(next, _)| next.start == rows.start + run.len())
-            {
-                run.push(wrap);
+        while let Some(first) = settled.next() {
+            let start = first.0.start;
+            let mut end = first.0.end;
+            let mut batch = vec![first];
+            while let Some(next) = settled.next_if(|(rows, _)| rows.start <= end + MAX_GAP) {
+                end = end.max(next.0.end);
+                batch.push(next);
             }
-            let start = rows.start;
             let frames = &self.text_rows.as_ref().expect("text rows are on").frames;
-            let mut heights = Vec::new();
-            let mut run = run.into_iter();
-            self.layout_items
-                .map_range(start..start + run.len(), |item| {
-                    let DocumentLayoutItem::Text {
-                        display,
-                        line,
-                        node_id,
-                        frame,
-                        wrapped,
-                        ..
-                    } = item
-                    else {
-                        return;
-                    };
-                    wrapped.0 = run.next();
-                    // A frame kept for an older style takes over with the wrap.
-                    if !frames.is_empty()
-                        && let Some(retained) = frames.get(&(node_id.clone(), line.clone()))
-                    {
+            let mut heights: Vec<(usize, Option<Pixels>)> = Vec::new();
+            let mut segments = batch.into_iter().peekable();
+            let mut ix = start;
+            self.layout_items.map_range(start..end, |item| {
+                let here = ix;
+                ix += 1;
+                while segments.next_if(|(rows, _)| rows.end <= here).is_some() {}
+                let Some((rows, wrap)) = segments.peek() else {
+                    return;
+                };
+                if here < rows.start {
+                    return;
+                }
+                let DocumentLayoutItem::Text {
+                    display,
+                    line,
+                    node_id,
+                    frame,
+                    wrapped,
+                    ..
+                } = item
+                else {
+                    return;
+                };
+                wrapped.0 = Some(*wrap);
+                // A frame kept for an older style takes over with the wrap.
+                if !frames.is_empty() {
+                    if let Some(retained) = frames.get(&(node_id.clone(), line.clone())) {
                         frame.0 = Some(*retained);
                     }
-                    heights.push(frame.0.map(|frame| frame.row_height(display, line)));
-                });
-            if frames.is_empty() {
-                continue;
+                    heights.push((here, frame.0.map(|frame| frame.row_height(display, line))));
+                }
+            });
+            let mut heights = heights.into_iter().peekable();
+            while let Some((at, height)) = heights.next() {
+                let mut run = vec![height];
+                while let Some((_, height)) = heights.next_if(|(next, _)| *next == at + run.len()) {
+                    run.push(height);
+                }
+                self.list_state.set_item_heights(at, run);
             }
-            self.list_state.set_item_heights(start, heights);
         }
     }
 
@@ -2548,6 +2578,17 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             })
             .collect();
         state.cache.lines.retain(|key, _| live.contains(key));
+    }
+}
+
+/// Records one-row lines whose row matches their wrap, merging adjacent ones
+/// with the same wrap, so uniform text costs a handful of entries.
+fn push_settled(settled: &mut Vec<(Range<usize>, WrapKey)>, rows: Range<usize>, wrap: WrapKey) {
+    match settled.last_mut() {
+        Some((last, last_wrap)) if last.end == rows.start && *last_wrap == wrap => {
+            last.end = rows.end;
+        }
+        _ => settled.push((rows, wrap)),
     }
 }
 
