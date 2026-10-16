@@ -3718,6 +3718,7 @@ dependencies = [
  "chrono",
  "criterion",
  "data-url",
+ "foldhash 0.2.0",
  "futures",
  "gpui-pre",
  "gpui-pre-macros",

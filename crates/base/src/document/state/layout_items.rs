@@ -34,7 +34,8 @@ impl<'a> sum_tree::Dimension<'a, Count> for usize {
 // cannot unexpectedly destroy an entire document-sized backing allocation.
 const CHUNK_ROWS: usize = 256;
 struct Row<I> {
-    items: Arc<[DocumentLayoutItem<I>]>,
+    // A Vec, not a slice: sharing a built chunk then moves no items.
+    items: Arc<Vec<DocumentLayoutItem<I>>>,
     range: Range<usize>,
 }
 impl<I> Clone for Row<I> {
@@ -49,7 +50,7 @@ impl<I> Row<I> {
     fn new(items: Vec<DocumentLayoutItem<I>>) -> Self {
         Self {
             range: 0..items.len(),
-            items: items.into(),
+            items: Arc::new(items),
         }
     }
     fn items(&self) -> &[DocumentLayoutItem<I>] {
@@ -307,6 +308,35 @@ impl<I: Clone> LayoutItems<I> {
     }
     pub fn retire(&mut self, count: usize) {
         self.splice(0..count.min(self.len()), []);
+    }
+}
+
+/// Builds a tree from items in order, one chunk at a time, so a whole
+/// document's items are never collected and then moved again.
+pub(super) struct LayoutItemsBuilder<I> {
+    tree: LayoutItems<I>,
+    chunk: Vec<DocumentLayoutItem<I>>,
+}
+
+impl<I: Clone> LayoutItemsBuilder<I> {
+    pub fn new() -> Self {
+        Self {
+            tree: LayoutItems::default(),
+            chunk: Vec::with_capacity(CHUNK_ROWS),
+        }
+    }
+    pub fn push(&mut self, item: DocumentLayoutItem<I>) {
+        self.chunk.push(item);
+        if self.chunk.len() == CHUNK_ROWS {
+            let chunk = std::mem::replace(&mut self.chunk, Vec::with_capacity(CHUNK_ROWS));
+            self.tree.0.push(Row::new(chunk), ());
+        }
+    }
+    pub fn finish(mut self) -> LayoutItems<I> {
+        if !self.chunk.is_empty() {
+            self.tree.0.push(Row::new(self.chunk), ());
+        }
+        self.tree
     }
 }
 

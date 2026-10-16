@@ -725,6 +725,23 @@ impl<I: Clone + Eq + Hash> DocumentUndoManager<I> {
     }
 }
 
+/// Where generated layout items go: a vector, or a tree built chunk by chunk.
+trait ItemSink<I> {
+    fn push_item(&mut self, item: DocumentLayoutItem<I>);
+}
+
+impl<I> ItemSink<I> for Vec<DocumentLayoutItem<I>> {
+    fn push_item(&mut self, item: DocumentLayoutItem<I>) {
+        self.push(item);
+    }
+}
+
+impl<I: Clone> ItemSink<I> for layout_items::LayoutItemsBuilder<I> {
+    fn push_item(&mut self, item: DocumentLayoutItem<I>) {
+        self.push(item);
+    }
+}
+
 /// Where the lookups for the previous layout item ended. Items built in
 /// document order resume there instead of searching from the start.
 #[derive(Clone, Copy, Default)]
@@ -1085,104 +1102,14 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         nodes: Range<usize>,
         rows: Option<&text_rows::RowCache>,
     ) -> Vec<DocumentLayoutItem<I>> {
-        let regions = self.regions.as_slice();
-        let all = nodes.start == 0 && nodes.end == regions.len();
-        let display_text = self.display_text();
-        let (mut source_cursor, mut display_cursor) = match regions.get(nodes.start) {
-            Some(region) if nodes.start > 0 => {
-                let start = region.range().start;
-                let display = self
-                    .source_to_display(start, Affinity::Before)
-                    .expect("a node start maps to display");
-                (start, display)
-            }
-            _ => (0, 0),
-        };
-        let (source_end, display_end) = match regions.get(nodes.end) {
-            Some(region) => {
-                let end = region.range().start;
-                let display = self
-                    .source_to_display(end, Affinity::Before)
-                    .expect("a node start maps to display");
-                (end, display)
-            }
-            None => (self.text.len(), display_text.len()),
-        };
         let mut items = Vec::new();
-        let mut cursor = LayoutCursor::default();
-        // Blocks of earlier nodes start before the first node. Only empty nodes
-        // share a start, and they have no blocks.
-        let first_block = if nodes.start == 0 {
-            0
-        } else {
-            self.blocks
-                .partition_point(|block| block.source().start < source_cursor)
-        };
-        let mut blocks = self.blocks[first_block..].iter().peekable();
-        for (region_ix, region) in regions.iter().enumerate().take(nodes.end).skip(nodes.start) {
-            let block = blocks
-                .peek()
-                .filter(|block| block.id() == region.id())
-                .copied();
-            let empty_text = region.policy() == EditPolicy::Editable
-                && region.range().is_empty()
-                && region_ix + 1 != self.regions.as_slice().len();
-            if block.is_none() && !empty_text {
-                continue;
-            }
-            let source = region.range();
-            let display_start = self
-                .source_to_display(source.start, Affinity::Before)
-                .expect("validated block source must map to display");
-            let display_end = self
-                .source_to_display(source.end, Affinity::After)
-                .expect("validated block source must map to display");
-            self.push_text_layout_items(
-                &mut items,
-                display_cursor..display_start,
-                source_cursor..source.start,
-                false,
-                rows,
-                &mut cursor,
-            );
-            if let Some(block) = block {
-                items.push(DocumentLayoutItem::Block {
-                    id: block.id().clone(),
-                    source: source.clone(),
-                    height: Derived::default(),
-                });
-                blocks.next();
-            } else {
-                let empty = display_start..display_start;
-                let mut item = self.text_layout_item_from(
-                    display_text,
-                    empty.clone(),
-                    source.clone(),
-                    empty,
-                    0,
-                    &mut cursor,
-                );
-                if let DocumentLayoutItem::Text { node_id, .. } = &mut item {
-                    *node_id = Some(region.id().clone());
-                }
-                items.push(item);
-            }
-            display_cursor = display_end;
-            source_cursor = source.end;
-        }
-        // Only the document end has a line after its last line break; a seam
-        // starts the next node's first line.
-        self.push_text_layout_items(
-            &mut items,
-            display_cursor..display_end,
-            source_cursor..source_end,
-            nodes.end == regions.len(),
-            rows,
-            &mut cursor,
-        );
+        self.fill_layout_items_of_nodes(nodes.clone(), rows, &mut items);
         if self.anchored_blocks.is_empty() {
             return items;
         }
+        let regions = self.regions.as_slice();
+        let all = nodes.start == 0 && nodes.end == regions.len();
+        let display_text = self.display_text();
         // Each anchored block goes before the first text or block item at or after
         // its offset, after anchored blocks at earlier offsets. Text and blocks
         // are in document order, so one merge places them all. A block anchored
@@ -1246,9 +1173,122 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         merged
     }
 
+    /// The whole document's layout items as a tree, built without first
+    /// collecting them.
+    fn layout_items_tree(&self, rows: Option<&text_rows::RowCache>) -> LayoutItems<I> {
+        // Anchored blocks are placed among the generated items afterwards.
+        if !self.anchored_blocks.is_empty() {
+            return self.layout_items(rows).into();
+        }
+        let mut items = layout_items::LayoutItemsBuilder::new();
+        self.fill_layout_items_of_nodes(0..self.regions.as_slice().len(), rows, &mut items);
+        items.finish()
+    }
+
+    fn fill_layout_items_of_nodes(
+        &self,
+        nodes: Range<usize>,
+        rows: Option<&text_rows::RowCache>,
+        items: &mut impl ItemSink<I>,
+    ) {
+        let regions = self.regions.as_slice();
+        let display_text = self.display_text();
+        let (mut source_cursor, mut display_cursor) = match regions.get(nodes.start) {
+            Some(region) if nodes.start > 0 => {
+                let start = region.range().start;
+                let display = self
+                    .source_to_display(start, Affinity::Before)
+                    .expect("a node start maps to display");
+                (start, display)
+            }
+            _ => (0, 0),
+        };
+        let (source_end, display_end) = match regions.get(nodes.end) {
+            Some(region) => {
+                let end = region.range().start;
+                let display = self
+                    .source_to_display(end, Affinity::Before)
+                    .expect("a node start maps to display");
+                (end, display)
+            }
+            None => (self.text.len(), display_text.len()),
+        };
+        let mut cursor = LayoutCursor::default();
+        // Blocks of earlier nodes start before the first node. Only empty nodes
+        // share a start, and they have no blocks.
+        let first_block = if nodes.start == 0 {
+            0
+        } else {
+            self.blocks
+                .partition_point(|block| block.source().start < source_cursor)
+        };
+        let mut blocks = self.blocks[first_block..].iter().peekable();
+        for (region_ix, region) in regions.iter().enumerate().take(nodes.end).skip(nodes.start) {
+            let block = blocks
+                .peek()
+                .filter(|block| block.id() == region.id())
+                .copied();
+            let empty_text = region.policy() == EditPolicy::Editable
+                && region.range().is_empty()
+                && region_ix + 1 != self.regions.as_slice().len();
+            if block.is_none() && !empty_text {
+                continue;
+            }
+            let source = region.range();
+            let display_start = self
+                .source_to_display(source.start, Affinity::Before)
+                .expect("validated block source must map to display");
+            let display_end = self
+                .source_to_display(source.end, Affinity::After)
+                .expect("validated block source must map to display");
+            self.push_text_layout_items(
+                items,
+                display_cursor..display_start,
+                source_cursor..source.start,
+                false,
+                rows,
+                &mut cursor,
+            );
+            if let Some(block) = block {
+                items.push_item(DocumentLayoutItem::Block {
+                    id: block.id().clone(),
+                    source: source.clone(),
+                    height: Derived::default(),
+                });
+                blocks.next();
+            } else {
+                let empty = display_start..display_start;
+                let mut item = self.text_layout_item_from(
+                    display_text,
+                    empty.clone(),
+                    source.clone(),
+                    empty,
+                    0,
+                    &mut cursor,
+                );
+                if let DocumentLayoutItem::Text { node_id, .. } = &mut item {
+                    *node_id = Some(region.id().clone());
+                }
+                items.push_item(item);
+            }
+            display_cursor = display_end;
+            source_cursor = source.end;
+        }
+        // Only the document end has a line after its last line break; a seam
+        // starts the next node's first line.
+        self.push_text_layout_items(
+            items,
+            display_cursor..display_end,
+            source_cursor..source_end,
+            nodes.end == regions.len(),
+            rows,
+            &mut cursor,
+        );
+    }
+
     fn push_text_layout_items(
         &self,
-        items: &mut Vec<DocumentLayoutItem<I>>,
+        items: &mut impl ItemSink<I>,
         range: Range<usize>,
         source: Range<usize>,
         include_empty_tail: bool,
@@ -1273,13 +1313,13 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
                 if let DocumentLayoutItem::Text { line_key: key, .. } = &mut whole {
                     *key = line_key;
                 }
-                items.push(whole);
+                items.push_item(whole);
                 return;
             }
             // The rows start where the line did.
             *cursor = line_cursor;
             for row in text_rows::rows_of_line(line.clone(), starts.unwrap().starts()) {
-                items.push(self.text_layout_item_from(
+                items.push_item(self.text_layout_item_from(
                     display_text,
                     row,
                     source.clone(),
@@ -2113,12 +2153,12 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
 }
 
 /// Identifies a row's text for layout reuse. Deterministic within a process;
-/// a collision could only keep a stale measurement, never wrong text.
+/// a collision could only keep a stale measurement, never wrong text. It is
+/// computed for every line a document lays out, so it uses fixed-seed
+/// foldhash, several times faster than SipHash on short lines.
 fn text_fingerprint(text: &str) -> u64 {
-    use std::hash::{Hash as _, Hasher as _};
-    let mut hasher = std::hash::DefaultHasher::new();
-    text.hash(&mut hasher);
-    hasher.finish()
+    use std::hash::BuildHasher as _;
+    foldhash::quality::FixedState::with_seed(0).hash_one(text)
 }
 
 fn resolve_document_styles<I: Eq>(
@@ -2506,7 +2546,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) -> Result<Self, RegionError> {
         let model = DocumentModel::new(text, regions)?;
-        let layout_items = model.layout_items(None);
+        let layout_items = model.layout_items_tree(None);
         let list_state =
             ListState::new(layout_items.len(), ListAlignment::Top, px(400.)).measure_all();
         let focus_handle = cx.focus_handle();
@@ -2523,7 +2563,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         ];
         Ok(Self {
             model,
-            layout_items: layout_items.into(),
+            layout_items,
             list_state,
             focus_handle,
             blink_cursor,
@@ -2637,7 +2677,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.text_layouts.clear();
         self.block_layouts.clear();
         self.trailer_layout = None;
-        let items = self.next_layout_items().into();
+        let mut items = self
+            .model
+            .layout_items_tree(self.text_rows.as_ref().map(|rows| &rows.cache));
+        if self.dynamic_trailer {
+            items.extend([DocumentLayoutItem::Trailer]);
+        }
         let retired = std::mem::replace(&mut self.layout_items, items);
         self.retire_text_layout_items(retired);
         self.list_state.reset(self.layout_items.len());
