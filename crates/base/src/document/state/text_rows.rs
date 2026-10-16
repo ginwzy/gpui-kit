@@ -309,13 +309,33 @@ impl RowCache {
         self.lines.get(&key).map(|rows| &rows.starts)
     }
 
-    /// Records a wrap. A one-row line only updates an entry it had.
-    fn record(&mut self, key: u64, wrap: WrapKey, starts: Breaks, input: Option<Previous>) {
+    /// Records the wrap of the line at display offset `line_start`. A
+    /// one-row line only updates an entry it had.
+    fn record(
+        &mut self,
+        line_start: usize,
+        key: u64,
+        wrap: WrapKey,
+        starts: Breaks,
+        input: Option<Previous>,
+    ) {
         if starts.is_empty()
             && !self.lines.contains_key(&key)
             && input.as_ref().is_none_or(|input| input.range.len() <= 2048)
         {
             return;
+        }
+        if let Some(old) = self.previous.insert(line_start, key)
+            && old != key
+            && let Some(rows) = self.lines.get_mut(&old)
+        {
+            // Retain one derived input per line position, not every historical
+            // 8 MiB snapshot after successive edits. The line wrapped here
+            // before may still be shown elsewhere, so it keeps its rows.
+            rows.input = None;
+            if rows.starts.is_empty() {
+                self.lines.remove(&old);
+            }
         }
         self.lines.insert(
             key,
@@ -742,6 +762,8 @@ impl LineSpec {
 }
 
 impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
+    /// With text rows, replaced items are dropped a bounded batch per later
+    /// frame, so a large tree does not drop in one frame.
     pub(super) fn retire_layout_items(&mut self, items: super::LayoutItems<I>) {
         if let Some(state) = self.text_rows.as_mut() {
             state.retired.push((items, gpui::PreparedListItems::new()));
@@ -1149,12 +1171,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             if !state.retired.is_empty() {
                 cx.notify();
             }
-        }
-    }
-
-    pub(super) fn retire_text_layout_items(&mut self, items: super::LayoutItems<I>) {
-        if let Some(state) = self.text_rows.as_mut() {
-            state.retired.push((items, gpui::PreparedListItems::new()));
         }
     }
 
@@ -1938,7 +1954,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .map(|line| self.line_spec(line, &mut fonts))
                 .collect();
             let mut wrappers = fonts.wrappers(cx);
-            let text: Arc<str> = self.model.display_text().into();
+            let text = self.model.projection_map.shared_display_text();
             let lines = specs
                 .iter()
                 .map(|spec| spec.wrap(text.clone(), &mut wrappers))
@@ -1988,7 +2004,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let Some((specs, mut wrappers)) = background else {
             return;
         };
-        let text: Arc<str> = self.model.display_text().into();
+        let text = self.model.projection_map.shared_display_text();
         let request = state.request;
         let cancel = state.cancel.clone();
         let task = cx.spawn(async move |this, cx| {
@@ -2115,16 +2131,13 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             };
             let matches = self.rows_match(rows.clone(), &line.starts);
             if let Some(state) = self.text_rows.as_mut() {
-                if let Some(old) = state.cache.previous.insert(line.range.start, line.key)
-                    && old != line.key
-                {
-                    // Retain one derived input per source-line position, not
-                    // every historical 8 MiB snapshot after successive edits.
-                    state.cache.lines.remove(&old);
-                }
-                state
-                    .cache
-                    .record(line.key, wrap, line.starts.clone(), Some(line.input));
+                state.cache.record(
+                    line.range.start,
+                    line.key,
+                    wrap,
+                    line.starts.clone(),
+                    Some(line.input),
+                );
             }
             if matches {
                 settled.push((rows, wrap));

@@ -172,7 +172,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             refit = true;
             self.list_state.splice(items.clone(), replacement.len());
             let retired = self.layout_items.splice(items, replacement);
-            self.retire_text_layout_items(retired);
+            self.retire_layout_items(retired);
         }
         if refit {
             self.list_state.clone().measure_all();

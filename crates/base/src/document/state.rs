@@ -2691,7 +2691,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             items.extend([DocumentLayoutItem::Trailer]);
         }
         let retired = std::mem::replace(&mut self.layout_items, items);
-        self.retire_text_layout_items(retired);
+        self.retire_layout_items(retired);
         self.list_state.reset(self.layout_items.len());
         self.layout_items_changed();
         cx.emit(DocumentEvent::PresentationChanged);
@@ -3317,7 +3317,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             prefix..split,
         );
         let retired = std::mem::replace(&mut self.layout_items, next.into());
-        self.retire_text_layout_items(retired);
+        self.retire_layout_items(retired);
     }
 
     fn next_layout_items(&self) -> Vec<DocumentLayoutItem<I>> {

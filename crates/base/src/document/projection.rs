@@ -1,4 +1,9 @@
-use std::{error::Error, fmt, ops::Range};
+use std::{
+    error::Error,
+    fmt,
+    ops::Range,
+    sync::{Arc, OnceLock},
+};
 
 use ropey::Rope;
 
@@ -318,8 +323,21 @@ impl ProjectionRun {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ProjectionMap {
     display: String,
+    shared_display: SharedDisplay,
     source_len: usize,
     runs: Vec<ProjectionRun>,
+}
+
+/// The display text in one shared allocation, made when first asked for
+/// after each change, so background wraps scheduled frame after frame share
+/// it rather than copy the text each time. Not part of the map's identity.
+#[derive(Clone, Debug, Default)]
+struct SharedDisplay(OnceLock<Arc<str>>);
+
+impl PartialEq for SharedDisplay {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 impl ProjectionMap {
@@ -376,6 +394,7 @@ impl ProjectionMap {
         let inserted_len = inserted.len();
         self.runs.splice(from..to, inserted);
         self.display.replace_range(display, &replacement.display);
+        self.shared_display = SharedDisplay::default();
         self.source_len = self.source_len.checked_add_signed(source_delta).unwrap();
         // Identity runs cut at the seams join again, as `new` builds them.
         self.merge_identity_runs(from.saturating_sub(1)..from + inserted_len + 1);
@@ -466,6 +485,7 @@ impl ProjectionMap {
 
         Self {
             display,
+            shared_display: SharedDisplay::default(),
             source_len: source.len(),
             runs,
         }
@@ -473,6 +493,14 @@ impl ProjectionMap {
 
     pub(crate) fn display_text(&self) -> &str {
         &self.display
+    }
+
+    /// [`Self::display_text`], shared.
+    pub(crate) fn shared_display_text(&self) -> Arc<str> {
+        self.shared_display
+            .0
+            .get_or_init(|| self.display.as_str().into())
+            .clone()
     }
 
     pub(crate) fn source_to_display(&self, offset: usize, affinity: Affinity) -> Option<usize> {
@@ -829,6 +857,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn shared_display_text_is_reused_until_an_edit() {
+        let source = Rope::from("one\ntwo");
+        let mut map = ProjectionMap::new(&source, &DocumentProjection::identity(source.len()));
+        let shared = map.shared_display_text();
+        assert!(Arc::ptr_eq(&shared, &map.shared_display_text()));
+        map.replace_identity(4..7, "three");
+        assert_eq!(&*map.shared_display_text(), "one\nthree");
+        assert_eq!(&*shared, "one\ntwo");
     }
 
     #[test]
