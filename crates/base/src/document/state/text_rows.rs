@@ -50,6 +50,9 @@ const FIRST_WRAP_IN_FRAME_BYTES: usize = 256 * 1024;
 /// Lines wrapped for another width or font rewrap within the frame up to this
 /// many bytes beyond those in view; a larger rewrap runs in the background.
 const REWRAP_IN_FRAME_BYTES: usize = 32 * 1024;
+/// At most this many lines go to one background wrap. Preparing them reads
+/// the model on the UI thread; the rest go to the next wrap once it lands.
+const BACKGROUND_LINES_PER_WRAP: usize = 4096;
 /// How far past the viewport, in viewport heights, rows count as in view.
 const VIEW_MARGIN: f32 = 1.;
 
@@ -449,6 +452,15 @@ pub(in crate::document) struct TextRowsState<I> {
     frames: HashMap<(Option<I>, Range<usize>), RowFrame>,
     previous_styles: HashMap<u64, RowsStyle>,
     edit: Option<LineEdit>,
+    /// Items replaced since the last layout. When no whole-document pass is
+    /// due, only these resolve their frames and check their wraps.
+    dirty: Option<Range<usize>>,
+    /// Geometry was just invalidated: the next whole pass may also rewrap
+    /// lines beyond the view within the frame budget. Later passes, which
+    /// pick up background results, leave lines out of view to the background.
+    nearby: bool,
+    /// The width changed in the last laid-out frame.
+    resizing: bool,
 }
 
 /// Unchanged extents relative to one cached line, composed directly from the
@@ -486,6 +498,7 @@ struct WrappedLine {
 
 impl<I: Clone> TextRowsState<I> {
     fn invalidate(&mut self) {
+        self.nearby = true;
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = Arc::new(AtomicBool::new(false));
         self.request += 1;
@@ -521,6 +534,53 @@ impl<I: Clone> TextRowsState<I> {
             frames: HashMap::new(),
             previous_styles: HashMap::new(),
             edit: None,
+            dirty: None,
+            nearby: true,
+            resizing: false,
+        }
+    }
+
+    /// Items `old` were replaced by `len` items outside a publication's own
+    /// attachment. Work that addresses items by index follows the change:
+    /// queued lines the replacement touched are dropped and later ones move.
+    /// A partly built line at or after the change restarts, since its rows
+    /// were read with offsets from before it.
+    fn items_spliced(&mut self, old: &Range<usize>, len: usize) {
+        let moved = |ix: usize| {
+            if ix <= old.start {
+                ix
+            } else if ix >= old.end {
+                ix - old.len() + len
+            } else {
+                old.start + len
+            }
+        };
+        if let Some(dirty) = &mut self.dirty {
+            *dirty = moved(dirty.start)..moved(dirty.end);
+        }
+        if let Some(work) = &mut self.publishing {
+            let restart = work.row > 0
+                && work
+                    .lines
+                    .front()
+                    .is_some_and(|(rows, _, _)| rows.end > old.start);
+            work.lines.retain_mut(|(rows, _, _)| {
+                if rows.end <= old.start {
+                    true
+                } else if rows.start >= old.end {
+                    *rows = moved(rows.start)..moved(rows.end);
+                    true
+                } else {
+                    false
+                }
+            });
+            if restart {
+                self.retired.push((
+                    std::mem::take(&mut work.items),
+                    std::mem::replace(&mut work.heights, gpui::PreparedListItems::new()),
+                ));
+                work.row = 0;
+            }
         }
     }
 
@@ -529,6 +589,7 @@ impl<I: Clone> TextRowsState<I> {
     pub(in crate::document) fn is_wrapping(&self) -> bool {
         self.resolve
             || self.check
+            || self.dirty.is_some()
             || self.pending.is_some()
             || self.ready.is_some()
             || self.publishing.is_some()
@@ -554,18 +615,29 @@ struct FontTable {
     base_style: gpui::TextStyle,
     rem_size: Pixels,
     fonts: Vec<(Font, Pixels)>,
+    /// Each font's hash with its size, so keying a line's fonts does not
+    /// hash every font description again.
+    hashes: Vec<u64>,
 }
 
 impl FontTable {
     fn new(window: &Window) -> Self {
         let base_style = window.text_style();
         let rem_size = window.rem_size();
-        let fonts = vec![(base_style.font(), base_style.font_size.to_pixels(rem_size))];
+        let base = (base_style.font(), base_style.font_size.to_pixels(rem_size));
         Self {
             base_style,
             rem_size,
-            fonts,
+            hashes: vec![Self::hash(&base)],
+            fonts: vec![base],
         }
+    }
+
+    fn hash((font, size): &(Font, Pixels)) -> u64 {
+        let mut hash = DefaultHasher::new();
+        font.hash(&mut hash);
+        f32::from(*size).to_bits().hash(&mut hash);
+        hash.finish()
     }
 
     fn index(&mut self, font: Font, size: Pixels) -> usize {
@@ -576,7 +648,9 @@ impl FontTable {
         {
             return ix;
         }
-        self.fonts.push((font, size));
+        let entry = (font, size);
+        self.hashes.push(Self::hash(&entry));
+        self.fonts.push(entry);
         self.fonts.len() - 1
     }
 
@@ -604,9 +678,12 @@ struct RowPublication<I> {
 /// A line whose rows lag behind the wrap its width and fonts need.
 struct StaleLine {
     items: Range<usize>,
+    /// The display line, so prioritizing needs no item lookups.
+    line: Range<usize>,
     bytes: usize,
     wrapped_before: bool,
     in_view: bool,
+    focused: bool,
     widths: (Pixels, Pixels),
 }
 
@@ -862,6 +939,23 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         }
     }
 
+    /// Items `old` were replaced by `len` items, and later items moved with
+    /// them. Only the replacement resolves and wraps; work in flight goes on.
+    /// Background wraps are matched to lines by display range and text key,
+    /// so results for lines the change moved are dropped and checked again.
+    pub(super) fn layout_items_replaced(&mut self, old: Range<usize>, len: usize) {
+        let Some(state) = self.text_rows.as_mut() else {
+            return;
+        };
+        state.items_spliced(&old, len);
+        state.edit = None;
+        let new = old.start..old.start + len;
+        state.dirty = Some(match state.dirty.take() {
+            Some(dirty) => dirty.start.min(new.start)..dirty.end.max(new.end),
+            None => new,
+        });
+    }
+
     pub(super) fn text_row_edit(&self, transaction: &super::EditTransaction) -> Option<LineEdit> {
         let [edit] = transaction.edits() else {
             return None;
@@ -937,28 +1031,47 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let Some(state) = self.text_rows.as_mut() else {
             return;
         };
-        if state.width != Some(bounds.size.width) {
+        let resized = state.width != Some(bounds.size.width);
+        if resized {
             state.invalidate();
             state.width = Some(bounds.size.width);
             state.check = true;
             state.scan_all = true;
         }
+        // While the width changes frame after frame, only the view is checked:
+        // the rest keeps its complete earlier wrap, and one whole pass and
+        // background wrap follow once the width holds.
+        let defer = resized && state.resizing;
+        state.resizing = resized;
+        if defer {
+            cx.notify();
+        }
+        // Replaced items resolve now, or with a whole-document pass.
         if state.resolve {
             state.resolve = false;
-            self.resolve_row_geometry(window, cx);
+            self.resolve_row_geometry(0..usize::MAX, window, cx);
+        } else if let Some(dirty) = state.dirty.clone() {
+            self.resolve_row_geometry(dirty, window, cx);
         }
+        // Publication that starts this frame publishes its first batch at once.
+        let publishing = self
+            .text_rows
+            .as_ref()
+            .is_some_and(|state| state.publishing.is_some());
         self.consume_ready_rows(cx);
-        if self
-            .text_rows
-            .as_ref()
-            .is_some_and(|state| state.publishing.is_none() && state.check)
-        {
-            self.wrap_stale_lines(bounds, window, cx);
+        let state = self.text_rows.as_mut().expect("text rows are on");
+        // A whole pass also checks replaced items. Replaced items are checked
+        // while a publication is under way; lines in view wait for it.
+        let dirty = state.dirty.take().filter(|_| !state.scan_all);
+        let idle = state.publishing.is_none();
+        if (idle && state.check) || dirty.is_some() {
+            self.wrap_stale_lines(bounds, dirty, idle, defer, window, cx);
         }
-        if self
-            .text_rows
-            .as_ref()
-            .is_some_and(|state| state.publishing.is_some())
+        if publishing
+            && self
+                .text_rows
+                .as_ref()
+                .is_some_and(|state| state.publishing.is_some())
         {
             self.advance_row_publication(cx);
         }
@@ -1016,134 +1129,135 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         }
     }
 
-    /// Resolves the frame of every line and the height of every block that
-    /// lacks one, and declares their heights to the list.
-    fn resolve_row_geometry(&mut self, window: &Window, cx: &mut Context<Self>) {
+    /// Resolves the frame of every line and the height of every block in
+    /// `items` that lacks one, and declares their heights to the list.
+    /// Returns where `items` ends once changed lines collapse to placeholders.
+    fn resolve_row_geometry(
+        &mut self,
+        items: Range<usize>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        /// Adjacent single rows taking the same frame and wrap: their first
+        /// item and count. Uniform text needs a handful, not one per line.
+        struct Singles {
+            start: usize,
+            count: usize,
+            frame: RowFrame,
+            wrap: Option<WrapKey>,
+        }
+        let ascii_advance = self.ascii_advance(window, cx);
         let base_style = window.text_style();
+        let len = self.layout_items.len();
+        let end = items.end.min(len);
+        let start = if items.start < end {
+            self.line_rows(items.start).start
+        } else {
+            end
+        };
+        let state = self.text_rows.as_ref().unwrap();
+        let (generation, invalid, width) = (state.generation, &state.invalid_frames, state.width);
+        let keyed = !invalid.is_empty() || !state.frames.is_empty();
         // Without a resolver, every unstyled line has the same frame.
         let mut plain_frame = None;
-        let mut heights: Vec<(usize, Option<Pixels>)> = Vec::new();
-        let mut frames = Vec::new();
-        let mut ix = 0;
-        while ix < self.layout_items.len() {
-            match &self.layout_items[ix] {
+        let mut singles: Vec<Singles> = Vec::new();
+        // Lines whose rows collapse to one pending row, and frame map keys.
+        let mut collapses = Vec::new();
+        let mut keys = Vec::new();
+        let mut blocks = Vec::new();
+        let mut trailer = None;
+        // Read every item once, in order; changes apply afterwards.
+        let mut ix = start;
+        let mut iter = self.layout_items.iter_from(start).peekable();
+        while ix < end {
+            let Some(item) = iter.next() else {
+                break;
+            };
+            match item {
                 DocumentLayoutItem::Text {
-                    frame,
                     line,
                     node_id,
+                    frame,
+                    wrapped,
+                    presentation,
                     ..
-                } if frame.0.is_some()
-                    && !self
-                        .text_rows
-                        .as_ref()
-                        .unwrap()
-                        .invalid_frames
-                        .contains(&(node_id.clone(), line.clone())) =>
-                {
-                    ix = self.line_rows(ix).end
-                }
-                DocumentLayoutItem::Text { .. } => {
-                    // The first row without a frame frames its whole line.
-                    let mut rows = self.line_rows(ix);
-                    {
-                        let plain = self.text_frame_resolver.is_none()
-                            && matches!(
-                                &self.layout_items[rows.start],
-                                DocumentLayoutItem::Text {
-                                    presentation: None,
-                                    ..
-                                }
-                            );
-                        let resolved = match plain_frame {
-                            Some(frame) if plain => frame,
-                            _ => {
-                                let frame =
-                                    self.resolve_line_frame(rows.clone(), &base_style, window, cx);
-                                if plain {
-                                    plain_frame = Some(frame);
-                                }
-                                frame
-                            }
-                        };
-                        let DocumentLayoutItem::Text {
-                            node_id,
-                            line,
-                            frame: old_frame,
-                            wrapped,
-                            ..
-                        } = &self.layout_items[rows.start]
-                        else {
-                            unreachable!()
-                        };
-                        let key = (node_id.clone(), line.clone());
-                        let state = self.text_rows.as_mut().unwrap();
-                        state.invalid_frames.remove(&key);
-                        let keep_old = wrapped
-                            .0
-                            .is_some_and(|wrap| wrap.generation != state.generation);
-                        if keep_old {
-                            state.frames.insert(key, resolved);
-                        } else {
-                            state.frames.remove(&key);
-                        }
-                        if !keep_old && rows.len() > 1 && old_frame.0 != Some(resolved) {
-                            // The host has changed its frame/decoration. Its
-                            // renderer cannot reproduce the old decoration;
-                            // use one explicit pending row until reflow lands.
-                            let DocumentLayoutItem::Text {
-                                source: first,
-                                line_key,
-                                ..
-                            } = &self.layout_items[rows.start]
-                            else {
-                                unreachable!()
-                            };
-                            let DocumentLayoutItem::Text { source: last, .. } =
-                                &self.layout_items[rows.end - 1]
-                            else {
-                                unreachable!()
-                            };
-                            let mut item = self.model.text_layout_item(
-                                self.model.display_text(),
-                                line.clone(),
-                                first.start..last.end,
-                                line.clone(),
-                                *line_key,
-                            );
-                            if let DocumentLayoutItem::Text { frame, .. } = &mut item {
-                                frame.0 = Some(resolved);
-                            }
-                            let mut heights = gpui::PreparedListItems::new();
-                            heights.extend([Some(resolved.row_height(line, line))]);
-                            let old = self
-                                .layout_items
-                                .splice_prepared(rows.clone(), vec![item].into());
-                            let old_heights =
-                                self.list_state.splice_prepared(rows.clone(), heights);
-                            self.text_rows
-                                .as_mut()
-                                .unwrap()
-                                .retired
-                                .push((old, old_heights));
-                            rows.end = rows.start + 1;
-                        }
-                        // Existing complete rows keep their old geometry until
-                        // the candidate is published. Only a placeholder has
-                        // its height installed immediately.
-                        if rows.len() == 1
-                            && let DocumentLayoutItem::Text {
-                                display,
-                                line,
-                                wrapped,
-                                ..
-                            } = &self.layout_items[rows.start]
-                            && (!keep_old || wrapped.0.is_none())
-                        {
-                            frames.push((rows.start, resolved));
-                            heights.push((rows.start, Some(resolved.row_height(display, line))));
-                        }
+                } => {
+                    let mut last = item;
+                    let mut count = 1;
+                    while let Some(next) = iter.next_if(|next| {
+                        matches!(next, DocumentLayoutItem::Text { line: other, node_id: other_node, .. }
+                            if other == line && other_node == node_id)
+                    }) {
+                        last = next;
+                        count += 1;
                     }
+                    let rows = ix..ix + count;
                     ix = rows.end;
+                    if frame.0.is_some()
+                        && (invalid.is_empty()
+                            || !invalid.contains(&(node_id.clone(), line.clone())))
+                    {
+                        continue;
+                    }
+                    // The first row without a frame frames its whole line.
+                    let plain = self.text_frame_resolver.is_none() && presentation.is_none();
+                    let resolved = match plain_frame {
+                        Some(frame) if plain => frame,
+                        _ => {
+                            let frame =
+                                self.resolve_line_frame(item, last, &base_style, window, cx);
+                            if plain {
+                                plain_frame = Some(frame);
+                            }
+                            frame
+                        }
+                    };
+                    let keep_old = wrapped.0.is_some_and(|wrap| wrap.generation != generation);
+                    // Most lines are in neither map; skip building their key.
+                    if keep_old || keyed {
+                        keys.push(((node_id.clone(), line.clone()), resolved, keep_old));
+                    }
+                    if !keep_old && count > 1 && frame.0 != Some(resolved) {
+                        // The host changed the frame, and its renderer cannot
+                        // reproduce the old one: one pending row until reflow.
+                        collapses.push((rows, resolved));
+                        continue;
+                    }
+                    // Existing complete rows keep their old geometry until
+                    // the candidate is published.
+                    if count > 1 || keep_old && wrapped.0.is_some() {
+                        continue;
+                    }
+                    // As the wrap check decides it, without a second pass.
+                    let wrap = width.filter(|_| !keep_old).and_then(|width| {
+                        let widths = resolved.widths(width);
+                        let whole = resolved.hidden
+                            || line.is_empty()
+                            || presentation.is_none()
+                                && ascii_advance.is_some_and(|advance| {
+                                    fits_unwrapped(
+                                        &self.model.display_text()[line.clone()],
+                                        advance,
+                                        widths.0,
+                                    )
+                                });
+                        whole.then_some(WrapKey { generation, widths })
+                    });
+                    match singles.last_mut() {
+                        Some(last)
+                            if last.start + last.count == rows.start
+                                && last.frame == resolved
+                                && last.wrap == wrap =>
+                        {
+                            last.count += 1;
+                        }
+                        _ => singles.push(Singles {
+                            start: rows.start,
+                            count: 1,
+                            frame: resolved,
+                            wrap,
+                        }),
+                    }
                 }
                 DocumentLayoutItem::Block { id, height, .. }
                 | DocumentLayoutItem::AnchoredBlock { id, height, .. } => {
@@ -1157,48 +1271,139 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                             },
                             None => BlockGeometry::Measured,
                         };
-                        self.layout_items.update(ix, |item| {
-                            if let DocumentLayoutItem::Block { height, .. }
-                            | DocumentLayoutItem::AnchoredBlock { height, .. } = item
-                            {
-                                height.0 = geometry;
-                            }
-                        });
-                        heights.push((ix, geometry.height()));
+                        blocks.push((ix, geometry));
                     }
                     ix += 1;
                 }
                 DocumentLayoutItem::Trailer => {
-                    heights.push((ix, Some(self.trailer_item_height(window))));
+                    trailer = Some(ix);
                     ix += 1;
                 }
             }
         }
-        // Consecutive source lines must not split the persistent tree once
-        // per item. Resolve their initial placeholders in one contiguous run.
-        let mut frames = frames.into_iter().peekable();
-        while let Some((start, frame)) = frames.next() {
-            let mut run = vec![frame];
-            while let Some((_, frame)) = frames.next_if(|(next, _)| *next == start + run.len()) {
-                run.push(frame);
+        drop(iter);
+
+        let state = self.text_rows.as_mut().unwrap();
+        for (key, frame, keep_old) in keys {
+            state.invalid_frames.remove(&key);
+            if keep_old {
+                state.frames.insert(key, frame);
+            } else {
+                state.frames.remove(&key);
             }
-            let end = start + run.len();
-            let mut run = run.into_iter();
-            self.layout_items.map_range(start..end, |item| {
-                if let DocumentLayoutItem::Text { frame, .. } = item {
-                    frame.0 = run.next();
+        }
+        // Collapse changed lines from the end, so earlier indices stand; later
+        // indices move back by the rows each collapse removed before them.
+        let mut collapsed: Vec<(usize, usize)> = Vec::new();
+        for (rows, resolved) in collapses.into_iter().rev() {
+            let (
+                DocumentLayoutItem::Text {
+                    source: first,
+                    line: display_line,
+                    line_key,
+                    ..
+                },
+                DocumentLayoutItem::Text { source: last, .. },
+            ) = (
+                &self.layout_items[rows.start],
+                &self.layout_items[rows.end - 1],
+            )
+            else {
+                unreachable!("line rows are text items")
+            };
+            let display_line = display_line.clone();
+            let mut item = self.model.text_layout_item(
+                self.model.display_text(),
+                display_line.clone(),
+                first.start..last.end,
+                display_line.clone(),
+                *line_key,
+            );
+            if let DocumentLayoutItem::Text { frame, .. } = &mut item {
+                frame.0 = Some(resolved);
+            }
+            let mut heights = gpui::PreparedListItems::new();
+            heights.extend([Some(resolved.row_height(&display_line, &display_line))]);
+            let old = self
+                .layout_items
+                .splice_prepared(rows.clone(), vec![item].into());
+            let old_heights = self.list_state.splice_prepared(rows.clone(), heights);
+            let state = self.text_rows.as_mut().unwrap();
+            state.retired.push((old, old_heights));
+            state.items_spliced(&rows, 1);
+            collapsed.push((rows.end, rows.len() - 1));
+        }
+        collapsed.reverse();
+        let mut removed = 0;
+        let collapsed: Vec<(usize, usize)> = collapsed
+            .into_iter()
+            .map(|(end, rows)| {
+                removed += rows;
+                (end, removed)
+            })
+            .collect();
+        let moved = |ix: usize| {
+            ix - collapsed
+                .partition_point(|(end, _)| *end <= ix)
+                .checked_sub(1)
+                .map_or(0, |at| collapsed[at].1)
+        };
+
+        // Adjacent single rows take their frames and declare their heights in
+        // one pass, and one list update, per run.
+        let mut singles = singles.into_iter().peekable();
+        while let Some(first) = singles.next() {
+            let start = moved(first.start);
+            let mut len = first.count;
+            let mut run = vec![first];
+            while let Some(next) = singles.next_if(|next| moved(next.start) == start + len) {
+                len += next.count;
+                run.push(next);
+            }
+            let mut heights = Vec::with_capacity(len);
+            let mut segments = run.iter();
+            let mut current = segments.next().map(|segment| (segment, segment.count));
+            self.layout_items.map_range(start..start + len, |item| {
+                let Some((segment, left)) = &mut current else {
+                    return;
+                };
+                if let DocumentLayoutItem::Text {
+                    display,
+                    line,
+                    frame,
+                    wrapped,
+                    ..
+                } = item
+                {
+                    frame.0 = Some(segment.frame);
+                    if segment.wrap.is_some() {
+                        wrapped.0 = segment.wrap;
+                    }
+                    heights.push(Some(segment.frame.row_height(display, line)));
+                }
+                *left -= 1;
+                if *left == 0 {
+                    current = segments.next().map(|segment| (segment, segment.count));
                 }
             });
+            self.list_state.set_item_heights(start, heights);
         }
-        // One update per run of adjacent items.
-        let mut heights = heights.into_iter().peekable();
-        while let Some((start, height)) = heights.next() {
-            let mut run = vec![height];
-            while let Some((_, height)) = heights.next_if(|(next, _)| *next == start + run.len()) {
-                run.push(height);
-            }
-            self.list_state.set_item_heights(start, run);
+        for (ix, geometry) in blocks {
+            let at = moved(ix);
+            self.layout_items.update(at, |item| {
+                if let DocumentLayoutItem::Block { height, .. }
+                | DocumentLayoutItem::AnchoredBlock { height, .. } = item
+                {
+                    height.0 = geometry;
+                }
+            });
+            self.list_state.set_item_heights(at, [geometry.height()]);
         }
+        if let Some(ix) = trailer {
+            self.list_state
+                .set_item_heights(moved(ix), [Some(self.trailer_item_height(window))]);
+        }
+        moved(end)
     }
 
     pub(super) fn trailer_item_height(&self, window: &Window) -> Pixels {
@@ -1220,42 +1425,69 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         if display == line {
             return ix..ix + 1;
         }
-        let same_line = |item: &DocumentLayoutItem<I>| {
-            matches!(item, DocumentLayoutItem::Text { line: other, node_id: other_node, .. }
+        let same_line = |ix: usize| {
+            matches!(&self.layout_items[ix], DocumentLayoutItem::Text { line: other, node_id: other_node, .. }
                 if other == line && other_node == node_id)
         };
-        let mut lo = if display.start == line.start { ix } else { 0 };
-        let mut hi = ix;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if same_line(&self.layout_items[mid]) {
-                hi = mid;
-            } else {
-                lo = mid + 1;
+        // A line's rows are adjacent. Gallop out from `ix`, then bisect, so
+        // the cost follows the line's row count rather than the document's.
+        let start = if display.start == line.start {
+            ix
+        } else {
+            let (mut inside, mut step) = (ix, 1);
+            let mut lo = 0;
+            while let Some(probe) = inside.checked_sub(step) {
+                if !same_line(probe) {
+                    lo = probe + 1;
+                    break;
+                }
+                inside = probe;
+                step *= 2;
             }
-        }
-        let start = lo;
-        lo = ix + 1;
-        hi = if display.end == line.end {
+            let mut hi = inside;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if same_line(mid) {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            lo
+        };
+        let end = if display.end == line.end {
             ix + 1
         } else {
-            self.layout_items.len()
-        };
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if same_line(&self.layout_items[mid]) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+            let len = self.layout_items.len();
+            let (mut inside, mut step) = (ix, 1);
+            let mut hi = len;
+            while inside + step < len {
+                let probe = inside + step;
+                if !same_line(probe) {
+                    hi = probe;
+                    break;
+                }
+                inside = probe;
+                step *= 2;
             }
-        }
-        let end = lo;
+            let mut lo = inside + 1;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if same_line(mid) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
         start..end
     }
 
     fn resolve_line_frame(
         &self,
-        rows: Range<usize>,
+        first: &DocumentLayoutItem<I>,
+        last: &DocumentLayoutItem<I>,
         base_style: &gpui::TextStyle,
         window: &Window,
         cx: &mut Context<Self>,
@@ -1271,10 +1503,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 source: last_source,
                 ..
             },
-        ) = (
-            &self.layout_items[rows.start],
-            &self.layout_items[rows.end - 1],
-        )
+        ) = (first, last)
         else {
             unreachable!("line rows are text items");
         };
@@ -1303,19 +1532,23 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let refinement = presentation
             .as_ref()
             .and_then(|presentation| presentation.text_style.as_ref());
-        let style = match refinement {
-            Some(refinement) => {
-                let mut style = base_style.clone();
-                style.refine(refinement);
-                std::borrow::Cow::Owned(style)
-            }
-            None => std::borrow::Cow::Borrowed(base_style),
-        };
-        let font_size = style.font_size.to_pixels(rem_size);
+        // Only a frame's font size and line height count; the full style is
+        // built only to measure an indent marker.
+        let font_size = refinement
+            .and_then(|refinement| refinement.font_size)
+            .unwrap_or(base_style.font_size)
+            .to_pixels(rem_size);
+        let line_height = refinement
+            .and_then(|refinement| refinement.line_height)
+            .unwrap_or(base_style.line_height);
         let (indent, hanging) = presentation
             .as_ref()
             .and_then(|presentation| presentation.indent.as_ref())
             .map_or((px(0.), true), |indent| {
+                let mut style = base_style.clone();
+                if let Some(refinement) = refinement {
+                    style.refine(refinement);
+                }
                 // Measured as the text element measures it, in the line's own style.
                 let width = window
                     .text_system()
@@ -1336,7 +1569,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             max_width: frame.max_width.map(|width| width.to_pixels(rem_size)),
             hidden: frame.hidden,
             // The line height a text element lays out with, snapped to device pixels.
-            line_height: window.pixel_snap(style.line_height.to_pixels(font_size.into(), rem_size)),
+            line_height: window.pixel_snap(line_height.to_pixels(font_size.into(), rem_size)),
             indent,
             hanging,
         }
@@ -1382,6 +1615,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     fn wrap_stale_lines(
         &mut self,
         bounds: Bounds<Pixels>,
+        dirty: Option<Range<usize>>,
+        idle: bool,
+        defer: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -1393,89 +1629,134 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let generation = state.generation;
         let view = self.items_in_view(bounds);
         // While a background wrap is out, only lines scrolling into view can
-        // have become stale; its result brings back a full check.
-        let scan_all = state.scan_all;
-        let (mut ix, end) = if scan_all {
-            (0, self.layout_items.len())
-        } else {
-            let start = (view.start < self.layout_items.len())
-                .then(|| self.line_rows(view.start).start)
-                .unwrap_or(view.start);
-            (start, view.end)
+        // have become stale; its result brings back a full check. Replaced
+        // items are checked wherever they are.
+        let scan_all = state.scan_all && !defer;
+        let nearby = state.nearby;
+        let len = self.layout_items.len();
+        let line_start = |ix: usize| {
+            if ix < len {
+                self.line_rows(ix).start
+            } else {
+                ix
+            }
         };
+        let mut scopes = Vec::new();
+        if scan_all {
+            scopes.push(0..len);
+        } else {
+            if let Some(dirty) = &dirty {
+                scopes.push(line_start(dirty.start)..dirty.end.min(len));
+            }
+            if idle && state.check {
+                scopes.push(line_start(view.start)..view.end.min(len));
+            }
+            scopes.sort_by_key(|scope| scope.start);
+            if let [first, second] = &mut scopes[..]
+                && second.start <= first.end
+            {
+                first.end = first.end.max(second.end);
+                scopes.pop();
+            }
+        }
         let mut stale = Vec::new();
         let mut settled = Vec::new();
         let mut outdated = Vec::new();
-        while ix < end {
-            let DocumentLayoutItem::Text {
-                line,
-                line_key,
-                presentation,
-                node_id,
-                frame: Derived(Some(frame)),
-                wrapped,
-                ..
-            } = &self.layout_items[ix]
-            else {
-                ix += 1;
-                continue;
-            };
-            let rows = self.line_rows(ix);
-            ix = rows.end;
-            let frame = state
-                .frames
-                .get(&(node_id.clone(), line.clone()))
-                .unwrap_or(frame);
-            let wrap = WrapKey {
-                generation,
-                widths: frame.widths(width),
-            };
-            if wrapped.0 == Some(wrap)
-                && matches!(&self.layout_items[rows.start], DocumentLayoutItem::Text { frame: Derived(Some(old)), .. } if old == frame)
-            {
-                continue;
-            }
-            if frame.hidden || line.is_empty() {
-                if rows.len() == 1 {
-                    settled.push((rows, wrap));
-                } else {
-                    outdated.push((rows, wrap, Breaks::default()));
-                }
-                continue;
-            }
-            // Wrapping cannot break a line that never reaches its width.
-            if presentation.is_none()
-                && ascii_advance.is_some_and(|advance| {
-                    fits_unwrapped(
-                        &self.model.display_text()[line.clone()],
-                        advance,
-                        wrap.widths.0,
-                    )
+        for scope in scopes {
+            // Each scope starts a line. Walk it in order: a line's rows follow
+            // its first row, so no item is looked up by index.
+            let mut ix = scope.start;
+            let mut items = self.layout_items.iter_from(ix).peekable();
+            while ix < scope.end {
+                let Some(item) = items.next() else {
+                    break;
+                };
+                let DocumentLayoutItem::Text {
+                    line,
+                    line_key,
+                    presentation,
+                    node_id,
+                    frame: Derived(Some(item_frame)),
+                    wrapped,
+                    ..
+                } = item
+                else {
+                    ix += 1;
+                    continue;
+                };
+                let mut count = 1;
+                while items
+                .next_if(|next| {
+                    matches!(next, DocumentLayoutItem::Text { line: other, node_id: other_node, .. }
+                        if other == line && other_node == node_id)
                 })
+                .is_some()
             {
-                if rows.len() == 1 {
-                    settled.push((rows, wrap));
-                } else {
-                    outdated.push((rows, wrap, Breaks::default()));
-                }
-                continue;
+                count += 1;
             }
-            match state.cache.lines.get(line_key) {
-                // Another line with this text and fonts already wrapped for it.
-                Some(cached) if cached.generation == generation && cached.widths == wrap.widths => {
-                    if self.rows_match(rows.clone(), &cached.starts) {
+                let rows = ix..ix + count;
+                ix = rows.end;
+                let frame = if state.frames.is_empty() {
+                    item_frame
+                } else {
+                    state
+                        .frames
+                        .get(&(node_id.clone(), line.clone()))
+                        .unwrap_or(item_frame)
+                };
+                let wrap = WrapKey {
+                    generation,
+                    widths: frame.widths(width),
+                };
+                if wrapped.0 == Some(wrap) && item_frame == frame {
+                    continue;
+                }
+                if frame.hidden || line.is_empty() {
+                    if rows.len() == 1 {
                         settled.push((rows, wrap));
                     } else {
-                        outdated.push((rows, wrap, cached.starts.clone()));
+                        outdated.push((rows, wrap, Breaks::default()));
                     }
+                    continue;
                 }
-                cached => stale.push(StaleLine {
-                    in_view: rows.start < view.end && view.start < rows.end,
-                    items: rows,
-                    bytes: line.len(),
-                    wrapped_before: cached.is_some() || wrapped.0.is_some(),
-                    widths: wrap.widths,
-                }),
+                // Wrapping cannot break a line that never reaches its width.
+                if presentation.is_none()
+                    && ascii_advance.is_some_and(|advance| {
+                        fits_unwrapped(
+                            &self.model.display_text()[line.clone()],
+                            advance,
+                            wrap.widths.0,
+                        )
+                    })
+                {
+                    if rows.len() == 1 {
+                        settled.push((rows, wrap));
+                    } else {
+                        outdated.push((rows, wrap, Breaks::default()));
+                    }
+                    continue;
+                }
+                match state.cache.lines.get(line_key) {
+                    // Another line with this text and fonts already wrapped for it.
+                    Some(cached)
+                        if cached.generation == generation && cached.widths == wrap.widths =>
+                    {
+                        if self.rows_match(rows.clone(), &cached.starts) {
+                            settled.push((rows, wrap));
+                        } else {
+                            outdated.push((rows, wrap, cached.starts.clone()));
+                        }
+                    }
+                    cached => stale.push(StaleLine {
+                        in_view: rows.start < view.end && view.start < rows.end,
+                        focused: false,
+                        items: rows,
+                        line: line.clone(),
+                        bytes: line.len(),
+                        wrapped_before: cached.is_some() || wrapped.0.is_some(),
+                        widths: wrap.widths,
+                    }),
+                }
             }
         }
 
@@ -1503,15 +1784,20 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .and_then(|position| self.resolve_position(&position).ok())
             .unwrap_or_else(|| self.model.cursor());
         let focus = self.model.source_to_display(focus, super::Affinity::After);
-        for line in &mut stale {
-            line.in_view |= matches!(&self.layout_items[line.items.start], DocumentLayoutItem::Text { line, .. } if focus.is_some_and(|offset| line.start <= offset && offset <= line.end));
+        for stale_line in &mut stale {
+            stale_line.focused = focus.is_some_and(|offset| {
+                stale_line.line.start <= offset && offset <= stale_line.line.end
+            });
+            stale_line.in_view |= stale_line.focused;
         }
-        stale.sort_by_key(|line| {
-            let focused = matches!(&self.layout_items[line.items.start], DocumentLayoutItem::Text { line, .. } if focus.is_some_and(|offset| line.start <= offset && offset <= line.end));
-            (!focused, !line.in_view)
-        });
+        // Stable, so document order holds within each priority.
+        stale.sort_by_key(|line| (!line.focused, !line.in_view));
         let (now, later): (Vec<_>, Vec<_>) = stale.into_iter().partition(|line| {
             let budget = if line.wrapped_before {
+                // Beyond the view, only right after an invalidation.
+                if !(line.in_view || nearby && scan_all) {
+                    return false;
+                }
                 &mut rewrap_budget
             } else {
                 &mut first_budget
@@ -1541,7 +1827,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         }
         // Both batches refer to the current layout. Freeze the background
         // inputs before settling rows changes the indices of later lines.
-        let background = (scan_all
+        // Replaced items are checked as a whole pass is, for their own range.
+        let full = scan_all || dirty.is_some();
+        let background = (full
             && !later.is_empty()
             && self
                 .text_rows
@@ -1551,6 +1839,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             let mut fonts = FontTable::new(window);
             let specs: Vec<_> = later
                 .iter()
+                .take(BACKGROUND_LINES_PER_WRAP)
                 .map(|line| self.line_spec(line, &mut fonts))
                 .collect();
             let wrappers = fonts.wrappers(cx);
@@ -1559,12 +1848,21 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.settle_line_rows(settled, outdated, cx);
 
         let state = self.text_rows.as_mut().expect("text rows are on");
-        state.scan_all = false;
-        if !scan_all {
+        if !defer {
+            state.scan_all = false;
+        }
+        if scan_all {
+            state.nearby = false;
+        }
+        if !full {
             return;
         }
         // Lines still stale wrap as they scroll into view.
-        state.check = !later.is_empty();
+        if scan_all {
+            state.check = !later.is_empty();
+        } else {
+            state.check |= !later.is_empty();
+        }
         let Some((specs, mut wrappers)) = background else {
             return;
         };
@@ -1723,18 +2021,60 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         mut outdated: Vec<OutdatedLine>,
         cx: &mut Context<Self>,
     ) {
-        for (rows, wrap) in settled {
-            // These are one-row lines. Publishing their frame and wrap is
-            // subject to the same batch budget as multirow results.
-            debug_assert_eq!(rows.len(), 1);
-            outdated.push((rows, wrap, Breaks::default()));
-        }
+        self.mark_settled_rows(settled);
         if outdated.is_empty() {
             return;
         }
         outdated.sort_by_key(|(rows, _, _)| rows.start);
         outdated.dedup_by_key(|(rows, _, _)| rows.start);
         self.replace_line_rows(outdated, cx);
+    }
+
+    /// Records the wrap of one-row lines whose row already matches it. Their
+    /// rows do not change, so they update in place, a run of adjacent lines
+    /// at a time, without waiting for a publication.
+    fn mark_settled_rows(&mut self, mut settled: Vec<(Range<usize>, WrapKey)>) {
+        settled.sort_by_key(|(rows, _)| rows.start);
+        let mut settled = settled.into_iter().peekable();
+        while let Some((rows, wrap)) = settled.next() {
+            debug_assert_eq!(rows.len(), 1);
+            let mut run = vec![wrap];
+            while let Some((_, wrap)) =
+                settled.next_if(|(next, _)| next.start == rows.start + run.len())
+            {
+                run.push(wrap);
+            }
+            let start = rows.start;
+            let frames = &self.text_rows.as_ref().expect("text rows are on").frames;
+            let mut heights = Vec::new();
+            let mut run = run.into_iter();
+            self.layout_items
+                .map_range(start..start + run.len(), |item| {
+                    let DocumentLayoutItem::Text {
+                        display,
+                        line,
+                        node_id,
+                        frame,
+                        wrapped,
+                        ..
+                    } = item
+                    else {
+                        return;
+                    };
+                    wrapped.0 = run.next();
+                    // A frame kept for an older style takes over with the wrap.
+                    if !frames.is_empty()
+                        && let Some(retained) = frames.get(&(node_id.clone(), line.clone()))
+                    {
+                        frame.0 = Some(*retained);
+                    }
+                    heights.push(frame.0.map(|frame| frame.row_height(display, line)));
+                });
+            if frames.is_empty() {
+                continue;
+            }
+            self.list_state.set_item_heights(start, heights);
+        }
     }
 
     /// Whether the rows of line items `rows` start where `starts` says.
@@ -1779,8 +2119,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let spec = |runs: Vec<(usize, usize)>, fonts: &FontTable| {
             let mut hash = DefaultHasher::new();
             for font in std::iter::once(0).chain(runs.iter().map(|(_, font)| *font)) {
-                fonts.fonts[font].0.hash(&mut hash);
-                f32::from(fonts.fonts[font].1).to_bits().hash(&mut hash);
+                fonts.hashes[font].hash(&mut hash);
             }
             let fonts_key = hash.finish();
             LineSpec {
@@ -1792,10 +2131,13 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 previous: self.text_rows.as_ref().and_then(|state| {
                     let key = state.cache.previous.get(&display.start)?;
                     let cached = state.cache.lines.get(key)?;
+                    // A wrap resumes only for the same widths and fonts;
+                    // check before copying its input.
                     (cached.generation == state.generation)
-                        .then(|| cached.input.clone())
+                        .then_some(cached.input.as_ref())
                         .flatten()
-                        .filter(|input| input.fonts_key == fonts_key)
+                        .filter(|input| input.fonts_key == fonts_key && input.widths == line.widths)
+                        .cloned()
                         .map(|mut input| {
                             input.change = state
                                 .edit
@@ -1862,12 +2204,32 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// their items, with the rows of its wrap, keeping the visible text in place.
     fn replace_line_rows(&mut self, lines: Vec<OutdatedLine>, cx: &mut Context<Self>) {
         let state = self.text_rows.as_mut().expect("text rows enabled");
-        state.publishing = Some(RowPublication {
-            lines: lines.into_iter().rev().collect(),
-            items: super::LayoutItems::default(),
-            heights: gpui::PreparedListItems::new(),
-            row: 0,
-        });
+        if let Some(work) = state.publishing.as_mut() {
+            // Lines attach from the end, so earlier lines keep their indices.
+            // Keep the queue in that order; a partly built line that is no
+            // longer first restarts after the lines now before it.
+            let front = work.lines.front().map(|(rows, _, _)| rows.start);
+            for line in lines {
+                let at = work
+                    .lines
+                    .partition_point(|(rows, _, _)| rows.start > line.0.start);
+                work.lines.insert(at, line);
+            }
+            if work.row > 0 && work.lines.front().map(|(rows, _, _)| rows.start) != front {
+                state.retired.push((
+                    std::mem::take(&mut work.items),
+                    std::mem::replace(&mut work.heights, gpui::PreparedListItems::new()),
+                ));
+                work.row = 0;
+            }
+        } else {
+            state.publishing = Some(RowPublication {
+                lines: lines.into_iter().rev().collect(),
+                items: super::LayoutItems::default(),
+                heights: gpui::PreparedListItems::new(),
+                row: 0,
+            });
+        }
         self.advance_row_publication(cx);
         self.schedule_row_publication(cx);
     }
@@ -1920,6 +2282,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
 
     /// Build a bounded batch, keeping published geometry usable until the
     /// complete candidate subtree can be attached without visiting its rows.
+    /// Adjacent lines completed in one batch attach together: one splice of
+    /// each tree per run, however many small lines the run holds.
     fn advance_row_publication(&mut self, cx: &mut Context<Self>) {
         const ROW_BATCH: usize = 512;
         let Some(mut work) = self
@@ -1929,14 +2293,38 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         else {
             return;
         };
+        // The anchor's source offset does not change while rows attach.
+        let anchor = self
+            .pending_viewport_anchor
+            .as_ref()
+            .filter(|pending| !pending.reveal_on_wrap)
+            .and_then(|pending| self.model.position_for_anchor(pending.anchor).ok())
+            .and_then(|position| self.resolve_position(&position).ok());
         let mut budget = ROW_BATCH;
+        // Lines completed in this batch, last first, and the rows built for them.
+        let mut run: Vec<(
+            Range<usize>,
+            Vec<DocumentLayoutItem<I>>,
+            Vec<Option<Pixels>>,
+        )> = Vec::new();
         while budget > 0 {
-            if self.publish_single_rows(&mut work, &mut budget) {
-                continue;
-            }
             let Some((rows, wrap, starts)) = work.lines.front() else {
                 break;
             };
+            let (rows, wrap, starts) = (rows.clone(), *wrap, starts.clone());
+            if work.row == 0
+                && let Some(gap) = run
+                    .last()
+                    .map(|(last, ..)| rows.end..last.start)
+                    .filter(|gap| !gap.is_empty())
+            {
+                // A short gap of framed text joins the run unchanged, so
+                // lines between unchanged rows still attach in one splice.
+                match self.unchanged_rows(gap) {
+                    Some(gap) => run.push(gap),
+                    None => self.attach_line_run(std::mem::take(&mut run), anchor),
+                }
+            }
             let DocumentLayoutItem::Text {
                 source: first,
                 line,
@@ -1948,19 +2336,21 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             else {
                 unreachable!()
             };
+            let (line, line_key) = (line.clone(), *line_key);
             let DocumentLayoutItem::Text { source: last, .. } = &self.layout_items[rows.end - 1]
             else {
                 unreachable!()
             };
             let segment = first.start..last.end;
-            let frame = self
-                .text_rows
-                .as_ref()
-                .unwrap()
-                .frames
-                .get(&(node_id.clone(), line.clone()))
-                .copied()
-                .or(frame.0);
+            let frames = &self.text_rows.as_ref().unwrap().frames;
+            let frame = if frames.is_empty() {
+                frame.0
+            } else {
+                frames
+                    .get(&(node_id.clone(), line.clone()))
+                    .copied()
+                    .or(frame.0)
+            };
             let count = (starts.len() + 1 - work.row).min(budget);
             let mut items = Vec::with_capacity(count);
             let mut heights = Vec::with_capacity(count);
@@ -1986,7 +2376,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                         range.clone(),
                         segment.clone(),
                         line.clone(),
-                        *line_key,
+                        line_key,
                     )
                 };
                 if let DocumentLayoutItem::Text {
@@ -1996,60 +2386,33 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 } = &mut item
                 {
                     row_frame.0 = frame;
-                    wrapped.0 = Some(*wrap);
+                    wrapped.0 = Some(wrap);
                 }
-                heights.push(frame.map(|frame| frame.row_height(&range, line)));
+                heights.push(frame.map(|frame| frame.row_height(&range, &line)));
                 items.push(item);
             }
+            budget -= count;
+            if work.row == 0 && count == starts.len() + 1 {
+                run.push((rows, items, heights));
+                work.lines.pop_front();
+                continue;
+            }
+            // A line too long for one batch is built across batches and
+            // attached alone, after the lines completed before it.
+            self.attach_line_run(std::mem::take(&mut run), anchor);
             work.items.extend(items);
             work.heights.extend(heights);
             work.row += count;
-            budget -= count;
             if work.row <= starts.len() {
                 break;
             }
-            // Capture the viewport at publication, respecting intervening scrolls.
-            let top = self.list_state.logical_scroll_top();
-            let top_offset = match self.layout_items.get(top.item_ix) {
-                Some(DocumentLayoutItem::Text { display, .. }) if rows.contains(&top.item_ix) => {
-                    Some(display.start)
-                }
-                _ => None,
-            };
-            let new_top = top_offset.map(|offset| rows.start + work.items.partition_point(|item| matches!(item, DocumentLayoutItem::Text { display, .. } if display.start <= offset)).saturating_sub(1));
-            let old_items = self
-                .layout_items
-                .splice_prepared(rows.clone(), std::mem::take(&mut work.items));
-            let old_heights = self
-                .list_state
-                .splice_prepared(rows.clone(), std::mem::take(&mut work.heights));
-            if let Some(item_ix) = new_top {
-                self.list_state.scroll_to(gpui::ListOffset {
-                    item_ix,
-                    offset_in_item: top.offset_in_item,
-                });
-            }
-            if let Some(pending) = self
-                .pending_viewport_anchor
-                .as_ref()
-                .filter(|pending| !pending.reveal_on_wrap)
-                && let Ok(position) = self.model.position_for_anchor(pending.anchor)
-                && let Ok(offset) = self.resolve_position(&position)
-                && segment.contains(&offset)
-            {
-                self.list_state.scroll_to(gpui::ListOffset {
-                    item_ix: self.layout_item_for_source(offset),
-                    offset_in_item: px(0.),
-                });
-            }
-            self.text_rows
-                .as_mut()
-                .unwrap()
-                .retired
-                .push((old_items, old_heights));
+            let items = std::mem::take(&mut work.items);
+            let heights = std::mem::replace(&mut work.heights, gpui::PreparedListItems::new());
+            self.attach_rows(rows, items, heights, anchor);
             work.row = 0;
             work.lines.pop_front();
         }
+        self.attach_line_run(run, anchor);
         if !work.lines.is_empty() {
             self.text_rows.as_mut().unwrap().publishing = Some(work);
         } else {
@@ -2058,67 +2421,113 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         cx.notify();
     }
 
-    fn publish_single_rows(&mut self, work: &mut RowPublication<I>, budget: &mut usize) -> bool {
-        if work.row != 0 {
-            return false;
+    /// Items `rows` as they are, with their declared heights, to carry over
+    /// within a run; `None` when they are many, or not all framed text.
+    #[allow(clippy::type_complexity)]
+    fn unchanged_rows(
+        &self,
+        rows: Range<usize>,
+    ) -> Option<(
+        Range<usize>,
+        Vec<DocumentLayoutItem<I>>,
+        Vec<Option<Pixels>>,
+    )> {
+        const MAX_GAP: usize = 64;
+        if rows.len() > MAX_GAP {
+            return None;
         }
-        let Some((rows, _, starts)) = work
-            .lines
-            .front()
-            .filter(|(rows, _, starts)| rows.len() == 1 && starts.is_empty())
-        else {
-            return false;
-        };
-        debug_assert!(starts.is_empty());
-        let end = rows.end;
-        let mut start = end;
-        let mut values = Vec::new();
-        while values.len() < *budget {
-            let Some((rows, wrap, _)) = work.lines.front().filter(|(rows, _, starts)| {
-                rows.len() == 1 && rows.end == start && starts.is_empty()
-            }) else {
-                break;
-            };
+        let mut items = Vec::with_capacity(rows.len());
+        let mut heights = Vec::with_capacity(rows.len());
+        for item in self.layout_items.range(rows.clone()) {
             let DocumentLayoutItem::Text {
-                node_id,
-                line,
-                frame,
-                ..
-            } = &self.layout_items[rows.start]
-            else {
-                unreachable!()
-            };
-            let frame = self
-                .text_rows
-                .as_ref()
-                .unwrap()
-                .frames
-                .get(&(node_id.clone(), line.clone()))
-                .copied()
-                .or(frame.0);
-            values.push((*wrap, frame));
-            start = rows.start;
-            work.lines.pop_front();
-        }
-        *budget -= values.len();
-        let mut heights = Vec::with_capacity(values.len());
-        self.layout_items.map_range(start..end, |item| {
-            let (wrap, value) = values.pop().unwrap();
-            if let DocumentLayoutItem::Text {
                 display,
                 line,
-                frame,
-                wrapped,
+                frame: Derived(Some(frame)),
                 ..
             } = item
-            {
-                frame.0 = value;
-                wrapped.0 = Some(wrap);
-                heights.push(value.map(|frame| frame.row_height(display, line)));
+            else {
+                return None;
+            };
+            heights.push(Some(frame.row_height(display, line)));
+            items.push(item.clone());
+        }
+        Some((rows, items, heights))
+    }
+
+    /// Attaches adjacent lines given last first, in one splice of each tree.
+    fn attach_line_run(
+        &mut self,
+        run: Vec<(
+            Range<usize>,
+            Vec<DocumentLayoutItem<I>>,
+            Vec<Option<Pixels>>,
+        )>,
+        anchor: Option<usize>,
+    ) {
+        let (Some((last, ..)), Some((first, ..))) = (run.first(), run.last()) else {
+            return;
+        };
+        let rows = first.start..last.end;
+        let mut items = super::LayoutItems::default();
+        let mut heights = gpui::PreparedListItems::new();
+        for (_, line_items, line_heights) in run.into_iter().rev() {
+            items.extend(line_items);
+            heights.extend(line_heights);
+        }
+        self.attach_rows(rows, items, heights, anchor);
+    }
+
+    /// Replaces items `rows` with complete rows, keeping the viewport's text
+    /// in place and revealing a pending anchor the rows now place.
+    fn attach_rows(
+        &mut self,
+        rows: Range<usize>,
+        items: super::LayoutItems<I>,
+        heights: gpui::PreparedListItems,
+        anchor: Option<usize>,
+    ) {
+        let (Some(DocumentLayoutItem::Text { source: first, .. }), Some(last)) = (
+            self.layout_items.get(rows.start),
+            self.layout_items.get(rows.end - 1),
+        ) else {
+            unreachable!("published rows are text items")
+        };
+        let segment = first.start..last.source_end();
+        // Capture the viewport at publication, respecting intervening scrolls.
+        let top = self.list_state.logical_scroll_top();
+        let top_offset = match self.layout_items.get(top.item_ix) {
+            Some(DocumentLayoutItem::Text { display, .. }) if rows.contains(&top.item_ix) => {
+                Some(display.start)
             }
+            _ => None,
+        };
+        let new_top = top_offset.map(|offset| {
+            rows.start
+                + items
+                    .partition_point(|item| {
+                        matches!(item, DocumentLayoutItem::Text { display, .. } if display.start <= offset)
+                    })
+                    .saturating_sub(1)
         });
-        self.list_state.set_item_heights(start, heights);
-        true
+        let old_items = self.layout_items.splice_prepared(rows.clone(), items);
+        let old_heights = self.list_state.splice_prepared(rows, heights);
+        if let Some(item_ix) = new_top {
+            self.list_state.scroll_to(gpui::ListOffset {
+                item_ix,
+                offset_in_item: top.offset_in_item,
+            });
+        }
+        if let Some(offset) = anchor.filter(|offset| segment.contains(offset)) {
+            self.list_state.scroll_to(gpui::ListOffset {
+                item_ix: self.layout_item_for_source(offset),
+                offset_in_item: px(0.),
+            });
+        }
+        self.text_rows
+            .as_mut()
+            .unwrap()
+            .retired
+            .push((old_items, old_heights));
     }
 
     /// Drops the cached wraps of lines no longer in the document once they
@@ -2308,6 +2717,102 @@ mod tests {
         });
         settle_rows(&document, &mut cx);
         assert_declared_geometry(&document, &mut cx);
+    }
+
+    #[gpui::test]
+    fn edits_during_background_rows_settle_to_the_complete_wrap(cx: &mut TestAppContext) {
+        use crate::document::{EditDecision, EditOrigin, EditTransaction, TextEdit};
+        let snapshot = |text: &str| {
+            DocumentSnapshot::new(
+                text.to_string(),
+                vec![DocumentRegion::new(
+                    "draft",
+                    0..text.len(),
+                    EditPolicy::Editable,
+                )],
+                DocumentProjection::identity(text.len()),
+                vec![],
+                DocumentStyles::default(),
+            )
+        };
+        let rows = |document: &Entity<DocumentState<&'static str>>, cx: &mut VisualTestContext| {
+            document.read_with(cx, |doc, _| {
+                doc.layout_items
+                    .iter()
+                    .filter_map(|item| match item {
+                        DocumentLayoutItem::Text { display, .. } => Some(display.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let edit = |document: &Entity<DocumentState<&'static str>>,
+                    cx: &mut VisualTestContext,
+                    text: &mut String,
+                    at: usize,
+                    insert: &str| {
+            text.insert_str(at, insert);
+            document.update(cx, |doc, cx| {
+                let transaction = EditTransaction::new(
+                    doc.model.revision,
+                    EditOrigin::User,
+                    vec![TextEdit::new(at..at, insert)],
+                    doc.model.text.len(),
+                )
+                .unwrap();
+                assert_eq!(
+                    doc.commit_user_transaction(transaction, None, cx),
+                    EditDecision::Apply
+                );
+                assert!(doc.is_laying_out_text(), "an edit leaves rows to settle");
+            });
+        };
+        let frame = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            })
+        };
+        // More than a first frame wraps, so rows wrap in the background and
+        // publish in batches while the edits arrive.
+        let line = "words that wrap across several rows at this width ".repeat(4);
+        let mut text = format!("{line}\n").repeat(1500);
+        let mut app = cx.clone();
+        let (edited, mut cx) = document_view(cx);
+        edited.update(&mut cx, |doc, cx| {
+            doc.reset(snapshot(&text), cx).unwrap();
+            doc.set_text_rows(Some(TextRows::new()), cx);
+        });
+        cx.simulate_resize(size(px(320.), px(400.)));
+        frame(&mut cx);
+        assert!(edited.read_with(&cx, |doc, _| {
+            doc.text_rows.as_ref().unwrap().pending.is_some()
+        }));
+        let end = text.len() - 1;
+        edit(&edited, &mut cx, &mut text, end, " tail");
+        cx.run_until_parked();
+        frame(&mut cx);
+        assert!(edited.read_with(&cx, |doc, _| {
+            doc.text_rows.as_ref().unwrap().publishing.is_some()
+        }));
+        let middle = text.len() / 2;
+        edit(&edited, &mut cx, &mut text, middle, " middle words");
+        frame(&mut cx);
+        edit(&edited, &mut cx, &mut text, 0, "head ");
+        settle_rows(&edited, &mut cx);
+        // With nothing in flight, the replaced items alone remain to settle.
+        edit(&edited, &mut cx, &mut text, 7, " again");
+        settle_rows(&edited, &mut cx);
+        assert_declared_geometry(&edited, &mut cx);
+
+        let (fresh, mut fresh_cx) = document_view(&mut app);
+        fresh.update(&mut fresh_cx, |doc, cx| {
+            doc.reset(snapshot(&text), cx).unwrap();
+            doc.set_text_rows(Some(TextRows::new()), cx);
+        });
+        fresh_cx.simulate_resize(size(px(320.), px(400.)));
+        settle_rows(&fresh, &mut fresh_cx);
+        assert_eq!(rows(&edited, &mut cx), rows(&fresh, &mut fresh_cx));
     }
 
     #[gpui::test]
@@ -2560,7 +3065,9 @@ mod tests {
                 );
                 let stale = StaleLine {
                     items: 0..1,
+                    line: 0..text.len(),
                     in_view: true,
+                    focused: false,
                     bytes: text.len(),
                     wrapped_before: true,
                     widths,

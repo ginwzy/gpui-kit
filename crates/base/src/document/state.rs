@@ -798,8 +798,9 @@ enum DocumentLayoutItem<I> {
         /// Identifies the row's text without holding it; the text is sliced
         /// from the display text when the row is drawn.
         fingerprint: u64,
-        /// `None` for unstyled text, which then costs no allocation.
-        presentation: Option<Box<DocumentTextPresentation>>,
+        /// `None` for unstyled text, which then costs no allocation. Shared,
+        /// so attaching rows or updating their geometry copies no styles.
+        presentation: Option<std::sync::Arc<DocumentTextPresentation>>,
         /// The display line this row belongs to. Without text rows, every line
         /// is one row.
         line: Range<usize>,
@@ -1399,7 +1400,7 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             source,
             node_id,
             presentation: (presentation != DocumentTextPresentation::default())
-                .then(|| Box::new(presentation)),
+                .then(|| std::sync::Arc::new(presentation)),
             line,
             line_key,
             frame: Derived::default(),

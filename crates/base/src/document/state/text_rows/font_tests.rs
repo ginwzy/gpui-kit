@@ -176,7 +176,7 @@ fn item(
         display: 0..len,
         source: 0..len,
         node_id: Some(()),
-        presentation: presentation.map(Box::new),
+        presentation: presentation.map(std::sync::Arc::new),
         line: 0..len,
         line_key: 0,
         frame: Derived::default(),
@@ -342,6 +342,8 @@ fn paint_restyles_keep_wrapped_geometry_and_refresh_presentation(cx: &mut TestAp
             let spec = doc.line_spec(
                 &StaleLine {
                     items: doc.line_rows(0),
+                    line: 0..text.len(),
+                    focused: false,
                     bytes: text.len(),
                     wrapped_before: true,
                     in_view: true,
@@ -429,7 +431,7 @@ fn font_runs_benchmark(cx: &mut TestAppContext) {
                     std::hint::black_box(line_key(&doc.layout_items[0]));
                     let key_us = start.elapsed().as_secs_f64()*1e6;
                     let start = std::time::Instant::now();
-                    let spec = doc.line_spec(&StaleLine { items: 0..1, bytes: text.len(), wrapped_before: false, in_view: true, widths: (px(900.), px(900.)) }, &mut fonts);
+                    let spec = doc.line_spec(&StaleLine { items: 0..1, line: 0..text.len(), focused: false, bytes: text.len(), wrapped_before: false, in_view: true, widths: (px(900.), px(900.)) }, &mut fonts);
                     eprintln!("FONT_PROBE count={count} fonts={fonts_change} sample={sample} key_us={key_us:.3} spec_us={:.3} runs={}", start.elapsed().as_secs_f64()*1e6, spec.runs.len());
                     std::hint::black_box(spec);
                 }

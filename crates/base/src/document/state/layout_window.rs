@@ -262,9 +262,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             };
         }
         forget_touched_geometry(&touched, &mut replacement, prefix..split);
-        let removed = self.layout_items.splice_prepared(old, replacement.into());
+        let len = replacement.len();
+        let removed = self
+            .layout_items
+            .splice_prepared(old.clone(), replacement.into());
         self.retire_layout_items(removed);
-        self.layout_items_changed();
+        self.layout_items_replaced(old, len);
     }
 
     /// Checks that patched layout items are the document's layout items. Rows
