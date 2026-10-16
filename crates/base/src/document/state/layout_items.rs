@@ -282,6 +282,14 @@ impl<I: Clone> LayoutItems<I> {
         let rows: Vec<Row<I>> = middle.0.iter().cloned().collect();
         drop(middle);
         let mut changed = SumTree::default();
+        // Splices leave small chunks behind; adjacent ones taken out here are
+        // joined, so later passes visit fewer chunks.
+        let mut joined: Vec<DocumentLayoutItem<I>> = Vec::new();
+        let flush = |joined: &mut Vec<DocumentLayoutItem<I>>, changed: &mut SumTree<Row<I>>| {
+            if !joined.is_empty() {
+                changed.push(Row::new(std::mem::take(joined)), ());
+            }
+        };
         let mut at = lo;
         for mut row in rows {
             let len = row.range.len();
@@ -289,6 +297,21 @@ impl<I: Clone> LayoutItems<I> {
             let from = range.start.max(at) - at;
             let to = range.end.min(at + len).max(at) - at;
             at += len;
+            if len < CHUNK_ROWS / 4 {
+                if joined.len() + len > CHUNK_ROWS {
+                    flush(&mut joined, &mut changed);
+                }
+                let start = joined.len();
+                match Arc::get_mut(&mut row.items) {
+                    Some(items) => joined.extend(items.drain(row.range.clone())),
+                    None => joined.extend_from_slice(row.items()),
+                }
+                joined[start + from..start + to.max(from)]
+                    .iter_mut()
+                    .for_each(&mut update);
+                continue;
+            }
+            flush(&mut joined, &mut changed);
             if let Some(items) = Arc::get_mut(&mut row.items) {
                 let offset = row.range.start;
                 items[offset + from..offset + to]
@@ -301,6 +324,7 @@ impl<I: Clone> LayoutItems<I> {
                 changed.push(Row::new(items), ());
             }
         }
+        flush(&mut joined, &mut changed);
         let Self(mut next) = before;
         next.append(changed, ());
         next.append(after.0, ());
@@ -521,6 +545,26 @@ mod tests {
         assert_eq!(clones.load(Ordering::Relaxed), CHUNK_ROWS);
         assert_eq!(source(&shared, 0), 0..0);
         assert_eq!(source(&live, 0), 1..2);
+    }
+
+    #[test]
+    fn updating_a_range_joins_the_small_chunks_splices_leave() {
+        let block = |ix: usize| DocumentLayoutItem::Block {
+            id: ix,
+            source: ix..ix,
+            height: super::super::Derived::default(),
+        };
+        let chunks = |items: &LayoutItems<usize>| items.0.iter().count();
+        let mut items = LayoutItems::default();
+        for ix in 0..CHUNK_ROWS {
+            items.splice(ix..ix, [block(ix)]);
+        }
+        assert!(chunks(&items) > CHUNK_ROWS / 2);
+        items.map_range(0..CHUNK_ROWS, |_| {});
+        assert_eq!(chunks(&items), 1);
+        for ix in 0..CHUNK_ROWS {
+            assert!(matches!(&items[ix], DocumentLayoutItem::Block { id, .. } if *id == ix));
+        }
     }
 
     #[test]
