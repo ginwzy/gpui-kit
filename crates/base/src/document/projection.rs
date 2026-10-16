@@ -522,6 +522,15 @@ impl ProjectionMap {
         if offset == self.display.len() {
             return Some(self.source_len);
         }
+        // Inside the hinted identity run, no other run holds the offset and
+        // the search would end at the hint. Lines in order mostly land here.
+        if let Some(run) = self.runs.get(*hint)
+            && run.display.start < offset
+            && offset < run.display.end
+            && matches!(run.kind, ProjectionRunKind::Identity)
+        {
+            return Some(run.source.start + offset - run.display.start);
+        }
         let start = partition_from(&self.runs, *hint, |run| {
             run.display.end < offset || (run.display.end == offset && !run.display.is_empty())
         });

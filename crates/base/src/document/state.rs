@@ -1428,19 +1428,26 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
                 font_family_overrides.push((local, font_family.clone()));
             }
         }
-        let presentation = DocumentTextPresentation {
-            text_style,
-            indent,
-            highlights,
-            font_family_overrides,
-        };
+        // Most lines carry no styles; they skip building and comparing one.
+        let styled = text_style.is_some()
+            || indent.is_some()
+            || !highlights.is_empty()
+            || !font_family_overrides.is_empty();
+        let presentation = styled
+            .then(|| DocumentTextPresentation {
+                text_style,
+                indent,
+                highlights,
+                font_family_overrides,
+            })
+            .filter(|presentation| *presentation != DocumentTextPresentation::default())
+            .map(std::sync::Arc::new);
         DocumentLayoutItem::Text {
             fingerprint: text_fingerprint(&display_text[display.clone()]),
             display,
             source,
             node_id,
-            presentation: (presentation != DocumentTextPresentation::default())
-                .then(|| std::sync::Arc::new(presentation)),
+            presentation,
             line,
             line_key,
             frame: Derived::default(),
