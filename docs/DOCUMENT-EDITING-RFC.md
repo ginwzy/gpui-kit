@@ -19,6 +19,102 @@ history, an editable trailing draft, projected rich text, and embedded blocks.
 The API remains domain-neutral: `gpui-base` does not know about messages,
 comments, tools, terminals, or model turns.
 
+### Inline atomic objects in text rows
+
+`DocumentBlock::new` keeps its existing independent block-row behavior. With
+`TextRows` enabled, a host can opt an atomic region into text flow:
+
+```rust,ignore
+DocumentBlock::new(id, source.clone())
+    .with_inline_size(InlineSize::new(rems(5.), rems(1.5), rems(1.1)))
+    .replaceable(true)
+// The complete atomic source range projects to exactly one display marker:
+ProjectionSpan::replace(source, "\u{fffc}")
+```
+
+`InlineSize` declares width, height and baseline from the top, in pixels or
+rems. Its finite, nonnegative lengths are validated with the presentation.
+The existing block renderer supplies the object's appearance inside the
+allocated box. Base does not inspect labels, paths, domain types or theme
+choices. Measured pixel sizes must be reinstalled when their typography
+changes; rem sizes follow the document's rem size. Remove inline objects
+before disabling `TextRows`.
+
+`DocumentState` remains the sole owner of source, selection, anchors, undo,
+wrapping tasks and derived layout. `ListState` retains item heights and scroll
+geometry. Object advances join the existing resumable grapheme wrapping;
+objects cannot split, and their before/after boundaries also separate text
+graphemes. Each mixed row uses ordinary `StyledText` runs and flex-positioned
+object boxes, aligned on a shared baseline. Their actual prepaint bounds form
+one row layout used by painting, hit testing, selection, input-method bounds,
+vertical navigation and reveal. Plain rows retain their existing renderer.
+An oversized object stays whole and is clipped by the document viewport.
+
+Keep editable text regions, including zero-length regions where insertion or
+composition is allowed before, between or after objects. Those regions own
+text input; an object never becomes an editor or a marked-text owner. Normal
+left/right movement skips the entire atomic source range. Shift selection and
+pointer selection include whole objects, preserving source coordinates.
+
+Inline appearance does not itself permit deletion. Only blocks explicitly
+marked `replaceable(true)` participate in cross-object range replacement:
+
+1. A User or Paste transaction covering editable text and complete opted-in
+   objects emits `DocumentEvent::ReplaceRequested(StructureReplacement<I>)`
+   and returns `EditDecision::StructureRequested`, without mutating the source.
+2. The host builds the requested replacement's snapshot, preserving domain
+   identities outside the replacement and supplying the resulting caret, then
+   calls `apply_structure_replacement`. The request exposes its transaction
+   and the removed object IDs.
+3. Base rejects a stale revision, a response with different text, a protected
+   region or active composition. A successful response enters the existing
+   structure undo stack as one edit. The host handles
+   `StructureReplayRequested` through `apply_structure_replay` as before.
+
+Readonly, routed, partially covered atomic and ordinary block regions keep
+their previous protection. Local Host splices still require display-line
+seams. No application history, persistence or submission representation is
+introduced by this API.
+
+`crates/base/examples/inline_document.rs` is the runnable host example:
+
+```sh
+cargo run -p gpui-base --example inline_document
+cargo test -p gpui-base --example inline_document
+```
+
+It includes three generic objects, adjacent objects with an empty editable
+boundary, explicit newlines, Unicode, a readonly prefix, resize and a text-size
+toggle. Its test exercises typing, clipboard paste, deletion and one-step
+undo/redo through the real event/host transaction path. Kernel tests exercise
+shared baselines, hit testing, dragging, IME rectangles, narrow wrapping,
+reveal, composition boundaries, opt-in protection and superseding pending
+long-line layout. Platform IME candidate windows and high-DPI behavior still
+require native-platform acceptance.
+
+Step 1 acceptance (Jian `6382ced`, Kit `60847eb2` plus this working change):
+Base's 1,096 unit tests, one integration test and the example's host test
+passed (one existing ignored test). Jian workspace passed 247 tests, including
+the recorded replay, with 12 ignored; Harness integration, both formatting
+checks, strict Clippy and full builds passed. X11/Xvfb at scale 1 verified
+760/300-pixel windows and 16/22-pixel text, exact source copy after pointer
+selection, Chinese/emoji replacement, one undo/redo and insertion between
+adjacent objects. The rebuilt ordinary Jian binary also passed Unicode draft
+editing, SourceView copy including final LF, real bash exit and subsequent
+input, existing block references, metadata v6 save and normal exit.
+
+An exit-time leaked-handle assertion also reproduced in an unmodified Kit
+baseline built with all targets; no exit-flow changes were made here. Native
+acceptance uses the ordinary application build, separately from test artifacts.
+The original full-check logs were in temporary storage removed by an environment
+restart; final native evidence and the baseline comparison are retained at
+`~/.cache/jian-inline-step1/`.
+
+No Jian consumer opts into this API yet. Step 2 must supply reference dimensions
+and rendering, project each reference to its marker, and connect the typed
+replacement/replay requests to existing draft domain transactions. History
+policy, metadata v6 and Harness/Pi submission formats remain outside this step.
+
 ## Problem
 
 `InputState`, `TextareaState`, and `EditorState` share `InputBaseState`. That

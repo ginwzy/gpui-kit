@@ -1,16 +1,48 @@
 use std::{error::Error, fmt, ops::Range};
 
-use super::{DocumentProjection, DocumentRegions, EditPolicy};
+use super::{DocumentProjection, DocumentRegions, EditPolicy, InlineSize, inline::OBJECT};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DocumentBlock<I> {
     id: I,
     source: Range<usize>,
+    inline_size: Option<InlineSize>,
+    replaceable: bool,
 }
 
 impl<I> DocumentBlock<I> {
     pub fn new(id: I, source: Range<usize>) -> Self {
-        Self { id, source }
+        Self {
+            id,
+            source,
+            inline_size: None,
+            replaceable: false,
+        }
+    }
+
+    /// Opt into an indivisible inline object in `TextRows` layout. Its entire
+    /// source range must project to one U+FFFC, instead of the hidden source
+    /// required by a default block. The renderer must fit this declared box.
+    pub fn with_inline_size(mut self, size: InlineSize) -> Self {
+        self.inline_size = Some(size);
+        self
+    }
+
+    pub fn inline_size(&self) -> Option<InlineSize> {
+        self.inline_size
+    }
+
+    /// Allow range replacement requests for this inline object. Defaults to
+    /// false; ordinary atomic blocks always retain their existing protection.
+    /// The host must handle `DocumentEvent::ReplaceRequested` and commit a
+    /// validated structure transaction before any source is changed.
+    pub fn replaceable(mut self, replaceable: bool) -> Self {
+        self.replaceable = replaceable;
+        self
+    }
+
+    pub fn is_replaceable(&self) -> bool {
+        self.inline_size.is_some() && self.replaceable
     }
 
     pub fn id(&self) -> &I {
@@ -31,6 +63,9 @@ impl<I> DocumentBlock<I> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockError {
     MissingRenderer,
+    InlineRequiresTextRows,
+    InvalidInlineSize,
+    InlineProjection(Range<usize>),
     InvalidRange(Range<usize>),
     OutOfBounds {
         range: Range<usize>,
@@ -46,6 +81,16 @@ impl fmt::Display for BlockError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingRenderer => formatter.write_str("document block renderer is not set"),
+            Self::InlineRequiresTextRows => {
+                formatter.write_str("inline objects require TextRows layout")
+            }
+            Self::InvalidInlineSize => {
+                formatter.write_str("inline object dimensions must be finite and nonnegative")
+            }
+            Self::InlineProjection(range) => write!(
+                formatter,
+                "inline object {range:?} must project to one U+FFFC"
+            ),
             Self::InvalidRange(range) => write!(formatter, "invalid block range {range:?}"),
             Self::OutOfBounds { range, source_len } => {
                 write!(
@@ -115,11 +160,19 @@ pub(crate) fn validate_blocks<I: Eq>(
         }
         let spans = projection.spans();
         let from = spans.partition_point(|span| span.source().start < source.start);
-        if !spans[from..]
+        let replacement = spans[from..]
             .iter()
             .take_while(|span| span.source().start == source.start)
-            .any(|span| span.source() == source && span.replacement().is_empty())
-        {
+            .find(|span| span.source() == source)
+            .map(|span| span.replacement());
+        if let Some(size) = block.inline_size {
+            if !size.is_valid() {
+                return Err(BlockError::InvalidInlineSize);
+            }
+            if replacement != Some(OBJECT) {
+                return Err(BlockError::InlineProjection(source));
+            }
+        } else if replacement != Some("") {
             return Err(BlockError::VisibleSource(source));
         }
     }
@@ -134,10 +187,9 @@ pub(crate) fn transform_blocks<I: Clone>(
     blocks
         .iter()
         .map(|block| {
-            DocumentBlock::new(
-                block.id().clone(),
-                super::position::transform_source_range(block.source(), edits),
-            )
+            let mut next = block.clone();
+            next.source = super::position::transform_source_range(block.source(), edits);
+            next
         })
         .collect()
 }

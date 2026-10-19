@@ -113,6 +113,8 @@ pub enum EditDecision<R> {
     Reject,
     Route(R),
     MaterializeAndApply,
+    /// The host received a structure replacement request; no mutation occurred.
+    StructureRequested,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

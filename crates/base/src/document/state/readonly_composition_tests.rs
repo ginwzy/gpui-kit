@@ -612,6 +612,7 @@ fn readonly_body_pointer_keyboard_copy_gutter_and_hidden_projection(cx: &mut Tes
                 assert!(
                     !line
                         .layout
+                        .text()
                         .line_layout_for_index(0)
                         .unwrap()
                         .wrap_boundaries

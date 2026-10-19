@@ -47,6 +47,7 @@ use super::{
 const DOCUMENT_INPUT_CONTEXT: &str = "Input";
 
 mod host;
+pub(super) mod inline_objects;
 mod inline_styles;
 mod layout_items;
 mod layout_window;
@@ -56,6 +57,8 @@ use layout_items::LayoutItems;
 #[cfg(test)]
 mod style_tests;
 
+pub use inline_objects::StructureReplacement;
+pub(super) use text_rows::RowFrame;
 pub use text_rows::{TextFrame, TextRows};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,6 +234,7 @@ pub enum DocumentEvent<I> {
     },
     Routed(RoutedEdit<I>),
     StructureReplayRequested(StructureReplay<I>),
+    ReplaceRequested(StructureReplacement<I>),
     Rejected(DocumentEditRejection),
     SelectionChanged,
     ProjectionChanged,
@@ -795,6 +799,7 @@ pub(super) struct DocumentTextPresentation {
     pub(super) indent: Option<DocumentTextIndent>,
     pub(super) highlights: Vec<(Range<usize>, HighlightStyle)>,
     pub(super) font_family_overrides: Vec<(Range<usize>, SharedString)>,
+    pub(super) objects: Vec<(Range<usize>, super::InlineSize)>,
 }
 
 /// Aligns a line of a paragraph with the text after its hanging marker.
@@ -853,6 +858,12 @@ impl<T> PartialEq for Derived<T> {
 }
 
 impl<I: Eq> DocumentLayoutItem<I> {
+    fn presentation(&self) -> Option<&DocumentTextPresentation> {
+        match self {
+            Self::Text { presentation, .. } => presentation.as_deref(),
+            _ => None,
+        }
+    }
     fn same_layout_identity(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -1230,7 +1241,16 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
                 .copied();
             let empty_text = region.policy() == EditPolicy::Editable
                 && region.range().is_empty()
-                && region_ix + 1 != self.regions.as_slice().len();
+                && region_ix + 1 != self.regions.as_slice().len()
+                && !self.blocks.iter().any(|block| {
+                    block.inline_size().is_some()
+                        && (block.source().start == region.range().start
+                            || block.source().end == region.range().start)
+                });
+            if block.is_some_and(|block| block.inline_size().is_some()) {
+                blocks.next();
+                continue;
+            }
             if block.is_none() && !empty_text {
                 continue;
             }
@@ -1384,7 +1404,19 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             .unwrap_or(segment.end)
             .clamp(source_start, segment.end);
         let source = source_start..source_end;
-        let node_id = self.node_after_from(source_start, &mut cursor.region);
+        let mut node_id = self.node_after_from(source_start, &mut cursor.region);
+        let objects = self.inline_objects_in(display.clone());
+        // A mixed paragraph can span several domain nodes. All its display
+        // rows share the paragraph identity; source positions keep their own IDs.
+        if !self.inline_objects_in(line.clone()).is_empty() {
+            let start = self
+                .display_to_source(line.start, Affinity::After)
+                .unwrap_or(source_start);
+            node_id = self
+                .position_for_offset(start, Affinity::After)
+                .ok()
+                .map(DocumentPosition::into_node_id);
+        }
         // Source styles are ordered and nonoverlapping; projection preserves
         // endpoint order (but can collapse or overlap display ranges). Find the
         // first end that can contain this line, then check its start. Keep equal
@@ -1432,13 +1464,15 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         let styled = text_style.is_some()
             || indent.is_some()
             || !highlights.is_empty()
-            || !font_family_overrides.is_empty();
+            || !font_family_overrides.is_empty()
+            || !objects.is_empty();
         let presentation = styled
             .then(|| DocumentTextPresentation {
                 text_style,
                 indent,
                 highlights,
                 font_family_overrides,
+                objects,
             })
             .filter(|presentation| *presentation != DocumentTextPresentation::default())
             .map(std::sync::Arc::new);
@@ -2466,7 +2500,7 @@ pub struct DocumentState<I> {
 struct TextLayoutRecord {
     item_ix: usize,
     display: Range<usize>,
-    layout: gpui::TextLayout,
+    layout: inline_objects::LineLayout,
     bounds: Bounds<Pixels>,
 }
 
@@ -2652,6 +2686,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         snapshot: DocumentSnapshot<I>,
         cx: &mut Context<Self>,
     ) -> Result<(), PresentationError> {
+        self.validate_inline_layout(&snapshot.blocks)?;
         if self.block_renderer.is_none() {
             if !snapshot.blocks.is_empty() {
                 return Err(PresentationError::Blocks(BlockError::MissingRenderer));
@@ -2709,6 +2744,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         blocks: Vec<DocumentBlock<I>>,
         cx: &mut Context<Self>,
     ) -> Result<(), PresentationError> {
+        self.validate_inline_layout(&blocks)?;
         if !blocks.is_empty() && self.block_renderer.is_none() {
             return Err(PresentationError::Blocks(BlockError::MissingRenderer));
         }
@@ -2726,6 +2762,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         styles: DocumentStyles,
         cx: &mut Context<Self>,
     ) -> Result<(), PresentationError> {
+        self.validate_inline_layout(&blocks)?;
         if !blocks.is_empty() && self.block_renderer.is_none() {
             return Err(PresentationError::Blocks(BlockError::MissingRenderer));
         }
@@ -2745,6 +2782,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         styles: DocumentStyles,
         cx: &mut Context<Self>,
     ) -> Result<(), PresentationError> {
+        self.validate_inline_layout(&blocks)?;
         if self.block_renderer.is_none() {
             if !blocks.is_empty() {
                 return Err(PresentationError::Blocks(BlockError::MissingRenderer));
@@ -3338,7 +3376,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         offset: usize,
         affinity: Affinity,
     ) -> Result<DocumentPosition<I>, PositionError> {
-        self.model.position_for_offset(offset, affinity)
+        self.inline_boundary_position(offset, affinity)
+            .map_or_else(|| self.model.position_for_offset(offset, affinity), Ok)
     }
 
     pub fn resolve_position(&self, position: &DocumentPosition<I>) -> Result<usize, PositionError> {
@@ -3368,7 +3407,23 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.auto_scroll.stop();
         let start = self.model.text.clip_offset(range.start, Bias::Left);
         let end = self.model.text.clip_offset(range.end, Bias::Right);
-        if reversed {
+        let start_position = self.inline_boundary_position(start, Affinity::After);
+        let end_position = self.inline_boundary_position(end, Affinity::Before);
+        if (start_position.is_some() || end_position.is_some())
+            && let (Ok(start), Ok(end)) = (
+                start_position.map_or_else(
+                    || self.model.position_for_offset(start, Affinity::After),
+                    Ok,
+                ),
+                end_position
+                    .map_or_else(|| self.model.position_for_offset(end, Affinity::Before), Ok),
+            )
+        {
+            let (anchor, head) = if reversed { (end, start) } else { (start, end) };
+            self.model
+                .replace_selection_positions(anchor, head)
+                .expect("inline boundary positions resolve");
+        } else if reversed {
             self.model.replace_selection(end, start);
         } else {
             self.model.replace_selection(start, end);
@@ -3497,6 +3552,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         if self.model.marked.is_some() {
             return Err(StructureError::MarkedText);
         }
+        self.validate_inline_layout(&snapshot.blocks)
+            .map_err(StructureError::Presentation)?;
         let before =
             DocumentStructure::suffix(&self.model, start).ok_or(StructureError::InvalidBoundary)?;
         if expected_current.is_some_and(|expected| expected != &before) {
@@ -3595,6 +3652,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         if let Err(reason) = self.model.validate_transaction(&transaction) {
             cx.emit(DocumentEvent::Rejected(reason));
             return EditDecision::Reject;
+        }
+        if let Some(request) = self.inline_replacement(&transaction) {
+            cx.emit(DocumentEvent::ReplaceRequested(request));
+            return EditDecision::StructureRequested;
         }
         let target = self
             .model
@@ -3921,6 +3982,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             let source = block.source();
             (source.start, source.end)
         });
+        self.validate_inline_layout(&next_blocks)
+            .map_err(HostTransactionError::InvalidFragment)?;
         validate_blocks(
             &next_blocks,
             &next_regions,
@@ -4208,12 +4271,26 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     }
 
     fn previous_boundary(&self, offset: usize) -> usize {
+        if let Some(block) = self.model.blocks.iter().find(|block| {
+            block.inline_size().is_some()
+                && block.source().start < offset
+                && offset <= block.source().end
+        }) {
+            return block.source().start;
+        }
         self.model
             .text
             .clip_offset(offset.saturating_sub(1), Bias::Left)
     }
 
     fn next_boundary(&self, offset: usize) -> usize {
+        if let Some(block) = self.model.blocks.iter().find(|block| {
+            block.inline_size().is_some()
+                && block.source().start <= offset
+                && offset < block.source().end
+        }) {
+            return block.source().end;
+        }
         self.model
             .text
             .clip_offset(offset.saturating_add(1), Bias::Right)
@@ -4772,14 +4849,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .display_text()
                 .get(record.display.clone())
                 .unwrap_or_default();
-            record.layout.line_layout_for_index(0).map_or(0, |line| {
-                closest_caret_index(
-                    &line,
-                    point - record.bounds.origin,
-                    record.layout.line_height(),
-                    text,
-                )
-            })
+            record.layout.closest_index(point, text)
         };
         let affinity = if local == record.display.len() && local > 0 {
             Affinity::Before
@@ -5424,10 +5494,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         &mut self,
         item_ix: usize,
         display: Range<usize>,
-        layout: gpui::TextLayout,
+        layout: impl Into<inline_objects::LineLayout>,
         bounds: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        let layout = layout.into();
         if let Some(record) = self
             .text_layouts
             .iter_mut()
@@ -5698,9 +5769,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     // A display row is one line; its wrap was decided with the geometry.
                     presentation.text_style.get_or_insert_default().white_space =
                         Some(gpui::WhiteSpace::Nowrap);
-                    hidden = frame
-                        .0
-                        .is_some_and(|frame| frame.row_height(display, line) == px(0.));
+                    hidden = frame.0.is_some_and(|frame| {
+                        frame.row_height(display, line, Some(&presentation)) == px(0.)
+                    });
                     #[cfg(debug_assertions)]
                     {
                         text_top = frame.0.map(|frame| frame.text_top(display, line));
@@ -5715,12 +5786,58 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     range.end = range.end.min(display.len());
                     range.start < range.end
                 });
-                DocumentChild::Text {
-                    item_ix,
-                    display: display.clone(),
-                    // Rows hold no text; only the rows in view slice it.
-                    text: self.model.display_text()[display.clone()].to_owned().into(),
-                    presentation: Box::new(presentation),
+                presentation
+                    .objects
+                    .retain(|(range, _)| range.end <= display.len());
+                if !presentation.objects.is_empty() {
+                    let frame = frame.0.expect("inline rows have resolved geometry");
+                    let elements = presentation
+                        .objects
+                        .iter()
+                        .map(|(range, _)| {
+                            let offset = display.start + range.start;
+                            let source = self
+                                .model
+                                .display_to_source(offset, Affinity::After)
+                                .unwrap();
+                            let block = self
+                                .model
+                                .blocks
+                                .iter()
+                                .find(|block| {
+                                    block.source().start == source && block.inline_size().is_some()
+                                })
+                                .expect("inline projection has a block");
+                            (
+                                range.clone(),
+                                self.block_renderer.as_ref().expect("inline renderer")(
+                                    block.id(),
+                                    window,
+                                    cx,
+                                ),
+                            )
+                        })
+                        .collect();
+                    DocumentChild::Inline {
+                        element: super::element::inline::InlineRow::new(
+                            cx.entity(),
+                            item_ix,
+                            display.clone(),
+                            self.model.display_text()[display.clone()].into(),
+                            presentation,
+                            frame,
+                            elements,
+                        )
+                        .into_any_element(),
+                    }
+                } else {
+                    DocumentChild::Text {
+                        item_ix,
+                        display: display.clone(),
+                        // Rows hold no text; only the rows in view slice it.
+                        text: self.model.display_text()[display.clone()].to_owned().into(),
+                        presentation: Box::new(presentation),
+                    }
                 }
             }
             DocumentLayoutItem::Block { id, source, .. } => {
@@ -8932,17 +9049,21 @@ mod tests {
 
             // Wrapped rows start under the text, and the indent itself maps to
             // the start of the row.
-            let line = first.layout.line_layout_for_index(0).unwrap();
+            let line = first.layout.text().line_layout_for_index(0).unwrap();
             let boundary = line.wrap_boundaries[0];
             let wrap = line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index;
             let row = first.bounds.top() + first.layout.line_height() * 1.5;
             assert_eq!(
-                first.layout.index_for_position(point(text_x + px(1.), row)),
+                first
+                    .layout
+                    .text()
+                    .index_for_position(point(text_x + px(1.), row)),
                 Ok(wrap)
             );
             assert_eq!(
                 first
                     .layout
+                    .text()
                     .index_for_position(point(first.bounds.left() + px(1.), row)),
                 Err(wrap)
             );
@@ -9039,7 +9160,7 @@ mod tests {
                 let body = &document.text_layouts[1];
                 let origin = title.layout.position_for_index(1).unwrap();
                 let start = point(origin.x, origin.y + title.layout.line_height() / 2.);
-                let line = body.layout.line_layout_for_index(0).unwrap();
+                let line = body.layout.text().line_layout_for_index(0).unwrap();
                 let boundary = line.wrap_boundaries[0];
                 let wrap = line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index;
                 let wrap_y = body.bounds.top() + body.layout.line_height();

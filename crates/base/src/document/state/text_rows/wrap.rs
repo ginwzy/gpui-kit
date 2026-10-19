@@ -141,6 +141,7 @@ pub(super) struct Wrap {
     complete: bool,
     pub processed: usize,
     pub reused: usize,
+    objects: Vec<(Range<usize>, Pixels)>,
 }
 
 impl Wrap {
@@ -166,6 +167,7 @@ impl Wrap {
             complete: false,
             processed: 0,
             reused: 0,
+            objects: Vec::new(),
         };
         if let Some(old) = previous.filter(|old| old.widths == widths) {
             let text = &old.text[old.range.clone()];
@@ -218,6 +220,11 @@ impl Wrap {
         this
     }
 
+    pub fn with_objects(mut self, objects: Vec<(Range<usize>, Pixels)>) -> Self {
+        self.objects = objects;
+        self
+    }
+
     /// Consume a bounded number of input bytes. A cluster is indivisible;
     /// callers route non-ASCII input to a cancellable background task.
     pub fn step(
@@ -238,20 +245,34 @@ impl Wrap {
         };
         let stop = self.point.next.saturating_add(budget);
         let from = self.point.next;
-        for (relative, cluster) in line[from..].grapheme_indices(true) {
+        let amount_at =
+            |ix: usize, cluster: &str, x: Pixels, wrappers: &mut [LineWrapperHandle]| {
+                let at = self.objects.partition_point(|(range, _)| range.end <= ix);
+                self.objects
+                    .get(at)
+                    .filter(|(range, _)| range.start == ix)
+                    .map_or_else(
+                        || advance(&mut wrappers[font_at(ix)], cluster, x),
+                        |(_, width)| *width,
+                    )
+            };
+        for (ix, cluster) in Clusters::new(line, &self.objects, from..line.len()) {
             if cancelled.load(Ordering::Relaxed) {
                 return false;
             }
-            let ix = from + relative;
             if ix >= stop {
                 return false;
             }
             let first = cluster.chars().next().unwrap_or_default();
-            if self.point.indented && LineWrapper::can_break_before(self.point.previous, first) {
+            if self.point.indented
+                && ((!self.objects.is_empty()
+                    && (first == '\u{fffc}' || self.point.previous == '\u{fffc}'))
+                    || LineWrapper::can_break_before(self.point.previous, first))
+            {
                 self.candidate = Some(ix);
             }
             self.point.indented |= first != ' ';
-            let mut amount = advance(&mut wrappers[font_at(ix)], cluster, self.point.x);
+            let mut amount = amount_at(ix, cluster, self.point.x, wrappers);
             let width = if self.prefix.is_empty() && self.points.is_empty() {
                 self.widths.0
             } else {
@@ -268,13 +289,11 @@ impl Wrap {
                     .unwrap_or(ix);
                 self.point.row = start;
                 self.candidate = None;
-                self.point.x =
-                    line[start..ix]
-                        .grapheme_indices(true)
-                        .fold(px(0.), |x, (offset, cluster)| {
-                            x + advance(&mut wrappers[font_at(start + offset)], cluster, x)
-                        });
-                amount = advance(&mut wrappers[font_at(ix)], cluster, self.point.x);
+                self.point.x = Clusters::new(line, &self.objects, start..ix)
+                    .fold(px(0.), |x, (offset, cluster)| {
+                        x + amount_at(offset, cluster, x, wrappers)
+                    });
+                amount = amount_at(ix, cluster, self.point.x, wrappers);
             }
             self.point.x += amount;
             self.point.previous = cluster.chars().last().unwrap_or(first);
@@ -318,5 +337,55 @@ impl Wrap {
             self.prefix.append_points(points);
         }
         self.prefix
+    }
+}
+
+/// Object boundaries also separate grapheme segmentation. A combining mark
+/// following an object belongs to the next text run, never to the object.
+struct Clusters<'a> {
+    text: &'a str,
+    objects: &'a [(Range<usize>, Pixels)],
+    end: usize,
+    offset: usize,
+    text_end: usize,
+    current: unicode_segmentation::GraphemeIndices<'a>,
+}
+
+impl<'a> Clusters<'a> {
+    fn new(text: &'a str, objects: &'a [(Range<usize>, Pixels)], range: Range<usize>) -> Self {
+        let objects = &objects[objects.partition_point(|(object, _)| object.end <= range.start)..];
+        let end = objects
+            .first()
+            .map_or(range.end, |(object, _)| object.start.min(range.end));
+        Self {
+            text,
+            objects,
+            end: range.end,
+            offset: range.start,
+            text_end: end,
+            current: text[range.start..end].grapheme_indices(true),
+        }
+    }
+}
+
+impl<'a> Iterator for Clusters<'a> {
+    type Item = (usize, &'a str);
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some((ix, cluster)) = self.current.next() {
+            return Some((self.offset + ix, cluster));
+        }
+        let (object, _) = self.objects.first()?;
+        if object.start >= self.end {
+            return None;
+        }
+        let result = (object.start, &self.text[object.clone()]);
+        self.offset = object.end;
+        self.objects = &self.objects[1..];
+        self.text_end = self
+            .objects
+            .first()
+            .map_or(self.end, |(object, _)| object.start.min(self.end));
+        self.current = self.text[self.offset..self.text_end].grapheme_indices(true);
+        Some(result)
     }
 }

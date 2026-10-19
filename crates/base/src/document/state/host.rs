@@ -27,6 +27,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         if revision != self.model.revision {
             return Err(HostTransactionError::StaleRevision);
         }
+        self.validate_inline_layout(&snapshot.blocks)
+            .map_err(HostTransactionError::InvalidFragment)?;
         let boundary = |id: Option<&I>| match id {
             Some(id) => self
                 .model
@@ -201,15 +203,13 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .blocks
             .partition_point(|block| block.source().start < source.end);
         for block in &mut self.model.blocks[block_end..] {
-            *block = DocumentBlock::new(block.id().clone(), shifted(block.source(), source_delta));
+            block.shift(source_delta);
         }
         self.model.blocks.splice(
             block_start..block_end,
-            candidate.blocks.into_iter().map(|block| {
-                DocumentBlock::new(
-                    block.id().clone(),
-                    shifted(block.source(), source.start as isize),
-                )
+            candidate.blocks.into_iter().map(|mut block| {
+                block.shift(source.start as isize);
+                block
             }),
         );
         self.model.anchored_blocks = retained_anchors;

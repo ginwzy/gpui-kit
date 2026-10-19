@@ -192,6 +192,8 @@ pub(in crate::document) struct RowFrame {
     max_width: Option<Pixels>,
     hidden: bool,
     line_height: Pixels,
+    rem_size: Pixels,
+    baseline: Pixels,
     /// The width of the paragraph's hanging marker, which wrapped rows align past.
     indent: Pixels,
     /// The line starts at the marker, so only its later rows are indented.
@@ -213,11 +215,12 @@ impl RowFrame {
         &self,
         row: &Range<usize>,
         line: &Range<usize>,
+        presentation: Option<&super::DocumentTextPresentation>,
     ) -> Pixels {
         if self.hidden {
             return px(0.);
         }
-        let mut height = self.line_height;
+        let mut height = self.inline_metrics(presentation).0;
         if row.start == line.start {
             height += self.space_before;
         }
@@ -225,6 +228,43 @@ impl RowFrame {
             height += self.space_after;
         }
         height
+    }
+
+    /// Height and baseline of this row, followed by its text's top inset.
+    pub(in crate::document) fn inline_metrics(
+        &self,
+        presentation: Option<&super::DocumentTextPresentation>,
+    ) -> (Pixels, Pixels, Pixels) {
+        if presentation.is_none_or(|presentation| presentation.objects.is_empty()) {
+            return (self.line_height, self.baseline, px(0.));
+        }
+        let mut above = self.baseline;
+        let mut below = self.line_height - self.baseline;
+        for (_, object) in presentation.into_iter().flat_map(|p| &p.objects) {
+            let (size, baseline) = object.resolve(self.rem_size);
+            above = above.max(baseline);
+            below = below.max(size.height - baseline);
+        }
+        (above + below, above, above - self.baseline)
+    }
+
+    pub(in crate::document) fn rem_size(&self) -> Pixels {
+        self.rem_size
+    }
+
+    pub(in crate::document) fn inline_indent(
+        &self,
+        presentation: &super::DocumentTextPresentation,
+    ) -> Pixels {
+        if presentation
+            .indent
+            .as_ref()
+            .is_some_and(|indent| !indent.hanging)
+        {
+            self.indent
+        } else {
+            px(0.)
+        }
     }
 
     /// The widths the line's first and later rows wrap to in a document `width` wide.
@@ -386,6 +426,18 @@ pub(in crate::document) fn line_key<I>(item: &DocumentLayoutItem<I>) -> u64 {
             font.hash(&mut hasher);
             styled = true;
         }
+    }
+    for (range, size) in &presentation.objects {
+        3u8.hash(&mut hasher);
+        range.hash(&mut hasher);
+        for length in [size.width(), size.height(), size.baseline()] {
+            match length {
+                AbsoluteLength::Pixels(value) => (0u8, f32::from(value).to_bits()),
+                AbsoluteLength::Rems(value) => (1u8, value.0.to_bits()),
+            }
+            .hash(&mut hasher);
+        }
+        styled = true;
     }
     // A paint-only presentation (including a default/colored paragraph) has
     // exactly the same font inputs as no presentation at all.
@@ -634,6 +686,7 @@ struct LineSpec {
     previous: Option<Previous>,
     fonts_key: u64,
     priority: bool,
+    objects: Vec<(Range<usize>, Pixels)>,
 }
 
 /// The fonts lines wrap in. The base style's font is the first.
@@ -754,7 +807,8 @@ impl LineSpec {
             &self.runs,
             self.widths,
             self.previous.clone(),
-        );
+        )
+        .with_objects(self.objects.clone());
         let cancel = AtomicBool::new(false);
         while !work.step(
             &text[self.range.clone()],
@@ -883,6 +937,15 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// copy are unchanged; each row reaches the text renderer with its own
     /// source range, and the renderer must draw it within its frame.
     pub fn set_text_rows(&mut self, rows: Option<TextRows>, cx: &mut Context<Self>) {
+        assert!(
+            rows.is_some()
+                || self
+                    .model
+                    .blocks
+                    .iter()
+                    .all(|block| block.inline_size().is_none()),
+            "remove inline objects before disabling text rows"
+        );
         match (rows, &mut self.text_rows) {
             (Some(rows), Some(state)) => {
                 if state.rows == rows {
@@ -1411,7 +1474,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 frame.0 = Some(resolved);
             }
             let mut heights = gpui::PreparedListItems::new();
-            heights.extend([Some(resolved.row_height(&display_line, &display_line))]);
+            heights.extend([Some(resolved.row_height(
+                &display_line,
+                &display_line,
+                item.presentation(),
+            ))]);
             let old = self
                 .layout_items
                 .splice_prepared(rows.clone(), vec![item].into());
@@ -1460,6 +1527,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     line,
                     frame,
                     wrapped,
+                    presentation,
                     ..
                 } = item
                 {
@@ -1467,7 +1535,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     if segment.wrap.is_some() {
                         wrapped.0 = segment.wrap;
                     }
-                    heights.push(Some(segment.frame.row_height(display, line)));
+                    heights.push(Some(segment.frame.row_height(
+                        display,
+                        line,
+                        presentation.as_deref(),
+                    )));
                 }
                 *left -= 1;
                 if *left == 0 {
@@ -1569,7 +1641,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 })
                 .map(|widths| WrapKey { generation, widths });
             whole &= wrapped.0.is_some();
-            heights.push(Some(frame.row_height(display, line)));
+            heights.push(Some(frame.row_height(display, line, None)));
         });
         let framed = heights.len();
         if framed > 0 {
@@ -1669,6 +1741,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 source: first_source,
                 node_id,
                 presentation,
+                line,
                 ..
             },
             DocumentLayoutItem::Text {
@@ -1733,6 +1806,19 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     .width;
                 (width, indent.hanging)
             });
+        let line_height = window.pixel_snap(line_height.to_pixels(font_size.into(), rem_size));
+        let baseline = if self.model.inline_objects_in(line.clone()).is_empty() {
+            line_height
+        } else {
+            let mut style = base_style.clone();
+            if let Some(refinement) = refinement {
+                style.refine(refinement);
+            }
+            let font = window.text_system().resolve_font(&style.font());
+            window
+                .text_system()
+                .baseline_offset(font, font_size, line_height)
+        };
         RowFrame {
             space_before: frame.space_before.to_pixels(rem_size),
             space_after: frame.space_after.to_pixels(rem_size),
@@ -1741,7 +1827,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             max_width: frame.max_width.map(|width| width.to_pixels(rem_size)),
             hidden: frame.hidden,
             // The line height a text element lays out with, snapped to device pixels.
-            line_height: window.pixel_snap(line_height.to_pixels(font_size.into(), rem_size)),
+            line_height,
+            rem_size,
+            baseline,
             indent,
             hanging,
         }
@@ -1754,10 +1842,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 display,
                 line,
                 frame,
+                presentation,
                 ..
-            } => frame
-                .0
-                .map_or(px(0.), |frame| frame.row_height(display, line)),
+            } => frame.0.map_or(px(0.), |frame| {
+                frame.row_height(display, line, presentation.as_deref())
+            }),
             DocumentLayoutItem::Block { height, .. }
             | DocumentLayoutItem::AnchoredBlock { height, .. } => {
                 height.0.height().unwrap_or_default()
@@ -2051,7 +2140,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                         &spec.runs,
                         spec.widths,
                         spec.previous.clone(),
-                    );
+                    )
+                    .with_objects(spec.objects.clone());
                     loop {
                         if cancel.load(Ordering::Relaxed) {
                             return;
@@ -2233,6 +2323,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     node_id,
                     frame,
                     wrapped,
+                    presentation,
                     ..
                 } = item
                 else {
@@ -2244,7 +2335,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     if let Some(retained) = frames.get(&(node_id.clone(), line.clone())) {
                         frame.0 = Some(*retained);
                     }
-                    heights.push((here, frame.0.map(|frame| frame.row_height(display, line))));
+                    heights.push((
+                        here,
+                        frame
+                            .0
+                            .map(|frame| frame.row_height(display, line, presentation.as_deref())),
+                    ));
                 }
             });
             let mut heights = heights.into_iter().peekable();
@@ -2298,9 +2394,23 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             unreachable!("line rows are text items");
         };
         let spec = |runs: Vec<(usize, usize)>, fonts: &FontTable| {
+            let objects: Vec<_> = self
+                .model
+                .inline_objects_in(display.clone())
+                .into_iter()
+                .map(|(range, size)| (range, size.width().to_pixels(fonts.rem_size)))
+                .collect();
             let mut hash = DefaultHasher::new();
             for font in std::iter::once(0).chain(runs.iter().map(|(_, font)| *font)) {
                 fonts.hashes[font].hash(&mut hash);
+            }
+            // A previous plain wrap must never reuse advances from objects,
+            // even when a presentation change keeps the same source text.
+            if !objects.is_empty() {
+                for (range, width) in &objects {
+                    range.hash(&mut hash);
+                    f32::from(*width).to_bits().hash(&mut hash);
+                }
             }
             let fonts_key = hash.finish();
             LineSpec {
@@ -2309,31 +2419,38 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 range: display.clone(),
                 runs,
                 widths: line.widths,
-                previous: self.text_rows.as_ref().and_then(|state| {
-                    let key = state.cache.previous.get(&display.start)?;
-                    let cached = state.cache.lines.get(key)?;
-                    // A wrap resumes only for the same widths and fonts;
-                    // check before copying its input.
-                    (cached.generation == state.generation)
-                        .then_some(cached.input.as_ref())
-                        .flatten()
-                        .filter(|input| input.fonts_key == fonts_key && input.widths == line.widths)
-                        .cloned()
-                        .map(|mut input| {
-                            input.change = state
-                                .edit
-                                .as_ref()
-                                .filter(|edit| {
-                                    edit.key == *key
-                                        && edit.line_start == display.start
-                                        && edit.current_len == display.len()
-                                })
-                                .map(|edit| (edit.prefix, edit.suffix));
-                            input
-                        })
-                }),
+                previous: self
+                    .text_rows
+                    .as_ref()
+                    .filter(|_| objects.is_empty())
+                    .and_then(|state| {
+                        let key = state.cache.previous.get(&display.start)?;
+                        let cached = state.cache.lines.get(key)?;
+                        // A wrap resumes only for the same widths and fonts;
+                        // check before copying its input.
+                        (cached.generation == state.generation)
+                            .then_some(cached.input.as_ref())
+                            .flatten()
+                            .filter(|input| {
+                                input.fonts_key == fonts_key && input.widths == line.widths
+                            })
+                            .cloned()
+                            .map(|mut input| {
+                                input.change = state
+                                    .edit
+                                    .as_ref()
+                                    .filter(|edit| {
+                                        edit.key == *key
+                                            && edit.line_start == display.start
+                                            && edit.current_len == display.len()
+                                    })
+                                    .map(|edit| (edit.prefix, edit.suffix));
+                                input
+                            })
+                    }),
                 fonts_key,
                 priority: line.in_view,
+                objects,
             }
         };
         // Unstyled lines wrap in the base font.
@@ -2569,7 +2686,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     row_frame.0 = frame;
                     wrapped.0 = Some(wrap);
                 }
-                heights.push(frame.map(|frame| frame.row_height(&range, &line)));
+                heights
+                    .push(frame.map(|frame| frame.row_height(&range, &line, item.presentation())));
                 items.push(item);
             }
             budget -= count;
@@ -2624,12 +2742,17 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 display,
                 line,
                 frame: Derived(Some(frame)),
+                presentation,
                 ..
             } = item
             else {
                 return None;
             };
-            heights.push(Some(frame.row_height(display, line)));
+            heights.push(Some(frame.row_height(
+                display,
+                line,
+                presentation.as_deref(),
+            )));
             items.push(item.clone());
         }
         Some((rows, items, heights))
@@ -2882,6 +3005,7 @@ mod tests {
                     previous: None,
                     fonts_key: if ix == 4 { 1 } else { 0 },
                     priority: false,
+                    objects: Vec::new(),
                 })
                 .collect();
             let mut wrappers = FontTable::new(window).wrappers(cx);
@@ -3590,10 +3714,11 @@ mod tests {
                         line,
                         frame,
                         ..
-                    } => frame
-                        .0
-                        .expect("every row is framed")
-                        .row_height(display, line),
+                    } => frame.0.expect("every row is framed").row_height(
+                        display,
+                        line,
+                        item.presentation(),
+                    ),
                     DocumentLayoutItem::Block { id, height, .. } => match height.0 {
                         BlockGeometry::Declared(height) => height,
                         BlockGeometry::Measured => {

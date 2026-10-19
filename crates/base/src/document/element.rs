@@ -13,7 +13,12 @@ use super::{
 };
 use crate::editing::blink_cursor::caret_bounds;
 
+pub(super) mod inline;
+
 pub(super) enum DocumentChild<I: 'static> {
+    Inline {
+        element: AnyElement,
+    },
     Text {
         item_ix: usize,
         display: Range<usize>,
@@ -47,6 +52,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentElement<I> {
         child: DocumentChild<I>,
     ) -> AnyElement {
         match child {
+            DocumentChild::Inline { element } => element,
             DocumentChild::Text {
                 item_ix,
                 display,
