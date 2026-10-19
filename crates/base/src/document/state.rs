@@ -2430,6 +2430,8 @@ pub struct DocumentState<I> {
     list_state: ListState,
     focus_handle: FocusHandle,
     blink_cursor: gpui::Entity<BlinkCursor>,
+    // Independent of editability so returning from a selection can restart blinking.
+    cursor_active: bool,
     _cursor_subscriptions: [gpui::Subscription; 2],
     cursor_focus_subscriptions: Option<[gpui::Subscription; 3]>,
     text_layouts: Vec<TextLayoutRecord>,
@@ -2574,6 +2576,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             list_state,
             focus_handle,
             blink_cursor,
+            cursor_active: false,
             _cursor_subscriptions: cursor_subscriptions,
             cursor_focus_subscriptions: None,
             text_layouts: Vec::new(),
@@ -5581,6 +5584,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     }
 
     fn pause_blink_cursor(&mut self, cx: &mut Context<Self>) {
+        if !self.cursor_active {
+            return;
+        }
         self.blink_cursor.update(cx, |cursor, cx| {
             if self.caret_is_editable() {
                 cursor.pause(cx);
@@ -5591,11 +5597,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     }
 
     fn update_cursor_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cursor_active = self.focus_handle.is_focused(window) && window.is_window_active();
         self.blink_cursor.update(cx, |cursor, cx| {
-            if self.focus_handle.is_focused(window)
-                && window.is_window_active()
-                && self.caret_is_editable()
-            {
+            if self.cursor_active && self.caret_is_editable() {
                 cursor.start(cx);
             } else {
                 cursor.stop(cx);
@@ -5612,6 +5616,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.cursor_focus_subscriptions = Some([
             cx.on_focus(&focus, window, Self::update_cursor_focus),
             cx.on_blur(&focus, window, |this, _, cx| {
+                this.cursor_active = false;
                 this.blink_cursor.update(cx, |cursor, cx| cursor.stop(cx));
             }),
             cx.observe_window_activation(window, Self::update_cursor_focus),
@@ -6165,6 +6170,10 @@ mod tests {
             assert!(!state.show_cursor(window, cx));
             assert!(!state.blink_cursor.read(cx).visible());
             assert_eq!(state.text(), "historydraft");
+            document.update(cx, |state, cx| {
+                state.set_selection(12..12, false, cx);
+                assert!(!state.blink_cursor.read(cx).visible());
+            });
         });
     }
 

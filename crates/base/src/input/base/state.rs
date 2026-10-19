@@ -386,6 +386,8 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) scroll_beyond_last_line: Option<usize>,
     pub(super) cursor_surrounding_lines: Option<usize>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
+    // Focus/activation projection; text updates cannot make an input active.
+    cursor_active: bool,
     pub(super) loading: bool,
     /// The cursors and selections.
     ///
@@ -686,7 +688,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 let focus_handle = focus_handle.clone();
                 let blink_cursor = blink_cursor.downgrade();
                 move |_, window, cx| {
-                    if focus_handle.is_focused(window) {
+                    if focus_handle.is_focused(window) && window.is_window_active() {
                         _ = blink_cursor.update(cx, |cursor, cx| cursor.pause(cx));
                     }
                 }
@@ -694,16 +696,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             // Observe the blink cursor to repaint the view when it changes.
             cx.observe(&blink_cursor, |_, _, cx| cx.notify()),
             // Blink the cursor when the window is active, pause when it's not.
-            cx.observe_window_activation(window, |input, window, cx| {
-                if window.is_window_active() {
-                    let focus_handle = input.focus_handle.clone();
-                    if focus_handle.is_focused(window) {
-                        input.blink_cursor.update(cx, |blink_cursor, cx| {
-                            blink_cursor.start(cx);
-                        });
-                    }
-                }
-            }),
+            cx.observe_window_activation(window, Self::update_cursor_focus),
             cx.on_focus(&focus_handle, window, Self::on_focus),
             cx.on_blur(&focus_handle, window, Self::on_blur),
         ];
@@ -724,6 +717,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             scroll_beyond_last_line: None,
             cursor_surrounding_lines: None,
             blink_cursor,
+            cursor_active: false,
             undo_manager,
             selections: Selections::default(),
             selected_word_range: None,
@@ -1288,7 +1282,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window, cx);
         self.blink_cursor.update(cx, |cursor, cx| {
-            cursor.start(cx);
+            if window.is_window_active() && !self.disabled {
+                cursor.start(cx);
+            }
         });
     }
 
@@ -3201,14 +3197,25 @@ impl<M: InputModeKind> InputBaseState<M> {
             && window.is_window_active()
     }
 
-    fn on_focus(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+    fn update_cursor_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cursor_active = self.focus_handle.is_focused(window) && window.is_window_active();
         self.blink_cursor.update(cx, |cursor, cx| {
-            cursor.start(cx);
+            if self.cursor_active && !self.disabled {
+                cursor.start(cx);
+            } else {
+                cursor.stop(cx);
+            }
         });
+    }
+
+    fn on_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_cursor_focus(window, cx);
         cx.emit(InputEvent::Focus);
     }
 
     fn on_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cursor_active = false;
+        self.blink_cursor.update(cx, BlinkCursor::stop);
         if M::is_context_menu_open(self, cx) {
             return;
         }
@@ -3222,9 +3229,6 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.diagnostic_popover = None;
         M::clear_inline_completion(self, cx);
         self.dismiss_touch_selection(cx);
-        self.blink_cursor.update(cx, |cursor, cx| {
-            cursor.stop(cx);
-        });
         self.clamp_number_value(window, cx);
         cx.emit(InputEvent::Blur);
         cx.notify();
@@ -3267,6 +3271,12 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(super) fn pause_blink_cursor(&mut self, cx: &mut Context<Self>) {
+        if !self.cursor_active || self.disabled {
+            // Preserve the edit's one-shot invalidation for layout consumers,
+            // without starting a timer on a retained, unfocused input.
+            self.blink_cursor.update(cx, BlinkCursor::stop);
+            return;
+        }
         self.blink_cursor.update(cx, |cursor, cx| {
             cursor.pause(cx);
         });
@@ -7046,15 +7056,53 @@ mod tests {
     }
 
     #[gpui::test]
+    fn retained_input_updates_do_not_restart_blink_after_blur(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| state.focus(window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.blur(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("restored while hidden", window, cx);
+                assert!(!state.blink_cursor.read(cx).visible());
+            });
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(2));
+        cx.run_until_parked();
+        view.input.read_with(&cx, |state, cx| {
+            assert!(!state.blink_cursor.read(cx).visible());
+        });
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| state.focus(window, cx));
+        });
+        cx.run_until_parked();
+        view.input.read_with(&cx, |state, cx| {
+            assert!(state.blink_cursor.read(cx).visible());
+        });
+    }
+
+    #[gpui::test]
     fn test_consumed_keystrokes_keep_cursor_visible(cx: &mut TestAppContext) {
         let view = InputView::<EditorMode>::new(cx);
         let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
         setup_cursors(&mut cx, &view.input, "a|b");
         cx.update(|window, cx| {
-            view.input.update(cx, |state, cx| {
-                state.focus(window, cx);
-                state.pause_blink_cursor(cx);
-            });
+            view.input.update(cx, |state, cx| state.focus(window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.input
+                .update(cx, |state, cx| state.pause_blink_cursor(cx));
         });
         cx.run_until_parked();
         cx.executor()
@@ -7083,6 +7131,11 @@ mod tests {
     fn test_multi_cursor_actions_reveal_hidden_carets(cx: &mut TestAppContext) {
         let view = InputView::<EditorMode>::new(cx);
         let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            window.activate_window();
+            view.input.update(cx, |state, cx| state.focus(window, cx));
+        });
+        cx.run_until_parked();
         setup_cursors(&mut cx, &view.input, "ab\na|b\nab");
         cx.update(|window, cx| {
             view.input.update(cx, |state, cx| {
