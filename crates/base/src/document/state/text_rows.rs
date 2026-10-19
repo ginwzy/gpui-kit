@@ -714,6 +714,40 @@ struct StaleLine {
 }
 
 impl LineSpec {
+    /// Repeated lines in one synchronous batch share their completed wrap.
+    /// The retained row cache is installed only after the whole batch returns.
+    fn wrap_batch(
+        specs: &[Self],
+        text: Arc<str>,
+        wrappers: &mut [LineWrapperHandle],
+    ) -> Vec<WrappedLine> {
+        let mut completed: HashMap<u64, usize> = HashMap::new();
+        let mut lines: Vec<WrappedLine> = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let prior = completed
+                .get(&spec.key)
+                .map(|ix| &lines[*ix])
+                .filter(|line| {
+                    line.widths == spec.widths && line.input.fonts_key == spec.fonts_key
+                });
+            let line = if let Some(prior) = prior {
+                WrappedLine {
+                    item: spec.item,
+                    range: spec.range.clone(),
+                    key: spec.key,
+                    widths: spec.widths,
+                    starts: prior.starts.clone(),
+                    input: prior.input.clone(),
+                }
+            } else {
+                spec.wrap(text.clone(), wrappers)
+            };
+            completed.insert(spec.key, lines.len());
+            lines.push(line);
+        }
+        lines
+    }
+
     fn wrap(&self, text: Arc<str>, wrappers: &mut [LineWrapperHandle]) -> WrappedLine {
         let mut work = Wrap::new(
             &text[self.range.clone()],
@@ -1955,10 +1989,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .collect();
             let mut wrappers = fonts.wrappers(cx);
             let text = self.model.projection_map.shared_display_text();
-            let lines = specs
-                .iter()
-                .map(|spec| spec.wrap(text.clone(), &mut wrappers))
-                .collect();
+            let lines = LineSpec::wrap_batch(&specs, text, &mut wrappers);
             let (now_settled, now_outdated) = self.take_wrapped(generation, lines);
             settled.extend(now_settled);
             outdated.extend(now_outdated);
@@ -2830,6 +2861,47 @@ mod tests {
         DocumentBlock, DocumentParagraphStyle, DocumentProjection, DocumentSnapshot,
         DocumentStyles, EditPolicy, ProjectionSpan,
     };
+
+    #[gpui::test]
+    fn batch_wrap_reuses_matching_lines_without_reusing_positions(cx: &mut TestAppContext) {
+        let (_, mut cx) = document_view(cx);
+        cx.update(|window, cx| {
+            let line = "words 中文🙂\tmore words repeated across rows";
+            let text: Arc<str> = format!("{line}\n").repeat(5).into();
+            let specs: Vec<_> = (0..5)
+                .map(|ix| LineSpec {
+                    item: ix,
+                    key: 7,
+                    range: ix * (line.len() + 1)..ix * (line.len() + 1) + line.len(),
+                    runs: Vec::new(),
+                    widths: if ix == 2 {
+                        (px(70.), px(90.))
+                    } else {
+                        (px(120.), px(120.))
+                    },
+                    previous: None,
+                    fonts_key: if ix == 4 { 1 } else { 0 },
+                    priority: false,
+                })
+                .collect();
+            let mut wrappers = FontTable::new(window).wrappers(cx);
+            let actual = LineSpec::wrap_batch(&specs, text.clone(), &mut wrappers);
+            for (spec, actual) in specs.iter().zip(&actual) {
+                let expected = spec.wrap(text.clone(), &mut wrappers);
+                assert_eq!(
+                    actual.starts.starts().collect::<Vec<_>>(),
+                    expected.starts.starts().collect::<Vec<_>>()
+                );
+                assert_eq!(actual.item, expected.item);
+                assert_eq!(actual.range, expected.range);
+                assert_eq!(actual.input.text, expected.input.text);
+                assert_eq!(actual.input.fonts_key, expected.input.fonts_key);
+            }
+            assert!(Arc::ptr_eq(&actual[0].input.text, &actual[1].input.text));
+            assert!(!Arc::ptr_eq(&actual[1].input.text, &actual[2].input.text));
+            assert!(!Arc::ptr_eq(&actual[3].input.text, &actual[4].input.text));
+        });
+    }
 
     #[gpui::test]
     fn visible_long_line_obeys_budget_and_rejects_superseded_results(cx: &mut TestAppContext) {
