@@ -430,6 +430,7 @@ pub(in crate::document) fn line_key<I>(item: &DocumentLayoutItem<I>) -> u64 {
     for (range, size) in &presentation.objects {
         3u8.hash(&mut hasher);
         range.hash(&mut hasher);
+        size.is_width_constrained().hash(&mut hasher);
         for length in [size.width(), size.height(), size.baseline()] {
             match length {
                 AbsoluteLength::Pixels(value) => (0u8, f32::from(value).to_bits()),
@@ -2374,6 +2375,16 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         state.ascii_advance
     }
 
+    pub(in crate::document) fn inline_width_limit(&self, frame: RowFrame) -> Pixels {
+        let (first, rest) = frame.widths(
+            self.text_rows
+                .as_ref()
+                .and_then(|state| state.width)
+                .unwrap_or_default(),
+        );
+        first.min(rest)
+    }
+
     fn line_spec(&self, line: &StaleLine, fonts: &mut FontTable) -> LineSpec {
         let (
             DocumentLayoutItem::Text {
@@ -2398,7 +2409,14 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .model
                 .inline_objects_in(display.clone())
                 .into_iter()
-                .map(|(range, size)| (range, size.width().to_pixels(fonts.rem_size)))
+                .map(|(range, size)| {
+                    (
+                        range,
+                        size.constrained_to(fonts.rem_size, line.widths.0.min(line.widths.1))
+                            .width()
+                            .to_pixels(fonts.rem_size),
+                    )
+                })
                 .collect();
             let mut hash = DefaultHasher::new();
             for font in std::iter::once(0).chain(runs.iter().map(|(_, font)| *font)) {

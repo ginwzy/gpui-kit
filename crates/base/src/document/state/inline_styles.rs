@@ -107,6 +107,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             &self.model.regions,
             &self.model.projection_map,
             &DocumentStyles::new(Vec::new(), styles.clone()),
+            &self.model.blocks,
         )?;
         let display = self
             .model

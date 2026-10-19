@@ -40,6 +40,16 @@ choices. Measured pixel sizes must be reinstalled when their typography
 changes; rem sizes follow the document's rem size. Remove inline objects
 before disabling `TextRows`.
 
+`InlineSize::constrain_width(true)` opts into capping the preferred width at
+the paragraph's available row width. Wrapping and painting resolve the same
+cap (including paragraph insets and indentation); the object stays atomic and
+the host renderer must fit or truncate within that box. Fixed-width objects
+retain the default behavior. Paragraph styles may span declared inline objects
+when they cover complete display lines; ordinary atomic block rows and inline
+character styles retain their existing exclusion rules. Hosts composing
+fragments into a shared line must expand paragraph styles and Host splice
+boundaries to complete lines before submission.
+
 `DocumentState` remains the sole owner of source, selection, anchors, undo,
 wrapping tasks and derived layout. `ListState` retains item heights and scroll
 geometry. Object advances join the existing resumable grapheme wrapping;

@@ -1013,7 +1013,7 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         )
         .map_err(PresentationError::AnchoredBlocks)?;
         let resolved_styles =
-            resolve_document_styles(&self.text, &self.regions, &projection_map, &styles)
+            resolve_document_styles(&self.text, &self.regions, &projection_map, &styles, &blocks)
                 .map_err(PresentationError::Styles)?;
         self.projection_map = projection_map;
         self.projection = projection;
@@ -1988,8 +1988,9 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             .map_err(|_| DocumentEditRejection::InvalidPresentation)?;
         let projection_map = ProjectionMap::new(text, &projection);
         let styles = self.styles.transformed(edits);
-        let resolved_styles = resolve_document_styles(text, &regions, &projection_map, &styles)
-            .map_err(|_| DocumentEditRejection::InvalidPresentation)?;
+        let resolved_styles =
+            resolve_document_styles(text, &regions, &projection_map, &styles, &blocks)
+                .map_err(|_| DocumentEditRejection::InvalidPresentation)?;
         let mut model = self.clone();
         for edit in edits {
             model
@@ -2207,12 +2208,14 @@ fn resolve_document_styles<I: Eq>(
     regions: &DocumentRegions<I>,
     projection: &ProjectionMap,
     styles: &DocumentStyles,
+    blocks: &[DocumentBlock<I>],
 ) -> Result<ResolvedDocumentStyles, DocumentStyleError> {
-    validate_style_ranges(
+    validate_style_ranges_with_objects(
         text,
         regions,
         styles.paragraphs().iter().map(|style| style.source()),
         false,
+        blocks,
     )?;
     validate_style_ranges(
         text,
@@ -2287,6 +2290,16 @@ fn validate_style_ranges<I: Eq>(
     ranges: impl IntoIterator<Item = Range<usize>>,
     allow_editable: bool,
 ) -> Result<(), DocumentStyleError> {
+    validate_style_ranges_with_objects(text, regions, ranges, allow_editable, &[])
+}
+
+fn validate_style_ranges_with_objects<I: Eq>(
+    text: &Rope,
+    regions: &DocumentRegions<I>,
+    ranges: impl IntoIterator<Item = Range<usize>>,
+    allow_editable: bool,
+    inline_blocks: &[DocumentBlock<I>],
+) -> Result<(), DocumentStyleError> {
     let mut ranges = ranges.into_iter().collect::<Vec<_>>();
     ranges.sort_by_key(|range| (range.start, range.end));
     let mut previous_end = 0;
@@ -2321,7 +2334,13 @@ fn validate_style_ranges<I: Eq>(
                         return Err(DocumentStyleError::EditableRange(range));
                     }
                     EditPolicy::Atomic => {
-                        return Err(DocumentStyleError::AtomicRange(range));
+                        let ix = inline_blocks
+                            .partition_point(|block| block.source().end <= region_range.start);
+                        if !inline_blocks.get(ix).is_some_and(|block| {
+                            block.id() == region.id() && block.inline_size().is_some()
+                        }) {
+                            return Err(DocumentStyleError::AtomicRange(range));
+                        }
                     }
                     EditPolicy::Editable | EditPolicy::Readonly | EditPolicy::Routed => {}
                 }
@@ -4015,6 +4034,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             &next_regions,
             &next_projection_map,
             &next_styles,
+            &next_blocks,
         )
         .map_err(HostTransactionError::InvalidStyles)?;
         let first_changed_item = transaction
@@ -5791,6 +5811,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     .retain(|(range, _)| range.end <= display.len());
                 if !presentation.objects.is_empty() {
                     let frame = frame.0.expect("inline rows have resolved geometry");
+                    let limit = self.inline_width_limit(frame);
+                    for (_, object) in &mut presentation.objects {
+                        *object = object.constrained_to(frame.rem_size(), limit);
+                    }
                     let elements = presentation
                         .objects
                         .iter()

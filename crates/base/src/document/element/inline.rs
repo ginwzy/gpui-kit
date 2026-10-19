@@ -46,7 +46,7 @@ impl<I: Clone + Eq + Hash + 'static> InlineRow<I> {
             let clip = |span: &Range<usize>| {
                 let start = span.start.max(range.start);
                 let end = span.end.min(range.end);
-                (start < end).then_some(start - range.start..end - range.start)
+                (start < end).then(|| start - range.start..end - range.start)
             };
             let styled = StyledText::new(text[range.clone()].to_owned())
                 .with_highlights(

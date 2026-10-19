@@ -64,6 +64,81 @@ fn settle(document: &Entity<DocumentState<&'static str>>, view: &mut VisualTestC
 }
 
 #[gpui::test]
+fn constrained_objects_share_wrap_and_paint_width_after_resize(cx: &mut TestAppContext) {
+    let (document, mut view) = setup(cx);
+    document.update(&mut view, |document, cx| {
+        let mut snapshot = fixture();
+        for block in &mut snapshot.blocks {
+            *block = block.clone().with_inline_size(
+                InlineSize::new(px(600.), px(32.), px(24.)).constrain_width(true),
+            );
+        }
+        document.reset(snapshot, cx).unwrap();
+    });
+    for width in [300., 100., 400.] {
+        view.simulate_resize(size(px(width), px(300.)));
+        settle(&document, &mut view);
+        document.read_with(&view, |document, _| {
+            let mut count = 0;
+            for row in &document.text_layouts {
+                if let LineLayout::Inline { parts, .. } = &row.layout {
+                    for part in parts.iter().filter(|part| part.text.is_none()) {
+                        count += 1;
+                        assert_eq!(part.bounds.size.width, px(width));
+                    }
+                }
+            }
+            assert_eq!(count, 2);
+            assert_eq!(document.text(), "header\n中🙂<alpha><beta>tail\n");
+        });
+    }
+}
+
+#[gpui::test]
+fn paragraph_style_spans_inline_objects_but_inline_marks_still_reject_them(
+    cx: &mut TestAppContext,
+) {
+    let (document, mut view) = setup(cx);
+    document.update(&mut view, |document, cx| {
+        let mut snapshot = fixture();
+        snapshot.regions = snapshot
+            .regions
+            .into_iter()
+            .map(|region| {
+                let policy = if region.policy() == EditPolicy::Editable {
+                    EditPolicy::Readonly
+                } else {
+                    region.policy()
+                };
+                DocumentRegion::new(*region.id(), region.range(), policy)
+            })
+            .collect();
+        snapshot.styles = DocumentStyles::new(
+            vec![crate::document::DocumentParagraphStyle::new(
+                7..snapshot.text.len(),
+                Default::default(),
+            )],
+            vec![],
+        );
+        document.reset(snapshot.clone(), cx).unwrap();
+        snapshot.styles = DocumentStyles::new(
+            vec![],
+            vec![crate::document::DocumentInlineStyle::new(
+                7..snapshot.text.len(),
+                Default::default(),
+            )],
+        );
+        assert!(matches!(
+            document.reset(snapshot, cx),
+            Err(PresentationError::Styles(DocumentStyleError::AtomicRange(
+                _
+            )))
+        ));
+    });
+    settle(&document, &mut view);
+}
+
+#[gpui::test]
 fn mixed_geometry_drives_hit_testing_selection_ime_and_reflow(cx: &mut TestAppContext) {
     let (document, mut view) = setup(cx);
     let (a, b, start, end) = document.read_with(&view, |document, _| {

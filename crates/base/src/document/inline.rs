@@ -9,6 +9,7 @@ pub struct InlineSize {
     width: AbsoluteLength,
     height: AbsoluteLength,
     baseline: AbsoluteLength,
+    constrain_width: bool,
 }
 
 // Descriptor identity is exact, including the declared unit. Compare bits so
@@ -22,6 +23,7 @@ impl PartialEq for InlineSize {
         };
         [self.width, self.height, self.baseline].map(key)
             == [other.width, other.height, other.baseline].map(key)
+            && self.constrain_width == other.constrain_width
     }
 }
 impl Eq for InlineSize {}
@@ -36,6 +38,7 @@ impl InlineSize {
             width: width.into(),
             height: height.into(),
             baseline: baseline.into(),
+            constrain_width: false,
         }
     }
 
@@ -47,6 +50,25 @@ impl InlineSize {
     }
     pub fn baseline(&self) -> AbsoluteLength {
         self.baseline
+    }
+
+    /// Cap the preferred width at the paragraph's available row width. The
+    /// object still wraps atomically; its renderer must fit the narrower box.
+    /// Fixed-width objects keep the default `false` behavior.
+    pub fn constrain_width(mut self, constrain: bool) -> Self {
+        self.constrain_width = constrain;
+        self
+    }
+
+    pub fn is_width_constrained(&self) -> bool {
+        self.constrain_width
+    }
+
+    pub(in crate::document) fn constrained_to(mut self, rem: Pixels, width: Pixels) -> Self {
+        if self.constrain_width {
+            self.width = self.width.to_pixels(rem).min(width).into();
+        }
+        self
     }
 
     pub(super) fn resolve(self, rem: Pixels) -> (Size<Pixels>, Pixels) {
