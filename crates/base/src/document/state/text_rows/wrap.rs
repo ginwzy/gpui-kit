@@ -1,7 +1,7 @@
-//! Resumable form of the document's greedy cluster wrapper. Checkpoints
-//! include the carried row width and all break state, not just an offset.
-//! Measurements stay in GPUI's font/size keyed LineWrapper pool; changing
-//! width invalidates breakpoints without invalidating cluster measurements.
+//! Resumable greedy cluster wrapper. Cluster advances propose a row; shaping
+//! validates its end before publication. Checkpoints retain unfinished scans.
+//! Cluster advances stay in GPUI's font/size keyed LineWrapper pool; immutable
+//! shaped measurements use TextSystem's bounded cache across width changes.
 use gpui::{LineWrapper, LineWrapperHandle, Pixels, px};
 use std::{
     ops::Range,
@@ -226,7 +226,7 @@ impl Wrap {
     }
 
     /// Consume a bounded number of input bytes. A cluster is indivisible;
-    /// callers route non-ASCII input to a cancellable background task.
+    /// callers route larger inputs to a cancellable background task.
     pub fn step(
         &mut self,
         line: &str,
@@ -244,35 +244,47 @@ impl Wrap {
                 .map_or(0, |(_, font)| *font)
         };
         let stop = self.point.next.saturating_add(budget);
-        let from = self.point.next;
-        let amount_at =
-            |ix: usize, cluster: &str, x: Pixels, wrappers: &mut [LineWrapperHandle]| {
-                let at = self.objects.partition_point(|(range, _)| range.end <= ix);
-                self.objects
-                    .get(at)
-                    .filter(|(range, _)| range.start == ix)
-                    .map_or_else(
-                        || advance(&mut wrappers[font_at(ix)], cluster, x),
-                        |(_, width)| *width,
-                    )
-            };
-        for (ix, cluster) in Clusters::new(line, &self.objects, from..line.len()) {
+        loop {
             if cancelled.load(Ordering::Relaxed) {
                 return false;
+            }
+            let ix = self.point.next;
+            if ix == line.len() {
+                let Some(end) = self.fitting_end(line, runs, wrappers, ix, cancelled) else {
+                    return false;
+                };
+                if end == ix {
+                    self.complete = true;
+                    return true;
+                }
+                if self.start_row(line, end) {
+                    return true;
+                }
+                continue;
             }
             if ix >= stop {
                 return false;
             }
+            let (_, cluster) = Clusters::new(line, &self.objects, ix..line.len())
+                .next()
+                .expect("remaining cluster");
             let first = cluster.chars().next().unwrap_or_default();
-            if self.point.indented
-                && ((!self.objects.is_empty()
-                    && (first == '\u{fffc}' || self.point.previous == '\u{fffc}'))
-                    || LineWrapper::can_break_before(self.point.previous, first))
-            {
+            if can_break(
+                self.point.previous,
+                first,
+                self.point.indented,
+                !self.objects.is_empty(),
+            ) {
                 self.candidate = Some(ix);
             }
             self.point.indented |= first != ' ';
-            let mut amount = amount_at(ix, cluster, self.point.x, wrappers);
+            let object = self
+                .objects
+                .get(self.objects.partition_point(|(range, _)| range.end <= ix));
+            let amount = object.filter(|(range, _)| range.start == ix).map_or_else(
+                || advance(&mut wrappers[font_at(ix)], cluster, self.point.x),
+                |(_, width)| *width,
+            );
             let width = if self.prefix.is_empty() && self.points.is_empty() {
                 self.widths.0
             } else {
@@ -283,44 +295,121 @@ impl Wrap {
                 && ix > self.point.row;
             if broke {
                 let row = self.point.row;
-                let start = self
+                let proposed = self
                     .candidate
                     .filter(|start| *start > row && end - start <= MAX_ROW_BYTES)
                     .unwrap_or(ix);
-                self.point.row = start;
-                self.candidate = None;
-                self.point.x = Clusters::new(line, &self.objects, start..ix)
-                    .fold(px(0.), |x, (offset, cluster)| {
-                        x + amount_at(offset, cluster, x, wrappers)
-                    });
-                amount = amount_at(ix, cluster, self.point.x, wrappers);
+                let Some(start) = self.fitting_end(line, runs, wrappers, proposed, cancelled)
+                else {
+                    return false;
+                };
+                if self.start_row(line, start) {
+                    return true;
+                }
+                continue;
             }
             self.point.x += amount;
             self.point.previous = cluster.chars().last().unwrap_or(first);
             self.point.next = ix + cluster.len();
             self.processed += cluster.len();
-            if broke {
-                self.points.push(self.point);
-                if let Some((old, suffix, delta)) = &self.reuse {
-                    if ix >= *suffix && self.point.row >= *suffix {
-                        let old_next = self.point.next.checked_add_signed(-*delta).unwrap();
-                        let at = old.breaks.partition_point(|point| point.next < old_next);
-                        if at < old.breaks.len()
-                            && old.breaks.point(at).shifted(*delta) == self.point
-                        {
-                            self.prefix.append_points(std::mem::take(&mut self.points));
-                            self.prefix
-                                .append_range(&old.breaks, at + 1..old.breaks.len(), *delta);
-                            self.reused = old.breaks.len() - at - 1;
-                            self.complete = true;
-                            return true;
-                        }
-                    }
-                }
+        }
+    }
+
+    fn start_row(&mut self, line: &str, start: usize) -> bool {
+        self.point.next = start;
+        self.point.row = start;
+        self.point.x = px(0.);
+        self.point.previous = line[..start].chars().next_back().unwrap_or_default();
+        self.candidate = None;
+        self.points.push(self.point);
+        if let Some((old, suffix, delta)) = &self.reuse
+            && start >= *suffix
+        {
+            let old_next = start.checked_add_signed(-*delta).unwrap();
+            let at = old.breaks.partition_point(|point| point.next < old_next);
+            if at < old.breaks.len() && old.breaks.point(at).shifted(*delta) == self.point {
+                self.prefix.append_points(std::mem::take(&mut self.points));
+                self.prefix
+                    .append_range(&old.breaks, at + 1..old.breaks.len(), *delta);
+                self.reused = old.breaks.len() - at - 1;
+                self.complete = true;
+                return true;
             }
         }
-        self.complete = true;
-        true
+        false
+    }
+
+    /// Only shape one bounded row, including its actual font runs. On overflow
+    /// find a fitting cluster boundary, then prefer the preceding word boundary.
+    /// The first cluster/object remains indivisible even in a zero-width view.
+    fn fitting_end(
+        &self,
+        line: &str,
+        runs: &[(usize, usize)],
+        wrappers: &[LineWrapperHandle],
+        proposed: usize,
+        cancelled: &AtomicBool,
+    ) -> Option<usize> {
+        let start = self.point.row;
+        let width = if self.prefix.is_empty() && self.points.is_empty() {
+            self.widths.0
+        } else {
+            self.widths.1
+        };
+        // The checkpoint at this row's start records whether the physical line
+        // has passed its indentation. The current scan may already have done so.
+        let row_indented = self
+            .points
+            .last()
+            .copied()
+            .or_else(|| (!self.prefix.is_empty()).then(|| self.prefix.point(self.prefix.len() - 1)))
+            .is_some_and(|point| point.indented);
+        let mut end = proposed;
+        let mut clusters = None;
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return None;
+            }
+            let (drawn, fit) = measure_row(
+                line,
+                runs,
+                wrappers,
+                &self.objects,
+                start..end,
+                width + px(0.01),
+            );
+            if drawn <= width + px(0.01) {
+                return Some(end);
+            }
+            let clusters = clusters.get_or_insert_with(|| {
+                Clusters::new(line, &self.objects, start..proposed).collect::<Vec<_>>()
+            });
+            let first_end = clusters[0].0 + clusters[0].1.len();
+            if end == first_end {
+                return Some(end);
+            }
+            // Glyph positions give a close proposal without shaping log(n)
+            // different prefixes. Still revalidate the final context, and always
+            // retreat at least one cluster if a shaper returns a non-progressing hint.
+            let count = clusters
+                .partition_point(|(ix, cluster)| {
+                    *ix + cluster.len() <= fit && *ix + cluster.len() < end
+                })
+                .max(1);
+            end = clusters[count - 1].0 + clusters[count - 1].1.len();
+            let mut indented = row_indented;
+            let mut previous = line[..start].chars().next_back().unwrap_or_default();
+            let mut preferred = None;
+            for &(ix, cluster) in clusters.iter().take_while(|(ix, _)| *ix <= end) {
+                let first = cluster.chars().next().unwrap_or_default();
+                if ix > start && can_break(previous, first, indented, !self.objects.is_empty()) {
+                    preferred = Some(ix);
+                }
+                indented |= first != ' ';
+                previous = cluster.chars().next_back().unwrap_or(first);
+            }
+            end = preferred.unwrap_or(end);
+        }
     }
 
     pub fn finish(mut self) -> Breaks {
@@ -338,6 +427,65 @@ impl Wrap {
         }
         self.prefix
     }
+}
+
+fn can_break(previous: char, first: char, indented: bool, objects: bool) -> bool {
+    indented
+        && (LineWrapper::can_break_before(previous, first)
+            || (objects && (previous == '\u{fffc}' || first == '\u{fffc}')))
+}
+
+fn measure_row(
+    line: &str,
+    runs: &[(usize, usize)],
+    wrappers: &[LineWrapperHandle],
+    objects: &[(Range<usize>, Pixels)],
+    range: Range<usize>,
+    max_width: Pixels,
+) -> (Pixels, usize) {
+    let text_width = |range: Range<usize>, available| {
+        let mut start = range.start;
+        let mut at = runs.partition_point(|(end, _)| *end <= start);
+        LineWrapper::measure_runs(
+            &line[range.clone()],
+            std::iter::from_fn(|| {
+                if start == range.end {
+                    return None;
+                }
+                let (end, font) = runs.get(at).copied().unwrap_or((range.end, 0));
+                let end = end.min(range.end);
+                let len = end - start;
+                start = end;
+                at += 1;
+                Some((len, &*wrappers[font]))
+            }),
+            available,
+        )
+    };
+    let mut start = range.start;
+    let mut width = px(0.);
+    let mut fit = range.end;
+    for (object, size) in
+        objects[objects.partition_point(|(object, _)| object.end <= start)..].iter()
+    {
+        if object.start >= range.end {
+            break;
+        }
+        let (drawn, boundary) = text_width(start..object.start, max_width - width);
+        if fit == range.end && width + drawn > max_width {
+            fit = start + boundary;
+        }
+        width += drawn + *size;
+        if fit == range.end && width > max_width {
+            fit = object.start;
+        }
+        start = object.end;
+    }
+    let (drawn, boundary) = text_width(start..range.end, max_width - width);
+    if fit == range.end && width + drawn > max_width {
+        fit = start + boundary;
+    }
+    (width + drawn, fit)
 }
 
 /// Object boundaries also separate grapheme segmentation. A combining mark

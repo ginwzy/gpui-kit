@@ -24,6 +24,11 @@ harness = false
 name = "text_view_scroll"
 harness = false
 
+[[test]]
+name = "text_width"
+# Native macOS text initialization must run on the main thread.
+harness = false
+
 [features]
 test-support = ["gpui/test-support"]
 inspector = ["gpui_macros/inspector", "gpui/inspector"]

@@ -2904,13 +2904,11 @@ pub(in crate::document) fn rows_of_line(
 /// `widths.0` and later rows to `widths.1`, relative to the line. `runs` gives
 /// each run's end and the wrapper of its font.
 ///
-/// Rows break with GPUI's wrapping rules but are measured as they are drawn,
-/// each as its own unwrapped line: a grapheme cluster advances by its shaped
-/// width in its run's font (a ZWJ sequence is one glyph), and a tab advances
-/// to the next tab stop from the row's start. Rows therefore never split a
-/// cluster. A tab exactly at a stop counts a whole tab, so a row is never
-/// estimated narrower than drawn. A row also ends before it would exceed
-/// [`MAX_ROW_BYTES`], unless it is a single cluster.
+/// Reference greedy wrapper for the test backend's additive font advances.
+/// Production `Wrap` also validates each row with contextual shaping; the
+/// native `text_width` integration test checks its actual rendered rows.
+/// Tabs advance to the next stop and clusters remain indivisible, including
+/// a single cluster larger than [`MAX_ROW_BYTES`].
 #[cfg(test)]
 fn wrap_line(
     line: &str,
@@ -2993,8 +2991,8 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use gpui::{
-        Entity, IntoElement, ParentElement as _, Render, Styled as _, TestAppContext,
-        VisualTestContext, div, prelude::FluentBuilder as _, size,
+        Entity, IntoElement, ParentElement as _, Styled as _, TestAppContext, VisualTestContext,
+        div, prelude::FluentBuilder as _, size,
     };
 
     use super::{super::tests::document_view, *};
@@ -3511,85 +3509,6 @@ mod tests {
             assert!(start > previous);
             previous = start;
         }
-    }
-
-    #[test]
-    fn rows_are_never_wider_than_they_are_drawn() {
-        // The platform's own text system, so clusters, tabs and fallback fonts
-        // shape as they do in the app.
-        let mut app =
-            gpui::TestApp::with_text_system(gpui_platform::current_platform(true).text_system());
-        struct Empty;
-        impl Render for Empty {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div()
-            }
-        }
-        // Bundled fonts, so the test does not depend on what the machine has.
-        app.text_system()
-            .add_fonts(vec![
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../story-web/fonts/JetBrainsMono-Regular.ttf"
-                ))
-                .as_slice()
-                .into(),
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../story-web/fonts/NotoSansSC-Regular-subset.ttf"
-                ))
-                .as_slice()
-                .into(),
-            ])
-            .unwrap();
-        let mut window = app.open_window(|_, _| Empty);
-        let json = format!(
-            "{{{}}}",
-            (0..60)
-                .map(|i| format!("\"k{i}\":\"v {i}\""))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let texts = [
-            "\tfn\tmain()\t{\t}\tlet\tx\t=\t1;\t".repeat(12),
-            "family 👨\u{200d}👩\u{200d}👧\u{200d}👦 skin 👍🏽 flag 🏳\u{fe0f}\u{200d}🌈 ".repeat(12),
-            "e\u{301}a\u{308}n\u{303}o\u{302} Z\u{335}a\u{336}l\u{337}g\u{338}o ".repeat(24),
-            "中文的长段落，包含标点；English words 12345 と日本語のテキスト。".repeat(12),
-            json,
-        ];
-        window.update(|_, window, cx| {
-            let font = gpui::font("JetBrains Mono");
-            let size = px(14.);
-            let mut wrappers = vec![cx.text_system().line_wrapper(font.clone(), size)];
-            let run = |len| gpui::TextRun {
-                len,
-                font: font.clone(),
-                color: gpui::black(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            for text in &texts {
-                let clusters: Vec<_> = text.grapheme_indices(true).map(|(ix, _)| ix).collect();
-                for width in [px(120.), px(310.)] {
-                    let starts = wrap_line(text, &[(text.len(), 0)], &mut wrappers, (width, width));
-                    assert!(!starts.is_empty(), "{text:?} wraps at {width:?}");
-                    for row in rows_of_line(0..text.len(), &starts) {
-                        assert!(row.end == text.len() || clusters.contains(&row.end));
-                        let row = &text[row];
-                        let drawn = window
-                            .text_system()
-                            .shape_line(row.to_owned().into(), size, &[run(row.len())], None)
-                            .width;
-                        // A cluster wider than a row keeps a row to itself.
-                        assert!(
-                            drawn <= width + px(0.01) || row.graphemes(true).count() == 1,
-                            "{row:?} draws {drawn:?} in {width:?}"
-                        );
-                    }
-                }
-            }
-        });
     }
 
     const OBJECT: &str = "\u{fffc}";
