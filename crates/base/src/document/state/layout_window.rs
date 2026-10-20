@@ -170,7 +170,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         // From the end, so earlier lines keep their indices.
         for (items, replacement) in splices.into_iter().rev() {
             refit = true;
+            self.before_list_splice();
             self.list_state.splice(items.clone(), replacement.len());
+            self.after_list_splice();
             let retired = self.layout_items.splice(items, replacement);
             self.retire_layout_items(retired);
         }
@@ -251,8 +253,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// Replaces layout items `old` with `replacement`, the items of the same
     /// nodes after an edit that moved later source by `source_delta` and later
     /// display text by `display_delta`. Later items shift. Up to `keep_prefix`
-    /// leading items and any trailing items that keep their identity keep
-    /// their geometry and list slots; the list splices only the rest.
+    /// leading items and any trailing items that are the same rows keep their
+    /// geometry and list slots, even when another node now owns them; the list
+    /// splices only the rest.
     pub(super) fn replace_layout_window(
         &mut self,
         old: Range<usize>,
@@ -270,27 +273,42 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .range(old.clone())
             .zip(&replacement)
             .take(keep_prefix)
-            .take_while(|(old, new)| old.same_layout_identity(new))
+            .take_while(|(old, new)| old.same_row(new))
             .count();
         let suffix = old_items
             .range(old.start + prefix..old.end)
             .rev()
             .zip(replacement[prefix..].iter().rev())
-            .take_while(|(old, new)| old.same_layout_identity(new))
+            .take_while(|(old, new)| old.same_row(new))
             .count();
         let changed = old.start + prefix..old.end - suffix;
         let count = replacement.len() - prefix - suffix;
         if !changed.is_empty() || count != 0 {
+            self.before_list_splice();
             self.list_state.splice(changed, count);
+            self.after_list_splice();
             self.list_state.clone().measure_all();
         }
         let split = replacement.len() - suffix;
         let (head, tail) = replacement.split_at_mut(split);
-        for (old, new) in old_items.range(old.start..old.start + prefix).zip(head) {
+        // Rows with a new owner keep their slot and rows; the owner's frame is
+        // resolved again and only a different frame reflows them.
+        let mut reowned = Vec::new();
+        let kept = old_items
+            .range(old.start..old.start + prefix)
+            .zip(head.iter_mut())
+            .zip(old.start..)
+            .chain(
+                old_items
+                    .range(old.end - suffix..old.end)
+                    .zip(tail.iter_mut())
+                    .zip(old.start + split..),
+            );
+        for ((old, new), ix) in kept {
             new.keep_geometry(old);
-        }
-        for (old, new) in old_items.range(old.end - suffix..old.end).zip(tail) {
-            new.keep_geometry(old);
+            if old.node() != new.node() {
+                reowned.push(ix);
+            }
         }
         // Geometry invalidation asks only which nodes were touched. One
         // representative per semantic line is sufficient, even when that
@@ -311,6 +329,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .splice_prepared(old.clone(), replacement.into());
         self.retire_layout_items(removed);
         self.layout_items_replaced(old, len);
+        self.reframe_rows(&reowned);
     }
 
     /// Checks that patched layout items are the document's layout items. Rows
@@ -552,6 +571,187 @@ mod tests {
                 document.list_state.item_count(),
                 document.layout_items.len()
             );
+        });
+    }
+
+    // A reply that streamed as one node and settles as another keeps its rows:
+    // the list does not splice them, so the viewport stays on the same text.
+    #[gpui::test]
+    fn renaming_a_node_around_unchanged_text_keeps_its_rows_and_the_viewport(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::document::DocumentSnapshot;
+        let text = (0..60).map(|ix| format!("line {ix}\n")).collect::<String>();
+        let len = text.len();
+        let mut document = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.set_global(Theme::default());
+                crate::init(cx);
+                document = Some(cx.new(|cx| {
+                    let mut document = DocumentState::new(
+                        text.clone(),
+                        vec![
+                            DocumentRegion::new("live", 0..len, EditPolicy::Readonly),
+                            DocumentRegion::new("draft", len..len, EditPolicy::Editable),
+                        ],
+                        cx,
+                    )
+                    .unwrap();
+                    document.set_text_rows(Some(TextRows::default()), cx);
+                    document.set_dynamic_trailer(true, cx);
+                    document
+                }));
+                cx.new(|_| Root(document.clone().unwrap()))
+            })
+            .unwrap()
+        });
+        let document = document.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(gpui::px(600.), gpui::px(300.)));
+        let draw = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                for _ in 0..2 {
+                    let _ = window.draw(cx);
+                }
+            });
+        };
+        draw(&mut cx);
+        let top = gpui::ListOffset {
+            item_ix: 30,
+            offset_in_item: gpui::px(5.),
+        };
+        document.read_with(&cx, |document, _| document.list_state.scroll_to(top));
+        draw(&mut cx);
+        let count = document.read_with(&cx, |document, _| document.list_state.item_count());
+        cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document
+                    .apply_host_splice(
+                        document.revision(),
+                        Some(&"live"),
+                        Some(&"draft"),
+                        DocumentSnapshot::new(
+                            text.clone(),
+                            vec![DocumentRegion::new("entry", 0..len, EditPolicy::Readonly)],
+                            DocumentProjection::identity(len),
+                            vec![],
+                            DocumentStyles::default(),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+                let kept = document.list_state.logical_scroll_top();
+                assert_eq!(
+                    (kept.item_ix, kept.offset_in_item),
+                    (top.item_ix, top.offset_in_item)
+                );
+            });
+            let _ = window.draw(cx);
+        });
+        draw(&mut cx);
+        document.read_with(&cx, |document, _| {
+            let kept = document.list_state.logical_scroll_top();
+            assert_eq!(
+                (kept.item_ix, kept.offset_in_item),
+                (top.item_ix, top.offset_in_item)
+            );
+            assert_eq!(document.list_state.item_count(), count);
+            assert!(
+                document
+                    .layout_items
+                    .iter()
+                    .all(|item| item.node() != Some(&"live"))
+            );
+        });
+    }
+
+    // Markdown blocks display their line break after their source, and a
+    // node's trailing blank lines can be hidden. Either way the boundary's
+    // display offset starts the next row, while the node's end is drawn at the
+    // end of its own last row.
+    #[gpui::test]
+    fn a_node_end_is_drawn_on_its_last_row(cx: &mut TestAppContext) {
+        use crate::document::ProjectionMapping;
+        let text = "**A**\n\nC\n\n";
+        let mut document = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.set_global(Theme::default());
+                crate::init(cx);
+                document = Some(cx.new(|cx| {
+                    let mut document = DocumentState::new(
+                        text,
+                        vec![
+                            DocumentRegion::new("first", 0..7, EditPolicy::Readonly),
+                            DocumentRegion::new("second", 7..10, EditPolicy::Readonly),
+                            DocumentRegion::new("draft", 10..10, EditPolicy::Editable),
+                        ],
+                        cx,
+                    )
+                    .unwrap();
+                    document
+                        .set_rich_presentation_with_anchors(
+                            DocumentProjection::new(
+                                10,
+                                vec![
+                                    ProjectionSpan::mapped(
+                                        0..7,
+                                        "A\n",
+                                        vec![
+                                            ProjectionMapping::new(0..1, 2..3),
+                                            ProjectionMapping::new(1..2, 3..7),
+                                        ],
+                                    ),
+                                    ProjectionSpan::mapped(
+                                        7..8,
+                                        "C\n",
+                                        vec![
+                                            ProjectionMapping::new(0..1, 7..8),
+                                            ProjectionMapping::new(1..2, 7..8),
+                                        ],
+                                    ),
+                                    ProjectionSpan::hide(8..10),
+                                ],
+                            )
+                            .unwrap(),
+                            vec![],
+                            vec![],
+                            DocumentStyles::default(),
+                            cx,
+                        )
+                        .unwrap();
+                    document.set_text_rows(Some(TextRows::default()), cx);
+                    document
+                }));
+                cx.new(|_| Root(document.clone().unwrap()))
+            })
+            .unwrap()
+        });
+        let document = document.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            for _ in 0..2 {
+                let _ = window.draw(cx);
+            }
+        });
+        document.read_with(&cx, |document, _| {
+            let at = |node, offset, affinity| {
+                document
+                    .viewport_fraction(&DocumentPosition::new(node, offset, affinity))
+                    .unwrap()
+            };
+            // "A" starts after the hidden "**".
+            assert_eq!(
+                at("first", 7, Affinity::Before),
+                at("first", 2, Affinity::After)
+            );
+            assert_eq!(
+                at("second", 3, Affinity::Before),
+                at("second", 0, Affinity::After)
+            );
+            assert!(at("first", 7, Affinity::Before) < at("second", 0, Affinity::After));
+            assert!(at("second", 3, Affinity::Before) < at("draft", 0, Affinity::After));
         });
     }
 }

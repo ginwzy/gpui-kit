@@ -333,8 +333,8 @@ impl<I: Clone + Eq + Hash + 'static> Element for DocumentTextElement<I> {
         self.text
             .prepaint(global_id, inspector_id, bounds, &mut (), window, cx);
         let layout = self.text.layout().clone();
-        self.state.update(cx, |state, cx| {
-            state.update_text_layout(self.item_ix, self.display.clone(), layout, bounds, cx);
+        self.state.update(cx, |state, _| {
+            state.update_text_layout(self.item_ix, self.display.clone(), layout, bounds);
         });
     }
 
@@ -446,14 +446,8 @@ impl<I: Clone + Eq + Hash + 'static> Element for DocumentBlockElement<I> {
         cx: &mut App,
     ) {
         self.content.prepaint(window, cx);
-        self.state.update(cx, |state, cx| {
-            state.update_block_layout(
-                self.item_ix,
-                self.id.clone(),
-                self.source.clone(),
-                bounds,
-                cx,
-            );
+        self.state.update(cx, |state, _| {
+            state.update_block_layout(self.item_ix, self.id.clone(), self.source.clone(), bounds);
         });
     }
 

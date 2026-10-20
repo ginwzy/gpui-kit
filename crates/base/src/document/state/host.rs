@@ -178,7 +178,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .collect::<Vec<_>>();
 
         // All fallible work is complete. Publish source, presentation and layout together.
-        self.capture_viewport_anchor();
         if let Some(edit) = edit {
             self.model
                 .anchors

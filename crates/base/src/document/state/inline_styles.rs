@@ -124,7 +124,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             resolved_inline.partition_point(|style| style.source.end <= source.start);
         let resolved_to = resolved_inline.partition_point(|style| style.source.start < source.end);
 
-        self.capture_viewport_anchor();
         self.model.styles.inline.splice(from..to, styles);
         let added = resolved.inline.len();
         let mut restyled: Vec<Range<usize>> = self

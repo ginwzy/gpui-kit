@@ -202,7 +202,6 @@ pub(in crate::document) struct RowFrame {
 
 impl RowFrame {
     /// How far below the top of `row` its text starts.
-    #[cfg(debug_assertions)]
     pub(in crate::document) fn text_top(&self, row: &Range<usize>, line: &Range<usize>) -> Pixels {
         if self.hidden || row.start != line.start {
             px(0.)
@@ -246,6 +245,10 @@ impl RowFrame {
             below = below.max(size.height - baseline);
         }
         (above + below, above, above - self.baseline)
+    }
+
+    pub(in crate::document) fn line_height(&self) -> Pixels {
+        self.line_height
     }
 
     pub(in crate::document) fn rem_size(&self) -> Pixels {
@@ -1008,6 +1011,30 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
 
     /// Forgets the frames and block heights of items whose node `owned`
     /// selects. Returns whether any item was cleared.
+    /// Asks the host again for the frames of rows `items`, keeping their slots.
+    pub(super) fn reframe_rows(&mut self, items: &[usize]) {
+        if self.text_rows.is_none() {
+            for &ix in items {
+                self.list_state.remeasure_items(ix..ix + 1);
+            }
+            return;
+        }
+        let lines: Vec<_> = items
+            .iter()
+            .filter_map(|&ix| match &self.layout_items[ix] {
+                DocumentLayoutItem::Text { node_id, line, .. } => {
+                    Some((node_id.clone(), line.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        self.text_rows
+            .as_mut()
+            .unwrap()
+            .invalid_frames
+            .extend(lines);
+    }
+
     pub(super) fn clear_row_geometry(&mut self, owned: impl Fn(Option<&I>) -> bool) -> bool {
         let Some(state) = self.text_rows.as_mut() else {
             return false;
@@ -1480,10 +1507,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 &display_line,
                 item.presentation(),
             ))]);
+            self.before_list_splice();
             let old = self
                 .layout_items
                 .splice_prepared(rows.clone(), vec![item].into());
             let old_heights = self.list_state.splice_prepared(rows.clone(), heights);
+            self.after_list_splice();
             let state = self.text_rows.as_mut().unwrap();
             state.retired.push((old, old_heights));
             state.items_spliced(&rows, 1);
@@ -2040,10 +2069,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         // line's cost follows its bytes whatever its script: a short Unicode
         // line wraps in the frame like ASCII, and a long one in the background.
         let focus = self
-            .pending_viewport_anchor
-            .as_ref()
-            .and_then(|pending| self.model.position_for_anchor(pending.anchor).ok())
-            .and_then(|position| self.resolve_position(&position).ok())
+            .reveal_target()
+            .or_else(|| self.viewport_top_offset())
             .unwrap_or_else(|| self.model.cursor());
         let focus = self.model.source_to_display(focus, super::Affinity::After);
         for stale_line in &mut stale {
@@ -2609,13 +2636,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         else {
             return;
         };
-        // The anchor's source offset does not change while rows attach.
-        let anchor = self
-            .pending_viewport_anchor
-            .as_ref()
-            .filter(|pending| !pending.reveal_on_wrap)
-            .and_then(|pending| self.model.position_for_anchor(pending.anchor).ok())
-            .and_then(|position| self.resolve_position(&position).ok());
         let mut budget = ROW_BATCH;
         // Lines completed in this batch, last first, and the rows built for them.
         let mut run: Vec<(
@@ -2638,7 +2658,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 // lines between unchanged rows still attach in one splice.
                 match self.unchanged_rows(gap) {
                     Some(gap) => run.push(gap),
-                    None => self.attach_line_run(std::mem::take(&mut run), anchor),
+                    None => self.attach_line_run(std::mem::take(&mut run)),
                 }
             }
             let DocumentLayoutItem::Text {
@@ -2716,7 +2736,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             }
             // A line too long for one batch is built across batches and
             // attached alone, after the lines completed before it.
-            self.attach_line_run(std::mem::take(&mut run), anchor);
+            self.attach_line_run(std::mem::take(&mut run));
             work.items.extend(items);
             work.heights.extend(heights);
             work.row += count;
@@ -2725,11 +2745,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             }
             let items = std::mem::take(&mut work.items);
             let heights = std::mem::replace(&mut work.heights, gpui::PreparedListItems::new());
-            self.attach_rows(rows, items, heights, anchor);
+            self.attach_rows(rows, items, heights);
             work.row = 0;
             work.lines.pop_front();
         }
-        self.attach_line_run(run, anchor);
+        self.attach_line_run(run);
         if !work.lines.is_empty() {
             self.text_rows.as_mut().unwrap().publishing = Some(work);
         } else {
@@ -2784,7 +2804,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             Vec<DocumentLayoutItem<I>>,
             Vec<Option<Pixels>>,
         )>,
-        anchor: Option<usize>,
     ) {
         let (Some((last, ..)), Some((first, ..))) = (run.first(), run.last()) else {
             return;
@@ -2796,55 +2815,21 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             items.extend(line_items);
             heights.extend(line_heights);
         }
-        self.attach_rows(rows, items, heights, anchor);
+        self.attach_rows(rows, items, heights);
     }
 
-    /// Replaces items `rows` with complete rows, keeping the viewport's text
-    /// in place and revealing a pending anchor the rows now place.
+    /// Replaces items `rows` with complete rows. The viewport is anchored to
+    /// content, so it keeps its text, and a pending reveal finds its row.
     fn attach_rows(
         &mut self,
         rows: Range<usize>,
         items: super::LayoutItems<I>,
         heights: gpui::PreparedListItems,
-        anchor: Option<usize>,
     ) {
-        let (Some(DocumentLayoutItem::Text { source: first, .. }), Some(last)) = (
-            self.layout_items.get(rows.start),
-            self.layout_items.get(rows.end - 1),
-        ) else {
-            unreachable!("published rows are text items")
-        };
-        let segment = first.start..last.source_end();
-        // Capture the viewport at publication, respecting intervening scrolls.
-        let top = self.list_state.logical_scroll_top();
-        let top_offset = match self.layout_items.get(top.item_ix) {
-            Some(DocumentLayoutItem::Text { display, .. }) if rows.contains(&top.item_ix) => {
-                Some(display.start)
-            }
-            _ => None,
-        };
-        let new_top = top_offset.map(|offset| {
-            rows.start
-                + items
-                    .partition_point(|item| {
-                        matches!(item, DocumentLayoutItem::Text { display, .. } if display.start <= offset)
-                    })
-                    .saturating_sub(1)
-        });
+        self.before_list_splice();
         let old_items = self.layout_items.splice_prepared(rows.clone(), items);
         let old_heights = self.list_state.splice_prepared(rows, heights);
-        if let Some(item_ix) = new_top {
-            self.list_state.scroll_to(gpui::ListOffset {
-                item_ix,
-                offset_in_item: top.offset_in_item,
-            });
-        }
-        if let Some(offset) = anchor.filter(|offset| segment.contains(offset)) {
-            self.list_state.scroll_to(gpui::ListOffset {
-                item_ix: self.layout_item_for_source(offset),
-                offset_in_item: px(0.),
-            });
-        }
+        self.after_list_splice();
         self.text_rows
             .as_mut()
             .unwrap()

@@ -148,14 +148,8 @@ impl<I: Clone + Eq + Hash + 'static> Element for InlineRow<I> {
             parts: self.parts.borrow().clone(),
             bounds,
         };
-        self.state.update(cx, |state, cx| {
-            state.update_text_layout(
-                self.item_ix,
-                self.display.clone(),
-                layout.clone(),
-                bounds,
-                cx,
-            )
+        self.state.update(cx, |state, _| {
+            state.update_text_layout(self.item_ix, self.display.clone(), layout.clone(), bounds)
         });
         layout
     }

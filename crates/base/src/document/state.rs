@@ -4,16 +4,16 @@ use std::{
     error::Error,
     fmt,
     hash::Hash,
-    ops::{Range, RangeInclusive},
+    ops::Range,
     rc::Rc,
 };
 
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, ClipboardItem, Context, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, HighlightStyle, InteractiveElement as _,
-    IntoElement as _, ListAlignment, ListOffset, ListState, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement as _, Pixels, Point, Render, SharedString, Styled as _,
-    TextStyleRefinement, UTF16Selection, Window, div, list, point, px,
+    IntoElement as _, ListAlignment, ListState, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement as _, Pixels, Point, Render, SharedString, Styled as _, TextStyleRefinement,
+    UTF16Selection, Window, div, list, point, px,
 };
 use ropey::{LineType, Rope};
 use sum_tree::Bias;
@@ -52,6 +52,7 @@ mod inline_styles;
 mod layout_items;
 mod layout_window;
 mod text_rows;
+mod viewport;
 use layout_items::LayoutItems;
 
 #[cfg(test)]
@@ -437,6 +438,9 @@ struct AnchorRecord<I> {
     bias: AnchorBias,
     node_id: Option<I>,
     affinity: Affinity,
+    /// Text replaced around the anchor moves it to the replacement's start,
+    /// while an insertion at it moves it past the inserted text.
+    content: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -471,8 +475,19 @@ impl<I> AnchorStore<I> {
                 bias,
                 node_id,
                 affinity,
+                content: false,
             },
         );
+        anchor
+    }
+
+    /// An anchor on the content at `offset`, whichever node owns it.
+    fn create_for_content(&mut self, offset: usize) -> DocumentAnchor {
+        let anchor = self.create_for_node(offset, AnchorBias::Right, None, Affinity::After);
+        self.anchors
+            .get_mut(&anchor)
+            .expect("anchor was just created")
+            .content = true;
         anchor
     }
 
@@ -486,7 +501,11 @@ impl<I> AnchorStore<I> {
 
     fn apply_edit(&mut self, range: &Range<usize>, replacement_len: usize) {
         for record in self.anchors.values_mut() {
-            record.offset = transform_offset(record.offset, record.bias, range, replacement_len);
+            record.offset = if record.content && range.contains(&record.offset) {
+                range.start
+            } else {
+                transform_offset(record.offset, record.bias, range, replacement_len)
+            };
         }
     }
 }
@@ -865,12 +884,17 @@ impl<I: Eq> DocumentLayoutItem<I> {
         }
     }
     fn same_layout_identity(&self, other: &Self) -> bool {
+        self.same_row(other) && self.node() == other.node()
+    }
+
+    /// The same row, whichever node owns it: a list slot belongs to the row's
+    /// content and geometry, so a node renamed around unchanged text keeps it.
+    fn same_row(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 Self::Text {
                     display: left_display,
                     fingerprint: left,
-                    node_id: left_node,
                     presentation: left_presentation,
                     line: left_line,
                     line_key: left_key,
@@ -879,7 +903,6 @@ impl<I: Eq> DocumentLayoutItem<I> {
                 Self::Text {
                     display: right_display,
                     fingerprint: right,
-                    node_id: right_node,
                     presentation: right_presentation,
                     line: right_line,
                     line_key: right_key,
@@ -887,8 +910,7 @@ impl<I: Eq> DocumentLayoutItem<I> {
                 },
             ) => {
                 // A row keeps its place in its line, wherever the line moved.
-                left_node == right_node
-                    && left == right
+                left == right
                     && left_presentation == right_presentation
                     && left_key == right_key
                     && left_line.len() == right_line.len()
@@ -2495,17 +2517,9 @@ pub struct DocumentState<I> {
     auto_scroll: AutoScroll,
     undo: DocumentUndoManager<I>,
     preferred_x: Option<Pixels>,
-    pending_viewport_anchor: Option<PendingViewportAnchor>,
-    viewport_restore_scheduled: bool,
     dynamic_trailer: bool,
     trailer_height: Option<Pixels>,
-    scroll_pin: Option<ScrollPin<I>>,
-    scroll_pin_adjustment_scheduled: bool,
-    /// Scrolling the pin applied since the last layout pass; later checks in the
-    /// same pass would otherwise compare against pre-scroll geometry.
-    unpainted_pin_scroll: Pixels,
-    caret_reveal_pending: bool,
-    caret_reveal_scheduled: bool,
+    viewport: viewport::Viewport<I>,
     scroll_handler_installed: bool,
     scrollbar_input_pending: Rc<Cell<bool>>,
     block_renderer: Option<BlockRenderer<I>>,
@@ -2534,36 +2548,6 @@ type TextFrameResolver<I> = Rc<dyn Fn(&DocumentTextContext<I>, &Window, &App) ->
 type BlockHeightResolver<I> = Rc<dyn Fn(&I, &Window, &App) -> Option<gpui::AbsoluteLength>>;
 type TextRenderer<I> =
     Rc<dyn Fn(DocumentTextContext<I>, AnyElement, &mut Window, &mut App) -> AnyElement>;
-
-struct PendingViewportAnchor {
-    anchor: DocumentAnchor,
-    viewport_y: Pixels,
-    reveal_on_wrap: bool,
-}
-
-struct ScrollPin<I> {
-    id: I,
-    anchor: DocumentAnchor,
-    viewport_fraction: f32,
-    /// The pin moved to another node or fraction; approach it over a few
-    /// frames instead of jumping, then track content growth directly.
-    easing: bool,
-    /// Released without an event once it has been applied to current layout.
-    settling: bool,
-    /// Holds the anchor lower, up to a fraction, while trailing content fits.
-    trail: Option<ScrollPinTrail>,
-}
-
-/// Content after a pin's anchor that should end `clearance` above the viewport
-/// bottom. The anchor sits between the pin's fraction and `max_fraction`.
-struct ScrollPinTrail {
-    anchor: DocumentAnchor,
-    clearance: Pixels,
-    max_fraction: f32,
-}
-
-/// Pin moves at most this far in one frame are applied directly.
-const PIN_EASE_SNAP: Pixels = px(24.);
 
 // ListState's wheel callback does not run for scrollbar offset writes. Keep
 // that input intent alongside the existing viewport, without a second offset.
@@ -2640,15 +2624,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             auto_scroll: AutoScroll::default(),
             undo: DocumentUndoManager::default(),
             preferred_x: None,
-            pending_viewport_anchor: None,
-            viewport_restore_scheduled: false,
             dynamic_trailer: false,
             trailer_height: None,
-            scroll_pin: None,
-            scroll_pin_adjustment_scheduled: false,
-            unpainted_pin_scroll: Pixels::ZERO,
-            caret_reveal_pending: false,
-            caret_reveal_scheduled: false,
+            viewport: viewport::Viewport::default(),
             scroll_handler_installed: false,
             scrollbar_input_pending: Rc::default(),
             block_renderer: None,
@@ -2734,10 +2712,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.auto_scroll.stop();
         self.undo = DocumentUndoManager::default();
         self.preferred_x = None;
-        self.pending_viewport_anchor = None;
-        self.scroll_pin = None;
+        self.reset_viewport();
         self.scrollbar_input_pending.set(false);
-        self.caret_reveal_pending = false;
         self.text_layouts.clear();
         self.block_layouts.clear();
         self.trailer_layout = None;
@@ -2812,7 +2788,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 ));
             }
         }
-        self.capture_viewport_anchor();
         self.model.set_rich_presentation_with_anchors(
             projection,
             blocks,
@@ -2966,248 +2941,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.dynamic_trailer
     }
 
-    pub fn pin_scroll(
-        &mut self,
-        pin_id: I,
-        position: &DocumentPosition<I>,
-        viewport_fraction: f32,
-        cx: &mut Context<Self>,
-    ) -> Result<(), ScrollPinError> {
-        if !viewport_fraction.is_finite() || !(0.0..=1.0).contains(&viewport_fraction) {
-            return Err(ScrollPinError::InvalidViewportFraction);
-        }
-        let offset = self
-            .resolve_position(position)
-            .map_err(ScrollPinError::InvalidPosition)?;
-        // Re-pinning the same target follows its growth; moving an existing
-        // pin elsewhere eases there unless the platform asks for reduced motion.
-        let easing = match self.scroll_pin.take() {
-            Some(previous) => {
-                let moved = previous.viewport_fraction != viewport_fraction
-                    || self
-                        .model
-                        .position_for_anchor(previous.anchor)
-                        .map_or(true, |previous| previous.node_id() != position.node_id());
-                self.remove_scroll_pin_anchors(&previous);
-                (previous.easing || moved) && !cx.reduce_motion()
-            }
-            None => false,
-        };
-        let anchor = self.model.anchors.create_for_node(
-            offset,
-            if position.affinity() == Affinity::Before {
-                AnchorBias::Left
-            } else {
-                AnchorBias::Right
-            },
-            Some(position.node_id().clone()),
-            position.affinity(),
-        );
-        self.scroll_pin = Some(ScrollPin {
-            id: pin_id,
-            anchor,
-            viewport_fraction,
-            easing,
-            settling: false,
-            trail: None,
-        });
-        // A pending caret reveal still runs: it keeps the pin while the caret
-        // stays visible in editable text, and otherwise stops following.
-        self.clear_pending_viewport_anchor();
-        cx.notify();
-        Ok(())
-    }
-
-    pub fn pinned_scroll_id(&self) -> Option<&I> {
-        self.scroll_pin.as_ref().map(|pin| &pin.id)
-    }
-
-    /// Pins `position` like [`Self::pin_scroll`], holding it as low within
-    /// `fractions` as lets `trailing` end `clearance` above the viewport bottom.
-    /// The hold is recomputed from each layout, so trailing growth moves it.
-    pub fn pin_scroll_above(
-        &mut self,
-        pin_id: I,
-        position: &DocumentPosition<I>,
-        trailing: &DocumentPosition<I>,
-        clearance: Pixels,
-        fractions: RangeInclusive<f32>,
-        cx: &mut Context<Self>,
-    ) -> Result<(), ScrollPinError> {
-        let (min, max) = (*fractions.start(), *fractions.end());
-        if !max.is_finite() || !(min..=1.0).contains(&max) {
-            return Err(ScrollPinError::InvalidViewportFraction);
-        }
-        let trailing_offset = self
-            .resolve_position(trailing)
-            .map_err(ScrollPinError::InvalidPosition)?;
-        self.pin_scroll(pin_id, position, min, cx)?;
-        let anchor = self.model.anchors.create_for_node(
-            trailing_offset,
-            if trailing.affinity() == Affinity::Before {
-                AnchorBias::Left
-            } else {
-                AnchorBias::Right
-            },
-            Some(trailing.node_id().clone()),
-            trailing.affinity(),
-        );
-        let pin = self.scroll_pin.as_mut().expect("pin was just set");
-        pin.trail = Some(ScrollPinTrail {
-            anchor,
-            clearance,
-            max_fraction: max,
-        });
-        Ok(())
-    }
-
-    /// The fraction [`Self::pin_scroll_above`] would hold `position` at in the
-    /// last layout, or `None` when `position` is not laid out.
-    pub fn scroll_hold_fraction(
-        &self,
-        position: &DocumentPosition<I>,
-        trailing: &DocumentPosition<I>,
-        clearance: Pixels,
-        fractions: RangeInclusive<f32>,
-    ) -> Option<f32> {
-        self.resolve_position(position).ok()?;
-        let (_, anchor) = self.layout_point_for_position(position)?;
-        let viewport = self.list_state.viewport_bounds();
-        Some(self.hold_fraction(
-            anchor?.y,
-            self.layout_bottom_for_position(trailing),
-            clearance,
-            fractions,
-            viewport,
-        ))
-    }
-
-    fn hold_fraction(
-        &self,
-        anchor_y: Pixels,
-        trailing_bottom: Option<Pixels>,
-        clearance: Pixels,
-        fractions: RangeInclusive<f32>,
-        viewport: Bounds<Pixels>,
-    ) -> f32 {
-        // Trailing content without layout runs past the viewport.
-        let Some(bottom) = trailing_bottom.filter(|_| viewport.size.height > Pixels::ZERO) else {
-            return *fractions.start();
-        };
-        let held = (viewport.size.height - clearance - (bottom - anchor_y)) / viewport.size.height;
-        held.clamp(*fractions.start(), *fractions.end())
-    }
-
     fn layout_bottom_for_position(&self, position: &DocumentPosition<I>) -> Option<Pixels> {
         if let Some((point, line_height, _, _)) = self.text_position_for_position(position) {
             return Some(point.y + line_height);
         }
         let (_, point) = self.layout_point_for_position(position)?;
         point.map(|point| point.y)
-    }
-
-    fn remove_scroll_pin_anchors(&mut self, pin: &ScrollPin<I>) {
-        self.model.anchors.remove(pin.anchor);
-        if let Some(trail) = &pin.trail {
-            self.model.anchors.remove(trail.anchor);
-        }
-    }
-
-    /// Releases `pin_id` once it has been applied to the next layout, so a
-    /// final content change (such as collapsing) still lands where it was pinned.
-    pub fn settle_scroll_pin(&mut self, pin_id: &I, cx: &mut Context<Self>) -> bool {
-        let Some(pin) = self.scroll_pin.as_mut().filter(|pin| &pin.id == pin_id) else {
-            return false;
-        };
-        pin.settling = true;
-        pin.easing = false;
-        cx.notify();
-        true
-    }
-
-    pub fn unpin_scroll(&mut self, pin_id: &I, cx: &mut Context<Self>) -> bool {
-        let Some(pin) = self.scroll_pin.as_ref() else {
-            return false;
-        };
-        if &pin.id != pin_id {
-            return false;
-        }
-        let pin = self.scroll_pin.take().expect("scroll pin was present");
-        self.remove_scroll_pin_anchors(&pin);
-        cx.notify();
-        true
-    }
-
-    pub fn reveal_position(
-        &mut self,
-        position: &DocumentPosition<I>,
-        cx: &mut Context<Self>,
-    ) -> Result<(), PositionError> {
-        let offset = self.resolve_position(position)?;
-        self.stop_following(cx);
-        self.clear_pending_viewport_anchor();
-        let item_ix = self
-            .text_rows
-            .as_ref()
-            .and_then(|_| self.text_item_for_position(position))
-            .filter(|ix| matches!(&self.layout_items[*ix], DocumentLayoutItem::Text { node_id, .. } if node_id.as_ref() == Some(position.node_id())))
-            .unwrap_or_else(|| self.layout_item_for_source(offset));
-        if self
-            .text_rows
-            .as_ref()
-            .is_some_and(|rows| rows.is_wrapping())
-        {
-            // The target may still belong to one unwrapped source line. Keep
-            // its identity until the full wrap supplies its display-row index.
-            self.pending_viewport_anchor = Some(PendingViewportAnchor {
-                anchor: self.model.anchors.create_for_node(
-                    offset,
-                    AnchorBias::Right,
-                    Some(position.node_id().clone()),
-                    position.affinity(),
-                ),
-                viewport_y: self.list_state.viewport_bounds().top(),
-                reveal_on_wrap: true,
-            });
-            // Only already-declared geometry can be addressed immediately.
-            // Fresh text rows have no frame yet; their index must wait for
-            // List's next layout. Keep the intent for later row publications.
-            if matches!(&self.layout_items[item_ix], DocumentLayoutItem::Text { source, display, line, frame: Derived(Some(_)), wrapped, .. }
-                if wrapped.0.is_some() || (offset == source.start && display.start == line.start))
-            {
-                self.list_state.scroll_to_reveal_item(item_ix);
-            }
-        } else {
-            // At a soft-wrap boundary, affinity chooses the owning display row.
-            // A block's positions belong to the block, not to text beside it.
-            self.list_state.scroll_to_reveal_item(item_ix);
-        }
-        cx.notify();
-        Ok(())
-    }
-
-    pub fn reveal_caret(&mut self, cx: &mut Context<Self>) {
-        self.request_caret_reveal(cx);
-    }
-
-    fn stop_following(&mut self, cx: &mut Context<Self>) {
-        let Some(pin) = self.scroll_pin.take() else {
-            return;
-        };
-        self.remove_scroll_pin_anchors(&pin);
-        cx.emit(DocumentEvent::StopFollowingRequested { pin_id: pin.id });
-        cx.notify();
-    }
-
-    fn apply_scrollbar_input(&mut self, cx: &mut Context<Self>) {
-        if self.scrollbar_input_pending.replace(false) {
-            self.caret_reveal_pending = false;
-            if let Some(pending) = self.pending_viewport_anchor.take() {
-                self.model.anchors.remove(pending.anchor);
-            }
-            self.stop_following(cx);
-            cx.emit(DocumentEvent::ViewportScrolled);
-        }
     }
 
     pub fn remeasure_block(&mut self, id: &I, cx: &mut Context<Self>) -> bool {
@@ -3218,7 +2957,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// With text rows, layout resolves the node's frames and block heights again.
     pub fn remeasure_node(&mut self, id: &I, cx: &mut Context<Self>) -> bool {
         if self.text_rows.is_some() {
-            self.capture_viewport_anchor();
             let cleared = self.clear_row_geometry(|node| node == Some(id));
             if cleared {
                 cx.notify();
@@ -3242,7 +2980,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         if indices.is_empty() {
             return false;
         }
-        self.capture_viewport_anchor();
         for ix in indices {
             self.list_state.remeasure_items(ix..ix + 1);
         }
@@ -3331,7 +3068,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         while prefix < first_changed_item
             && prefix < self.layout_items.len()
             && prefix < next.len()
-            && self.layout_items[prefix].same_layout_identity(&next[prefix])
+            && self.layout_items[prefix].same_row(&next[prefix])
         {
             prefix += 1;
         }
@@ -3339,14 +3076,16 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         while suffix < self.layout_items.len().saturating_sub(prefix)
             && suffix < next.len().saturating_sub(prefix)
             && self.layout_items[self.layout_items.len() - 1 - suffix]
-                .same_layout_identity(&next[next.len() - 1 - suffix])
+                .same_row(&next[next.len() - 1 - suffix])
         {
             suffix += 1;
         }
         let old_end = self.layout_items.len() - suffix;
         let replacement_count = next.len() - prefix - suffix;
         if prefix != old_end || replacement_count != 0 {
+            self.before_list_splice();
             self.list_state.splice(prefix..old_end, replacement_count);
+            self.after_list_splice();
             // GPUI 0.3.5 splice does not re-arm measure_all. Keep retained
             // measurements, but measure every inserted/replaced item before
             // publishing the next scroll extent, including offscreen items.
@@ -3357,15 +3096,24 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         // Retained items keep the geometry layout derived for them.
         let split = next.len() - suffix;
         let (head, tail) = next.split_at_mut(split);
-        for (old, new) in self.layout_items.range(0..prefix).zip(head) {
-            new.keep_geometry(old);
-        }
-        for (old, new) in self
+        // Rows with a new owner keep their slot; their frames are resolved again.
+        let mut reowned = Vec::new();
+        let kept = self
             .layout_items
-            .range(old_end..self.layout_items.len())
-            .zip(tail)
-        {
+            .range(0..prefix)
+            .zip(head.iter_mut())
+            .zip(0..)
+            .chain(
+                self.layout_items
+                    .range(old_end..self.layout_items.len())
+                    .zip(tail.iter_mut())
+                    .zip(split..),
+            );
+        for ((old, new), ix) in kept {
             new.keep_geometry(old);
+            if old.node() != new.node() {
+                reowned.push(ix);
+            }
         }
         host::forget_touched_geometry(
             &self
@@ -3378,6 +3126,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         );
         let retired = std::mem::replace(&mut self.layout_items, next.into());
         self.retire_layout_items(retired);
+        self.reframe_rows(&reowned);
     }
 
     fn next_layout_items(&self) -> Vec<DocumentLayoutItem<I>> {
@@ -3637,7 +3386,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) {
         let first_item = self.layout_item_for_source(start);
-        self.capture_viewport_anchor();
         next.anchors = self.model.anchors.clone();
         next.selection = self.model.selection;
         next.anchors
@@ -3788,7 +3536,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
 
     fn finish_user_edit(&mut self, origin: EditOrigin, cx: &mut Context<Self>) {
         self.preferred_x = None;
-        self.request_caret_reveal(cx);
+        self.reveal_caret(cx);
         cx.emit(DocumentEvent::Changed {
             revision: self.model.revision,
             origin,
@@ -4061,7 +3809,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         };
         let display_len = self.model.display_text().len();
 
-        self.capture_viewport_anchor();
         for edit in transaction.edits() {
             self.model
                 .anchors
@@ -4418,7 +4165,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .replace_selection_positions(position.clone(), position)
                 .expect("navigation position must resolve");
         }
-        self.request_caret_reveal(cx);
+        self.reveal_caret(cx);
         cx.emit(DocumentEvent::SelectionChanged);
         cx.notify();
     }
@@ -4914,8 +4661,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         {
             self.stop_following(cx);
         }
-        self.clear_pending_viewport_anchor();
-        self.caret_reveal_pending = false;
+        self.cancel_caret_reveal();
         self.focus_handle.focus(window, cx);
         let Some(position) = position else {
             return;
@@ -4952,7 +4698,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.auto_scroll.last_drag_position = Some(event.position);
         self.extend_pointer_selection(cx);
         let delta = AutoScroll::compute_delta(event.position.y, self.list_state.viewport_bounds());
-        if self.scroll_pin.is_some()
+        if self.viewport.pin.is_some()
             && (delta.is_some()
                 || !self
                     .model
@@ -4962,7 +4708,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             self.stop_following(cx);
         }
         self.auto_scroll.set(delta, cx, |delta, state, cx| {
-            state.list_state.scroll_by(delta);
+            state.scroll_by(delta, cx);
             // Resolve the pointer again after prepaint supplies the newly
             // visible rows, not against the previous frame's text geometry.
             cx.notify();
@@ -5007,42 +4753,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         }
     }
 
-    fn capture_viewport_anchor(&mut self) {
-        if self.pending_viewport_anchor.is_some()
-            || self.scroll_pin.is_some()
-            || self.caret_reveal_pending
-        {
-            return;
-        }
-        if self.text_layouts.is_empty() && self.block_layouts.is_empty() {
-            return;
-        }
-        let viewport = self.list_state.viewport_bounds();
-        if viewport.size.height <= Pixels::ZERO {
-            return;
-        }
-        let probe = point(viewport.left(), viewport.top() + gpui::px(1.));
-        let Some(position) = self.position_for_point(probe) else {
-            return;
-        };
-        let Ok(offset) = self.resolve_position(&position) else {
-            return;
-        };
-        let viewport_y = self
-            .text_position_for_position(&position)
-            .map_or(probe.y, |(point, _, _, _)| point.y);
-        self.pending_viewport_anchor = Some(PendingViewportAnchor {
-            anchor: self.model.anchors.create_for_node(
-                offset,
-                AnchorBias::Right,
-                Some(position.node_id().clone()),
-                position.affinity(),
-            ),
-            viewport_y,
-            reveal_on_wrap: false,
-        });
-    }
-
     #[cfg(test)]
     fn screen_position_for_source(
         &self,
@@ -5055,6 +4765,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     }
 
     fn text_item_for_position(&self, position: &DocumentPosition<I>) -> Option<usize> {
+        if let Some((item_ix, _)) = self.node_end_row(position) {
+            return Some(item_ix);
+        }
         let offset = self.resolve_position(position).ok()?;
         let found =
             self.text_item_for_offset_in(position, offset, self.items_around_source(offset));
@@ -5104,9 +4817,16 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         &self,
         position: &DocumentPosition<I>,
     ) -> Option<(Point<Pixels>, Pixels, usize, Bounds<Pixels>)> {
-        let source = self.resolve_position(position).ok()?;
-        let display = self.model.source_to_display(source, position.affinity())?;
-        let item_ix = self.text_item_for_position(position)?;
+        let (item_ix, display) = match self.node_end_row(position) {
+            Some(row) => row,
+            None => {
+                let source = self.resolve_position(position).ok()?;
+                (
+                    self.text_item_for_position(position)?,
+                    self.model.source_to_display(source, position.affinity())?,
+                )
+            }
+        };
         let record = self
             .text_layouts
             .iter()
@@ -5214,241 +4934,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             })
     }
 
-    fn restore_pending_viewport_anchor(&mut self, cx: &mut Context<Self>) {
-        if self
-            .text_rows
-            .as_ref()
-            .is_some_and(|rows| rows.is_wrapping())
-        {
-            return;
-        }
-        let Some(pending) = self.pending_viewport_anchor.as_ref() else {
-            return;
-        };
-        let Ok(position) = self.model.position_for_anchor(pending.anchor) else {
-            return;
-        };
-        if pending.reveal_on_wrap {
-            // This callback runs after List::prepaint installs this frame's
-            // viewport height. The target need not already have text geometry.
-            if self.list_state.viewport_bounds().size.height <= Pixels::ZERO {
-                return;
-            }
-            let _ = self.reveal_position(&position, cx);
-            return;
-        }
-        let Some((position, _, _, _)) = self.text_position_for_position(&position) else {
-            return;
-        };
-        self.list_state.scroll_by(position.y - pending.viewport_y);
-        self.clear_pending_viewport_anchor();
-        cx.notify();
-    }
-
-    fn schedule_pending_viewport_restore(&mut self, cx: &mut Context<Self>) {
-        if self.pending_viewport_anchor.is_none() || self.viewport_restore_scheduled {
-            return;
-        }
-        self.viewport_restore_scheduled = true;
-        let entity = cx.entity();
-        cx.defer(move |cx| {
-            entity.update(cx, |state, cx| {
-                state.viewport_restore_scheduled = false;
-                state.restore_pending_viewport_anchor(cx);
-            });
-        });
-    }
-
-    fn schedule_scroll_pin_adjustment(&mut self, cx: &mut Context<Self>) {
-        if self.scroll_pin.is_none() || self.scroll_pin_adjustment_scheduled {
-            return;
-        }
-        self.scroll_pin_adjustment_scheduled = true;
-        let entity = cx.entity();
-        cx.defer(move |cx| {
-            entity.update(cx, |state, cx| {
-                state.scroll_pin_adjustment_scheduled = false;
-                state.enforce_scroll_pin(cx);
-            });
-        });
-    }
-
-    /// A caret reveal keeps a scroll pin while the caret stays visible in an
-    /// editable region, so typing beside followed content does not stop it.
-    fn request_caret_reveal(&mut self, cx: &mut Context<Self>) {
-        self.pause_blink_cursor(cx);
-        self.clear_pending_viewport_anchor();
-        self.caret_reveal_pending = true;
-        // Edits invalidate the current line's measurement. Decide whether to
-        // scroll only after the new layout, otherwise every insertion at EOF
-        // looks like a caret outside the viewport.
-        cx.notify();
-    }
-
-    fn clear_pending_viewport_anchor(&mut self) {
-        if let Some(pending) = self.pending_viewport_anchor.take() {
-            self.model.anchors.remove(pending.anchor);
-        }
-    }
-
-    fn schedule_caret_reveal(&mut self, cx: &mut Context<Self>) {
-        if !self.caret_reveal_pending || self.caret_reveal_scheduled {
-            return;
-        }
-        self.caret_reveal_scheduled = true;
-        let entity = cx.entity();
-        cx.defer(move |cx| {
-            entity.update(cx, |state, cx| {
-                state.caret_reveal_scheduled = false;
-                state.enforce_caret_reveal(cx);
-            });
-        });
-    }
-
-    fn enforce_caret_reveal(&mut self, cx: &mut Context<Self>) {
-        if !self.caret_reveal_pending {
-            return;
-        }
-        let Ok(caret) = self.model.position_for_anchor(self.model.selection.head()) else {
-            return;
-        };
-        let Some((position, line_height, _, _)) = self.text_position_for_position(&caret) else {
-            if self
-                .text_rows
-                .as_ref()
-                .is_some_and(|rows| rows.is_wrapping())
-            {
-                return;
-            }
-            if let Some(item_ix) = self.text_item_for_position(&caret) {
-                self.stop_following(cx);
-                if self.list_state.bounds_for_item(item_ix).is_some() {
-                    self.list_state.scroll_to_reveal_item(item_ix);
-                } else {
-                    self.list_state.scroll_to(ListOffset {
-                        item_ix,
-                        offset_in_item: Pixels::ZERO,
-                    });
-                }
-                cx.notify();
-            }
-            return;
-        };
-        let viewport = self.list_state.viewport_bounds();
-        if viewport.size.height <= Pixels::ZERO {
-            return;
-        }
-        self.caret_reveal_pending = false;
-        let position = point(position.x, position.y - self.unpainted_pin_scroll);
-        let top_limit = viewport.top() + line_height;
-        let bottom_limit = viewport.bottom() - line_height;
-        let delta = if position.y < top_limit {
-            position.y - top_limit
-        } else if position.y + line_height > bottom_limit {
-            position.y + line_height - bottom_limit
-        } else {
-            Pixels::ZERO
-        };
-        if delta.abs() >= px(0.5) || !self.is_editable_position(&caret) {
-            self.stop_following(cx);
-        }
-        if delta.abs() >= px(0.5) {
-            self.list_state.scroll_by(delta);
-            cx.notify();
-        }
-    }
-
     fn is_editable_position(&self, position: &DocumentPosition<I>) -> bool {
         self.region(position.node_id())
             .is_some_and(|region| region.policy() == EditPolicy::Editable)
-    }
-
-    fn enforce_scroll_pin(&mut self, cx: &mut Context<Self>) {
-        self.apply_scrollbar_input(cx);
-        if self.apply_scroll_pin(cx) && self.scroll_pin.as_ref().is_some_and(|pin| pin.settling) {
-            let pin = self.scroll_pin.take().expect("settling pin was present");
-            self.remove_scroll_pin_anchors(&pin);
-        }
-    }
-
-    /// Moves the viewport toward the pin; returns whether the pin was resolved
-    /// against laid-out geometry, so a settling pin may be released.
-    fn apply_scroll_pin(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some((anchor, viewport_fraction, easing)) = self
-            .scroll_pin
-            .as_ref()
-            .map(|pin| (pin.anchor, pin.viewport_fraction, pin.easing))
-        else {
-            return false;
-        };
-        let Ok(anchor_position) = self.model.position_for_anchor(anchor) else {
-            return true;
-        };
-        let Some((item_ix, position)) = self.layout_point_for_position(&anchor_position) else {
-            return true;
-        };
-        let Some(position) = position else {
-            if self.list_state.logical_scroll_top().item_ix != item_ix {
-                self.list_state.scroll_to(ListOffset {
-                    item_ix,
-                    offset_in_item: Pixels::ZERO,
-                });
-                cx.notify();
-            }
-            return false;
-        };
-        let viewport = self.list_state.viewport_bounds();
-        if viewport.size.height <= Pixels::ZERO {
-            return false;
-        }
-        let viewport_fraction = match self.scroll_pin.as_ref().and_then(|pin| pin.trail.as_ref()) {
-            Some(trail) => {
-                let bottom = self
-                    .model
-                    .position_for_anchor(trail.anchor)
-                    .ok()
-                    .and_then(|trailing| self.layout_bottom_for_position(&trailing));
-                self.hold_fraction(
-                    position.y,
-                    bottom,
-                    trail.clearance,
-                    viewport_fraction..=trail.max_fraction,
-                    viewport,
-                )
-            }
-            None => viewport_fraction,
-        };
-        let target_y = viewport.top() + viewport.size.height * viewport_fraction;
-        let mut delta = position.y - self.unpainted_pin_scroll - target_y;
-        if easing {
-            if delta.abs() <= PIN_EASE_SNAP {
-                if let Some(pin) = self.scroll_pin.as_mut() {
-                    pin.easing = false;
-                }
-            } else {
-                // Halve the distance each frame; the next layout continues.
-                delta = delta * 0.5;
-            }
-        }
-        if delta.abs() < px(0.5) {
-            return true;
-        }
-        let top = self.list_state.logical_scroll_top();
-        if delta < Pixels::ZERO && top.item_ix == 0 && top.offset_in_item <= Pixels::ZERO {
-            return true;
-        }
-        if delta > Pixels::ZERO
-            && self
-                .list_state
-                .bounds_for_item(self.layout_items.len().saturating_sub(1))
-                .is_some_and(|bounds| bounds.bottom() <= viewport.bottom())
-        {
-            return true;
-        }
-        self.list_state.scroll_by(delta);
-        self.unpainted_pin_scroll += delta;
-        cx.notify();
-        true
     }
 
     /// The layout item that owns `position` and its window point, when laid out.
@@ -5488,6 +4976,39 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         ))
     }
 
+    /// Where a node's end is drawn: the end of its last text row. The display
+    /// offset of the boundary lies after the line break the node's display
+    /// ends with, which anchored rows rely on, but that offset belongs to the
+    /// next row; a position before the boundary is drawn at the end of this one.
+    fn node_end_row(&self, position: &DocumentPosition<I>) -> Option<(usize, usize)> {
+        if position.affinity() != Affinity::Before {
+            return None;
+        }
+        let item_ix = self.node_end_item(position)?;
+        match &self.layout_items[item_ix] {
+            DocumentLayoutItem::Text { display, .. } => Some((item_ix, display.end)),
+            _ => None,
+        }
+    }
+
+    /// The last text row of `position`'s node, when `position` is that node's end.
+    fn node_end_item(&self, position: &DocumentPosition<I>) -> Option<usize> {
+        let region = self.region(position.node_id())?;
+        if position.offset() != region.range().len() {
+            return None;
+        }
+        let end = self
+            .layout_items
+            .partition_point(|item| item.source_start() <= region.range().end);
+        (0..end)
+            .rev()
+            .take_while(|ix| self.layout_items[*ix].source_start() >= region.range().start)
+            .find(|ix| {
+                matches!(&self.layout_items[*ix], DocumentLayoutItem::Text { node_id, .. }
+                    if node_id.as_ref() == Some(position.node_id()))
+            })
+    }
+
     /// Where `position` sits in the viewport, from 0 at the top to 1 at the
     /// bottom, or `None` when it is not laid out in the last frame.
     pub fn viewport_fraction(&self, position: &DocumentPosition<I>) -> Option<f32> {
@@ -5498,7 +5019,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         if viewport.size.height <= Pixels::ZERO {
             return None;
         }
-        Some((point.y - self.unpainted_pin_scroll - viewport.top()) / viewport.size.height)
+        Some((point.y - viewport.top()) / viewport.size.height)
     }
 
     /// Where the text of item `item_ix` was laid out this frame.
@@ -5516,7 +5037,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         display: Range<usize>,
         layout: impl Into<inline_objects::LineLayout>,
         bounds: Bounds<Pixels>,
-        cx: &mut Context<Self>,
     ) {
         let layout = layout.into();
         if let Some(record) = self
@@ -5536,9 +5056,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             });
             self.text_layouts.sort_by_key(|record| record.item_ix);
         }
-        self.schedule_pending_viewport_restore(cx);
-        self.schedule_scroll_pin_adjustment(cx);
-        self.schedule_caret_reveal(cx);
     }
 
     pub(super) fn update_block_layout(
@@ -5547,7 +5064,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         _id: I,
         source: Range<usize>,
         bounds: Bounds<Pixels>,
-        cx: &mut Context<Self>,
     ) {
         if let Some(record) = self
             .block_layouts
@@ -5563,9 +5079,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 bounds,
             });
         }
-        self.schedule_pending_viewport_restore(cx);
-        self.schedule_scroll_pin_adjustment(cx);
-        self.schedule_caret_reveal(cx);
     }
 
     pub(super) fn prepare_layout(
@@ -5574,7 +5087,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_scrollbar_input(cx);
         let layout_style = (window.text_style(), window.rem_size());
         let style_changed = self
             .layout_style
@@ -5585,46 +5097,13 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .is_some_and(|previous| previous.size.width != bounds.size.width);
         if style_changed || width_changed {
             self.preferred_x = None;
-            self.capture_viewport_anchor();
         }
         if style_changed {
             self.list_state.remeasure_items(0..self.layout_items.len());
         }
         self.layout_style = Some(layout_style);
         self.last_bounds = Some(bounds);
-        self.unpainted_pin_scroll = Pixels::ZERO;
-        if self.dynamic_trailer
-            && self.trailer_height != Some(bounds.size.height)
-            && bounds.size.height > Pixels::ZERO
-        {
-            // The viewport is known before List::prepaint measures its items.
-            // Include the actual trailer height in this frame's total.
-            self.trailer_height = Some(bounds.size.height);
-            if matches!(self.layout_items.last(), Some(DocumentLayoutItem::Trailer)) {
-                let index = self.layout_items.len() - 1;
-                if self.text_rows.is_some() {
-                    self.list_state
-                        .set_item_heights(index, [Some(bounds.size.height)]);
-                } else {
-                    self.list_state.remeasure_items(index..index + 1);
-                }
-            }
-        }
         self.prepare_text_rows(bounds, window, cx);
-        // A reveal that waited for rows can find its row now, before the list
-        // lays out this frame, when the list keeps last frame's viewport.
-        // Otherwise it waits until the list has laid out the new viewport.
-        if self
-            .pending_viewport_anchor
-            .as_ref()
-            .is_some_and(|pending| pending.reveal_on_wrap)
-            && self.list_state.viewport_bounds().size == bounds.size
-        {
-            self.restore_pending_viewport_anchor(cx);
-        }
-        self.text_layouts.clear();
-        self.block_layouts.clear();
-        self.trailer_layout = None;
     }
 
     pub(super) fn update_trailer_layout(&mut self, item_ix: usize, bounds: Bounds<Pixels>) {
@@ -6113,6 +5592,7 @@ impl<I: Clone + Eq + Hash + 'static> Render for DocumentState<I> {
         let entity = cx.entity();
         if !self.scroll_handler_installed {
             self.scroll_handler_installed = true;
+            self.install_scroll_resolver(cx);
             let weak = entity.downgrade();
             self.list_state.set_scroll_handler(move |event, _, cx| {
                 if !event.is_scrolled {
@@ -6121,22 +5601,7 @@ impl<I: Clone + Eq + Hash + 'static> Render for DocumentState<I> {
                 let Some(entity) = weak.upgrade() else {
                     return;
                 };
-                entity.update(cx, |state, cx| {
-                    state.caret_reveal_pending = false;
-                    if state
-                        .text_rows
-                        .as_ref()
-                        .is_some_and(|rows| rows.is_wrapping())
-                        || state
-                            .pending_viewport_anchor
-                            .as_ref()
-                            .is_some_and(|pending| pending.reveal_on_wrap)
-                    {
-                        state.clear_pending_viewport_anchor();
-                    }
-                    state.stop_following(cx);
-                    cx.emit(DocumentEvent::ViewportScrolled);
-                });
+                entity.update(cx, |state, cx| state.list_scrolled(cx));
             });
         }
         let list_entity = entity.clone();
@@ -6216,8 +5681,8 @@ mod readonly_composition_tests;
 mod tests {
     use super::*;
     use gpui::{
-        Entity, FontWeight, IntoElement, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent,
-        TestAppContext, VisualTestContext, point, px,
+        Entity, FontWeight, IntoElement, ListOffset, Modifiers, MouseButton, ScrollDelta,
+        ScrollWheelEvent, TestAppContext, VisualTestContext, point, px,
     };
 
     use crate::{Theme, document::ProjectionSpan};
@@ -7020,7 +6485,10 @@ mod tests {
                 );
                 assert_eq!(document.text(), "historya中cd🙂f");
                 assert_eq!(document.selected_range(), 17..17);
-                assert!(document.caret_reveal_pending);
+                assert!(matches!(
+                    document.viewport.reveal,
+                    Some(viewport::Reveal::Caret)
+                ));
                 document.undo(&Undo, window, cx);
                 assert_eq!(document.text(), "historyabcdef");
                 assert_eq!(document.selected_positions().unwrap(), selection);
@@ -7131,7 +6599,6 @@ mod tests {
                     )
                     .unwrap();
                 assert_eq!(document.selected_range(), 2..2);
-                document.apply_scrollbar_input(cx);
                 assert_eq!(document.pinned_scroll_id(), Some(&"new-pin"));
                 assert_eq!(document.apply_transaction(stale, cx), EditDecision::Reject);
                 assert_eq!(document.text(), "new");
@@ -8160,7 +7627,7 @@ mod tests {
         cx.update(|window, cx| {
             document.update(cx, |document, cx| {
                 document.set_selection(history_len..history_len, false, cx);
-                document.request_caret_reveal(cx);
+                document.reveal_caret(cx);
             });
             let _ = window.draw(cx);
             let _ = window.draw(cx);
@@ -8622,18 +8089,19 @@ mod tests {
         let document = document.unwrap();
         let mut cx = VisualTestContext::from_window(window.into(), cx);
         let anchor = DocumentPosition::new("history", 9 * 150, Affinity::After);
-        // Returns whether the pin eases to its place. The test window redraws
-        // until idle, so the approach completes within each update.
+        // Returns whether the pin eases to its place over the next frames.
         let pin = |fraction: f32, cx: &mut VisualTestContext| {
             cx.update(|_, cx| {
                 document.update(cx, |document, cx| {
                     document.pin_scroll("run", &anchor, fraction, cx).unwrap();
-                    document.scroll_pin.as_ref().unwrap().easing
+                    document.viewport.pin.as_ref().unwrap().is_easing()
                 })
             })
         };
+        // One frame: an easing pin asks for the next one.
         let draw = |cx: &mut VisualTestContext| {
             cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
                 let _ = window.draw(cx);
             });
         };
@@ -8662,7 +8130,7 @@ mod tests {
         // Moving it approaches the new place over several frames, then
         // tracks the same target directly.
         assert!(pin(0.8, &mut cx));
-        for _ in 0..3 {
+        for _ in 0..12 {
             draw(&mut cx);
         }
         assert!((fraction(&mut cx) - 0.8).abs() < 0.01);
