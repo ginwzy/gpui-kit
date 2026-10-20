@@ -285,11 +285,7 @@ impl Wrap {
                 || advance(&mut wrappers[font_at(ix)], cluster, self.point.x),
                 |(_, width)| *width,
             );
-            let width = if self.prefix.is_empty() && self.points.is_empty() {
-                self.widths.0
-            } else {
-                self.widths.1
-            };
+            let width = self.row_width();
             let end = ix + cluster.len();
             let broke = (self.point.x + amount > width || end - self.point.row > MAX_ROW_BYTES)
                 && ix > self.point.row;
@@ -315,11 +311,20 @@ impl Wrap {
         }
     }
 
+    /// The first row of a physical line has its own width (widths.0).
+    fn row_width(&self) -> Pixels {
+        if self.prefix.is_empty() && self.points.is_empty() {
+            self.widths.0
+        } else {
+            self.widths.1
+        }
+    }
+
     fn start_row(&mut self, line: &str, start: usize) -> bool {
         self.point.next = start;
         self.point.row = start;
         self.point.x = px(0.);
-        self.point.previous = line[..start].chars().next_back().unwrap_or_default();
+        self.point.previous = char_before(line, start);
         self.candidate = None;
         self.points.push(self.point);
         if let Some((old, suffix, delta)) = &self.reuse
@@ -351,11 +356,8 @@ impl Wrap {
         cancelled: &AtomicBool,
     ) -> Option<usize> {
         let start = self.point.row;
-        let width = if self.prefix.is_empty() && self.points.is_empty() {
-            self.widths.0
-        } else {
-            self.widths.1
-        };
+        // Tolerate rounding noise between shaped and painted widths.
+        let limit = self.row_width() + px(0.01);
         // The checkpoint at this row's start records whether the physical line
         // has passed its indentation. The current scan may already have done so.
         let row_indented = self
@@ -370,15 +372,8 @@ impl Wrap {
             if cancelled.load(Ordering::Relaxed) {
                 return None;
             }
-            let (drawn, fit) = measure_row(
-                line,
-                runs,
-                wrappers,
-                &self.objects,
-                start..end,
-                width + px(0.01),
-            );
-            if drawn <= width + px(0.01) {
+            let (drawn, fit) = measure_row(line, runs, wrappers, &self.objects, start..end, limit);
+            if drawn <= limit {
                 return Some(end);
             }
             let clusters = clusters.get_or_insert_with(|| {
@@ -398,7 +393,7 @@ impl Wrap {
                 .max(1);
             end = clusters[count - 1].0 + clusters[count - 1].1.len();
             let mut indented = row_indented;
-            let mut previous = line[..start].chars().next_back().unwrap_or_default();
+            let mut previous = char_before(line, start);
             let mut preferred = None;
             for &(ix, cluster) in clusters.iter().take_while(|(ix, _)| *ix <= end) {
                 let first = cluster.chars().next().unwrap_or_default();
@@ -427,6 +422,10 @@ impl Wrap {
         }
         self.prefix
     }
+}
+
+fn char_before(line: &str, ix: usize) -> char {
+    line[..ix].chars().next_back().unwrap_or_default()
 }
 
 fn can_break(previous: char, first: char, indented: bool, objects: bool) -> bool {
