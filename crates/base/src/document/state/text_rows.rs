@@ -53,6 +53,8 @@ const REWRAP_IN_FRAME_BYTES: usize = 32 * 1024;
 /// At most this many lines go to one background wrap. Preparing them reads
 /// the model on the UI thread; the rest go to the next wrap once it lands.
 const BACKGROUND_LINES_PER_WRAP: usize = 4096;
+/// Display rows one publication step builds and attaches, lines in view included.
+const ROW_BATCH: usize = 512;
 /// Frames the width must hold before a resize's whole pass runs.
 const RESIZE_QUIET_FRAMES: u8 = 2;
 /// How far past the viewport, in viewport heights, rows count as in view.
@@ -2580,10 +2582,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.schedule_row_publication(cx);
     }
 
-    /// Attaches the queued lines in `view` now, whatever the batch budget: the
-    /// frame that wraps the lines it shows also shows their rows. The queue
-    /// otherwise attaches from the last line, so lines before an attached one
-    /// keep their indices; lines after these move by the rows they gained.
+    /// Attaches queued lines in `view` now, within one batch's budget: the
+    /// frame that wraps the lines it shows also shows their rows. Only whole
+    /// lines attach here; one with more rows than the budget keeps its place
+    /// and publishes across batches like any other. The queue otherwise
+    /// attaches from the last line, so lines before an attached one keep
+    /// their indices; lines after these move by the rows they gained.
     fn publish_rows_in_view(&mut self, view: Range<usize>, cx: &mut Context<Self>) {
         let Some(state) = self.text_rows.as_mut() else {
             return;
@@ -2598,23 +2602,31 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let last = work
             .lines
             .partition_point(|(rows, _, _)| rows.end > view.start);
-        if first >= last {
+        // The adjacent run of lines in view that fits the budget, skipping
+        // leading lines that alone exceed it.
+        let rows = |ix: usize| work.lines[ix].2.len() + 1;
+        let Some(start) = (first..last).find(|&ix| rows(ix) <= ROW_BATCH) else {
             return;
+        };
+        let (mut end, mut budget) = (start, ROW_BATCH);
+        while end < last && rows(end) <= budget {
+            budget -= rows(end);
+            end += 1;
         }
         // A partly built line in view restarts with the others.
-        if first == 0 && work.row > 0 {
+        if start == 0 && work.row > 0 {
             state.retired.push((
                 std::mem::take(&mut work.items),
                 std::mem::replace(&mut work.heights, gpui::PreparedListItems::new()),
             ));
             work.row = 0;
         }
-        let shown: std::collections::VecDeque<_> = work.lines.drain(first..last).collect();
+        let shown: std::collections::VecDeque<_> = work.lines.drain(start..end).collect();
         let gained = shown
             .iter()
             .map(|(rows, _, starts)| (starts.len() + 1) as isize - rows.len() as isize)
             .sum::<isize>();
-        for (rows, _, _) in work.lines.range_mut(..first) {
+        for (rows, _, _) in work.lines.range_mut(..start) {
             *rows = rows.start.wrapping_add_signed(gained)..rows.end.wrapping_add_signed(gained);
         }
         let rest = state.publishing.replace(RowPublication {
@@ -2623,7 +2635,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             heights: gpui::PreparedListItems::new(),
             row: 0,
         });
-        self.advance_rows(usize::MAX, cx);
+        self.advance_rows(ROW_BATCH - budget, cx);
         debug_assert!(
             self.text_rows
                 .as_ref()
@@ -2685,7 +2697,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// Adjacent lines completed in one batch attach together: one splice of
     /// each tree per run, however many small lines the run holds.
     fn advance_row_publication(&mut self, cx: &mut Context<Self>) {
-        const ROW_BATCH: usize = 512;
         self.advance_rows(ROW_BATCH, cx);
     }
 
@@ -3942,13 +3953,23 @@ mod tests {
         VisualTestContext,
         String,
     ) {
-        let (document, mut cx) = super::super::tests::document_view(cx);
-        cx.simulate_resize(size(px(320.), px(400.)));
-        draw(&mut cx);
         let text = (0..lines)
             .map(|line| format!("{line:05} {}", "words that wrap ".repeat(8)))
             .collect::<Vec<_>>()
             .join("\n");
+        let first = text.lines().next().unwrap().to_owned();
+        let (document, cx) = opened_text(text, cx);
+        (document, cx, first)
+    }
+
+    /// `text`, read-only, opened with text rows as `long_lines` opens its text.
+    fn opened_text(
+        text: String,
+        cx: &mut TestAppContext,
+    ) -> (Entity<DocumentState<&'static str>>, VisualTestContext) {
+        let (document, mut cx) = super::super::tests::document_view(cx);
+        cx.simulate_resize(size(px(320.), px(400.)));
+        draw(&mut cx);
         document.update(&mut cx, |doc, cx| {
             doc.reset(
                 DocumentSnapshot::new(
@@ -3967,8 +3988,7 @@ mod tests {
             .unwrap();
             doc.set_text_rows(Some(TextRows::new()), cx);
         });
-        let first = text.lines().next().unwrap().to_owned();
-        (document, cx, first)
+        (document, cx)
     }
 
     #[gpui::test]
@@ -3983,6 +4003,40 @@ mod tests {
         settle_rows(&document, &mut cx);
         assert_declared_geometry(&document, &mut cx);
         assert_eq!(line_rows(&document, "text", &mut cx)[0], rows[0]);
+    }
+
+    #[gpui::test]
+    fn a_line_in_view_with_more_rows_than_a_batch_publishes_in_batches(cx: &mut TestAppContext) {
+        let short = format!("short {}", "words that wrap ".repeat(8));
+        let long = format!("long {}", "words that wrap ".repeat(4000));
+        let text = format!("{short}\n{long}\n{short}");
+        assert!(text.len() < FIRST_WRAP_IN_FRAME_BYTES);
+        let (document, mut cx) = opened_text(text, cx);
+        let rows = line_rows(&document, "text", &mut cx);
+        assert!(rows[0].len() < short.len(), "{:?}", rows[0]);
+        // The long line wraps in the background, then, though in view, is
+        // built across batches rather than in the update its wrap lands in.
+        let mut across_batches = false;
+        for _ in 0..10000 {
+            draw(&mut cx);
+            let (partial, laying_out) = document.read_with(&cx, |doc, _| {
+                let partial = doc
+                    .text_rows
+                    .as_ref()
+                    .and_then(|state| state.publishing.as_ref())
+                    .is_some_and(|work| work.row > 0);
+                (partial, doc.is_laying_out_text())
+            });
+            across_batches |= partial;
+            if !laying_out {
+                break;
+            }
+        }
+        assert!(across_batches);
+        assert_declared_geometry(&document, &mut cx);
+        let settled = line_rows(&document, "text", &mut cx);
+        assert_eq!(settled[0], rows[0]);
+        assert!(settled.len() > ROW_BATCH, "{}", settled.len());
     }
 
     #[gpui::test]
