@@ -173,6 +173,7 @@ pub struct DocumentInlineStyle {
     source: Range<usize>,
     highlight: HighlightStyle,
     font_family: Option<SharedString>,
+    link: Option<SharedString>,
 }
 
 impl DocumentInlineStyle {
@@ -186,11 +187,21 @@ impl DocumentInlineStyle {
             source,
             highlight,
             font_family: None,
+            link: None,
         }
     }
 
     pub fn font_family(mut self, font_family: impl Into<SharedString>) -> Self {
         self.font_family = Some(font_family.into());
+        self
+    }
+
+    /// Makes the styled text a link to `target`. Pointing at it shows a hand
+    /// cursor, and a click that selects nothing emits
+    /// [`DocumentEvent::LinkClicked`](super::DocumentEvent::LinkClicked).
+    /// The document does not interpret the target.
+    pub fn with_link(mut self, target: impl Into<SharedString>) -> Self {
+        self.link = Some(target.into());
         self
     }
 
@@ -204,6 +215,10 @@ impl DocumentInlineStyle {
 
     pub fn font_family_override(&self) -> Option<&SharedString> {
         self.font_family.as_ref()
+    }
+
+    pub fn link(&self) -> Option<&SharedString> {
+        self.link.as_ref()
     }
 }
 

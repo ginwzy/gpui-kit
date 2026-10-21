@@ -142,12 +142,24 @@ impl<I: Clone + Eq + Hash + 'static> Element for DocumentElement<I> {
             cx,
         );
         self.content.paint(window, cx);
+        // After the content, whose rows may request their own cursor.
+        if hitbox.is_hovered(window)
+            && self
+                .state
+                .read(cx)
+                .link_at_point(window.mouse_position())
+                .is_some()
+        {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
         // A selection drag belongs to the document that received the press,
         // including moves/releases over embedded controls or outside its bounds.
         let state = self.state.clone();
+        let pointer = hitbox.clone();
         window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, window, cx| {
             if !phase.bubble() {
-                state.update(cx, |state, cx| state.mouse_move(event, window, cx));
+                let hovered = pointer.is_hovered(window);
+                state.update(cx, |state, cx| state.mouse_move(event, hovered, window, cx));
             }
         });
         let state = self.state.clone();

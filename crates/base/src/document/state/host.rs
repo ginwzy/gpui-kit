@@ -616,6 +616,7 @@ impl<I: Eq> HostEditPresentation<'_, I> {
                 shifted(old.source(), shift) == new.source()
                     && old.highlight() == new.highlight()
                     && old.font_family_override() == new.font_family_override()
+                    && old.link() == new.link()
             },
             super::DocumentInlineStyle::source,
         )

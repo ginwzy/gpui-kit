@@ -246,6 +246,9 @@ pub enum DocumentEvent<I> {
     },
     /// The user moved the viewport with the wheel or scrollbar.
     ViewportScrolled,
+    /// A click that selected nothing landed on text styled
+    /// [`with_link`](super::DocumentInlineStyle::with_link); carries its target.
+    LinkClicked(SharedString),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2516,6 +2519,9 @@ pub struct DocumentState<I> {
     last_bounds: Option<Bounds<Pixels>>,
     layout_style: Option<(gpui::TextStyle, Pixels)>,
     auto_scroll: AutoScroll,
+    /// Source range of the link under the pointer, and of the one pressed.
+    hovered_link: Option<Range<usize>>,
+    pressed_link: Option<Range<usize>>,
     undo: DocumentUndoManager<I>,
     preferred_x: Option<Pixels>,
     dynamic_trailer: bool,
@@ -2623,6 +2629,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             last_bounds: None,
             layout_style: None,
             auto_scroll: AutoScroll::default(),
+            hovered_link: None,
+            pressed_link: None,
             undo: DocumentUndoManager::default(),
             preferred_x: None,
             dynamic_trailer: false,
@@ -4599,6 +4607,41 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         }
     }
 
+    /// The source range of the link whose glyph is under `point`, and its
+    /// target. Unlike caret placement this is exact: the gap beside a line,
+    /// its end or an embedded block is not a link.
+    pub(super) fn link_at_point(
+        &self,
+        point: Point<Pixels>,
+    ) -> Option<(Range<usize>, SharedString)> {
+        if self
+            .block_layouts
+            .iter()
+            .any(|block| block.bounds.contains(&point))
+        {
+            return None;
+        }
+        let record = self
+            .text_layouts
+            .iter()
+            .find(|record| record.bounds.contains(&point))?;
+        let local = record.layout.index_at(point)?;
+        let offset = self
+            .model
+            .display_to_source(record.display.start + local, Affinity::After)?;
+        let inline = self.model.styles.inline();
+        inline[inline.partition_point(|style| style.source().end <= offset)..]
+            .iter()
+            .take_while(|style| style.source().start <= offset)
+            .find_map(|style| {
+                let link = style.link()?;
+                style
+                    .source()
+                    .contains(&offset)
+                    .then(|| (style.source(), link.clone()))
+            })
+    }
+
     fn text_position_for_point(
         &self,
         record: &TextLayoutRecord,
@@ -4669,6 +4712,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             return;
         }
         self.auto_scroll.stop();
+        self.pressed_link = (!event.modifiers.shift && event.click_count == 1)
+            .then(|| self.link_at_point(event.position))
+            .flatten()
+            .map(|(source, _)| source);
         let position = self.position_for_point(event.position);
         // Placing the caret in editable text beside followed content keeps
         // following; selecting other content is a deliberate inspection.
@@ -4703,11 +4750,21 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     pub(super) fn mouse_move(
         &mut self,
         event: &MouseMoveEvent,
+        hovered: bool,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if event.pressed_button != Some(gpui::MouseButton::Left) {
             self.auto_scroll.stop();
+            let link = hovered
+                .then(|| self.link_at_point(event.position))
+                .flatten()
+                .map(|(source, _)| source);
+            if link != self.hovered_link {
+                // The element picks the cursor while painting.
+                self.hovered_link = link;
+                cx.notify();
+            }
             return;
         }
         if self.auto_scroll.last_drag_position.is_none() {
@@ -4733,9 +4790,23 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         });
     }
 
-    pub(super) fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        if event.button == gpui::MouseButton::Left {
-            self.auto_scroll.stop();
+    pub(super) fn mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != gpui::MouseButton::Left {
+            return;
+        }
+        self.auto_scroll.stop();
+        // A drag that selected text, even within the link, is not a click.
+        if let Some(pressed) = self.pressed_link.take()
+            && self.selected_range().is_empty()
+            && let Some((source, target)) = self.link_at_point(event.position)
+            && source == pressed
+        {
+            cx.emit(DocumentEvent::LinkClicked(target));
         }
     }
 
@@ -5702,6 +5773,7 @@ mod tests {
         Entity, FontWeight, IntoElement, ListOffset, Modifiers, MouseButton, ScrollDelta,
         ScrollWheelEvent, TestAppContext, VisualTestContext, point, px,
     };
+    use std::cell::RefCell;
 
     use crate::{Theme, document::ProjectionSpan};
 
@@ -7151,6 +7223,82 @@ mod tests {
             assert_eq!(document.text(), "historyx");
             assert_eq!(document.selected_range(), 8..8);
         });
+    }
+
+    #[gpui::test]
+    fn clicking_link_text_reports_its_target_unless_it_selects(cx: &mut TestAppContext) {
+        let (document, mut cx) = document_view(cx);
+        let clicked = Rc::new(RefCell::new(Vec::new()));
+        let observed = clicked.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&document, move |_, event, _| {
+                if let DocumentEvent::LinkClicked(target) = event {
+                    observed.borrow_mut().push(target.clone());
+                }
+            })
+        });
+        let glyph = |offset: usize, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                document.update(cx, |document, cx| {
+                    let bounds = document.last_bounds.unwrap();
+                    let start = document
+                        .bounds_for_range(offset..offset, bounds, window, cx)
+                        .unwrap();
+                    let end = document
+                        .bounds_for_range(offset + 1..offset + 1, bounds, window, cx)
+                        .unwrap();
+                    point(
+                        (start.left() + end.left()) / 2.,
+                        start.top() + start.size.height / 2.,
+                    )
+                })
+            })
+        };
+        cx.update(|_, cx| {
+            document.update(cx, |document, cx| {
+                document
+                    .set_node_inline_styles(
+                        &"history",
+                        vec![
+                            super::super::DocumentInlineStyle::new(2..5, Default::default())
+                                .with_link("https://example.com"),
+                        ],
+                        cx,
+                    )
+                    .unwrap();
+            });
+        });
+
+        let inside = glyph(3, &mut cx);
+        cx.simulate_mouse_move(inside, None, Modifiers::default());
+        document.read_with(&cx, |document, _| {
+            assert_eq!(document.hovered_link, Some(2..5));
+        });
+        cx.simulate_mouse_down(inside, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(inside, MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            *clicked.borrow(),
+            vec![SharedString::from("https://example.com")]
+        );
+
+        let outside = glyph(0, &mut cx);
+        cx.simulate_mouse_move(outside, None, Modifiers::default());
+        document.read_with(&cx, |document, _| {
+            assert_eq!(document.hovered_link, None);
+        });
+        cx.simulate_mouse_down(outside, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::default());
+
+        // Selecting the link's text by dragging across it opens nothing.
+        let (start, end) = (glyph(2, &mut cx), glyph(4, &mut cx));
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        document.read_with(&cx, |document, _| {
+            assert!(!document.selected_range().is_empty());
+        });
+        assert_eq!(clicked.borrow().len(), 1);
     }
 
     #[gpui::test]

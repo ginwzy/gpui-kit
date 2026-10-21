@@ -80,6 +80,19 @@ impl LineLayout {
         }
     }
 
+    /// The display index of the glyph under `point`, if any; objects have none.
+    pub(super) fn index_at(&self, point: Point<Pixels>) -> Option<usize> {
+        match self {
+            Self::Text(layout) => layout.index_for_position(point).ok(),
+            Self::Inline { parts, .. } => {
+                let part = parts
+                    .iter()
+                    .find(|part| part.bounds.left() <= point.x && point.x < part.bounds.right())?;
+                Some(part.display.start + part.text.as_ref()?.index_for_position(point).ok()?)
+            }
+        }
+    }
+
     pub(super) fn closest_index(&self, point: Point<Pixels>, text: &str) -> usize {
         match self {
             Self::Text(layout) => layout.line_layout_for_index(0).map_or(0, |line| {
