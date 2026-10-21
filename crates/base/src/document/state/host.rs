@@ -24,6 +24,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         snapshot: DocumentSnapshot<I>,
         cx: &mut Context<Self>,
     ) -> Result<(), HostTransactionError> {
+        self.settle_list_scroll();
         if revision != self.model.revision {
             return Err(HostTransactionError::StaleRevision);
         }

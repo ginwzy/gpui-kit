@@ -26,8 +26,9 @@ pub use projection::{DocumentProjection, ProjectionError, ProjectionMapping, Pro
 pub use region::{DocumentRegion, DocumentRegions, EditPolicy, RegionError};
 pub use state::{
     DocumentEditRejection, DocumentEvent, DocumentSnapshot, DocumentState, DocumentStructure,
-    DocumentTextContext, HostTransactionError, PresentationError, RoutedEdit, ScrollPinError,
-    StructureError, StructureReplacement, StructureReplay, TextFrame, TextRows, UndoCheckpoint,
+    DocumentTextContext, HostTransactionError, PresentationError, RoutedEdit, ScrollHold,
+    ScrollPinError, StructureError, StructureReplacement, StructureReplay, TextFrame, TextRows,
+    UndoCheckpoint,
 };
 pub use style::{DocumentInlineStyle, DocumentParagraphStyle, DocumentStyleError, DocumentStyles};
 pub use transaction::{EditDecision, EditOrigin, EditTransaction, TextEdit, TransactionError};

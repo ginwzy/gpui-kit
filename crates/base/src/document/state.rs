@@ -61,6 +61,7 @@ mod style_tests;
 pub use inline_objects::StructureReplacement;
 pub(super) use text_rows::RowFrame;
 pub use text_rows::{TextFrame, TextRows};
+pub use viewport::ScrollHold;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentEditRejection {
@@ -2904,6 +2905,21 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         ))
     }
 
+    /// Where a caret at `position` was painted in the last frame, in window
+    /// coordinates, whether or not it is in view.
+    pub fn position_bounds(&self, position: &DocumentPosition<I>) -> Option<Bounds<Pixels>> {
+        self.resolve_position(position).ok()?;
+        let (origin, line_height, _, _) = self.text_position_for_position(position)?;
+        Some(Bounds::new(origin, gpui::size(px(1.), line_height)))
+    }
+
+    /// Where the IME composition in progress starts: the text before it is
+    /// committed, the marked text after it is not.
+    pub fn composition_start(&self) -> Option<DocumentPosition<I>> {
+        let marked = self.model.marked?;
+        self.model.position_for_anchor(marked.anchor()).ok()
+    }
+
     /// The window rem size used by the last layout.
     pub fn rem_size(&self) -> Option<Pixels> {
         self.layout_style.as_ref().map(|(_, rem_size)| *rem_size)
@@ -2918,8 +2934,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// placement. Returns `None` when the caret has no visible text geometry.
     pub fn caret_bounds(&self) -> Option<Bounds<Pixels>> {
         let (_, head) = self.selected_positions().ok()?;
-        let (origin, line_height, _, _) = self.text_position_for_position(&head)?;
-        let bounds = Bounds::new(origin, gpui::size(px(1.), line_height));
+        let bounds = self.position_bounds(&head)?;
         let visible = bounds.intersect(&self.list_state.viewport_bounds());
         (visible.size.width > Pixels::ZERO && visible.size.height > Pixels::ZERO).then_some(bounds)
     }
@@ -2941,6 +2956,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.dynamic_trailer
     }
 
+    #[cfg(test)]
     fn layout_bottom_for_position(&self, position: &DocumentPosition<I>) -> Option<Pixels> {
         if let Some((point, line_height, _, _)) = self.text_position_for_position(position) {
             return Some(point.y + line_height);
@@ -3083,9 +3099,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let old_end = self.layout_items.len() - suffix;
         let replacement_count = next.len() - prefix - suffix;
         if prefix != old_end || replacement_count != 0 {
-            self.before_list_splice();
-            self.list_state.splice(prefix..old_end, replacement_count);
-            self.after_list_splice();
+            self.splice_list(|list| list.splice(prefix..old_end, replacement_count));
             // GPUI 0.3.5 splice does not re-arm measure_all. Keep retained
             // measurements, but measure every inserted/replaced item before
             // publishing the next scroll extent, including offscreen items.
@@ -3385,6 +3399,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         origin: EditOrigin,
         cx: &mut Context<Self>,
     ) {
+        self.settle_list_scroll();
         let first_item = self.layout_item_for_source(start);
         next.anchors = self.model.anchors.clone();
         next.selection = self.model.selection;
@@ -3406,6 +3421,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         composition_selection: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) -> EditDecision<I> {
+        self.settle_list_scroll();
         let origin = transaction.origin();
         if !matches!(
             origin,
@@ -3666,6 +3682,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         styles: Option<DocumentStyles>,
         cx: &mut Context<Self>,
     ) -> Result<(), HostTransactionError> {
+        self.settle_list_scroll();
         if transaction.origin() != EditOrigin::Host {
             return Err(HostTransactionError::InvalidOrigin);
         }
@@ -3881,6 +3898,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let UndoKind::Text { region_id, changes } = &record.kind else {
             return false;
         };
+        self.settle_list_scroll();
         // Replay into a tentative model, so a missing node, changed source or
         // invalid presentation rejects the whole record before any live write.
         let mut model = self.model.clone();
@@ -8229,8 +8247,9 @@ mod tests {
             document.read_with(cx, |document, _| {
                 let draft = draft_end(document);
                 let held = document
-                    .scroll_hold_fraction(&target, &draft, clearance, 0.3..=0.9)
-                    .unwrap();
+                    .scroll_hold(&target, &draft, clearance, 0.3..=0.9)
+                    .unwrap()
+                    .fraction();
                 assert!((document.viewport_fraction(&target).unwrap() - held).abs() < 0.01);
                 assert_eq!(document.pinned_scroll_id(), Some(&"run"));
                 let viewport = document.list_state.viewport_bounds();

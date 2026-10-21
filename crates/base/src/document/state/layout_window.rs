@@ -170,9 +170,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         // From the end, so earlier lines keep their indices.
         for (items, replacement) in splices.into_iter().rev() {
             refit = true;
-            self.before_list_splice();
-            self.list_state.splice(items.clone(), replacement.len());
-            self.after_list_splice();
+            self.splice_list(|list| list.splice(items.clone(), replacement.len()));
             let retired = self.layout_items.splice(items, replacement);
             self.retire_layout_items(retired);
         }
@@ -284,9 +282,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let changed = old.start + prefix..old.end - suffix;
         let count = replacement.len() - prefix - suffix;
         if !changed.is_empty() || count != 0 {
-            self.before_list_splice();
-            self.list_state.splice(changed, count);
-            self.after_list_splice();
+            self.splice_list(|list| list.splice(changed, count));
             self.list_state.clone().measure_all();
         }
         let split = replacement.len() - suffix;

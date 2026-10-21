@@ -1507,12 +1507,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 &display_line,
                 item.presentation(),
             ))]);
-            self.before_list_splice();
+            // The list first: its splice anchors the viewport by the items it replaces.
+            let old_heights = self.splice_list(|list| list.splice_prepared(rows.clone(), heights));
             let old = self
                 .layout_items
                 .splice_prepared(rows.clone(), vec![item].into());
-            let old_heights = self.list_state.splice_prepared(rows.clone(), heights);
-            self.after_list_splice();
             let state = self.text_rows.as_mut().unwrap();
             state.retired.push((old, old_heights));
             state.items_spliced(&rows, 1);
@@ -2888,10 +2887,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         items: super::LayoutItems<I>,
         heights: gpui::PreparedListItems,
     ) {
-        self.before_list_splice();
-        let old_items = self.layout_items.splice_prepared(rows.clone(), items);
-        let old_heights = self.list_state.splice_prepared(rows, heights);
-        self.after_list_splice();
+        // The list first: its splice anchors the viewport by the items it replaces.
+        let old_heights = self.splice_list(|list| list.splice_prepared(rows.clone(), heights));
+        let old_items = self.layout_items.splice_prepared(rows, items);
         self.text_rows
             .as_mut()
             .unwrap()

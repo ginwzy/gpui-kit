@@ -4,7 +4,7 @@
 //! scrolling, following, reveals and the scroll range in that order.
 use std::{hash::Hash, ops::RangeInclusive, rc::Rc};
 
-use gpui::{Context, ListGeometry, ListOffset, Pixels, Window, px};
+use gpui::{Context, ListGeometry, ListOffset, ListState, Pixels, Window, px};
 
 use super::{
     Affinity, AnchorBias, DocumentAnchor, DocumentEvent, DocumentLayoutItem, DocumentPosition,
@@ -18,13 +18,11 @@ pub(super) struct Viewport<I> {
     /// The viewport top sits `delta` below the top of the row that owns `anchor`.
     top: Option<TopAnchor>,
     /// The list's scroll top as this document last left it: after the last
-    /// layout, or after a splice. Another one at the next layout means the list
+    /// layout, a splice, or settling a scroll. Another one means the list
     /// scrolled itself (wheel, scrollbar, a child's autoscroll, a direct write).
     resolved: Option<ListOffset>,
     /// A splice since the last paint renumbered the items it recorded.
     painted_stale: bool,
-    /// The list scrolled by input since the last layout.
-    pub(super) scrolled: bool,
     /// Scrolling asked for in pixels since the last layout.
     scroll: Pixels,
     pub(super) pin: Option<ScrollPin<I>>,
@@ -41,7 +39,6 @@ impl<I> Default for Viewport<I> {
             top: None,
             resolved: None,
             painted_stale: false,
-            scrolled: false,
             scroll: Pixels::ZERO,
             pin: None,
             reveal: None,
@@ -87,6 +84,67 @@ struct ScrollPinTrail {
     max_fraction: f32,
 }
 
+/// Where a pin above trailing content would hold its position, as
+/// [`DocumentState::scroll_hold`] measures it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollHold {
+    fraction: f32,
+    offset: f32,
+    in_view: bool,
+}
+
+impl ScrollHold {
+    /// The viewport fraction the position would be held at.
+    pub fn fraction(&self) -> f32 {
+        self.fraction
+    }
+
+    /// How far the position sits below its hold, as a viewport fraction;
+    /// negative above it.
+    pub fn offset(&self) -> f32 {
+        self.offset
+    }
+
+    /// Whether the position's line reaches below the viewport top. A pin that
+    /// only scrolls forward keeps the viewport while its position is in view
+    /// and not below its hold.
+    pub fn is_in_view(&self) -> bool {
+        self.in_view
+    }
+}
+
+/// Item tops and heights in content coordinates, while a layout measures
+/// them and after it.
+trait ItemGeometry {
+    fn item_top(&self, ix: usize) -> Option<Pixels>;
+    fn item_height(&self, ix: usize) -> Option<Pixels>;
+}
+
+impl ItemGeometry for ListGeometry<'_> {
+    fn item_top(&self, ix: usize) -> Option<Pixels> {
+        ListGeometry::item_top(self, ix)
+    }
+
+    fn item_height(&self, ix: usize) -> Option<Pixels> {
+        ListGeometry::item_height(self, ix)
+    }
+}
+
+impl ItemGeometry for ListState {
+    fn item_top(&self, ix: usize) -> Option<Pixels> {
+        ListState::item_top(self, ix)
+    }
+
+    fn item_height(&self, ix: usize) -> Option<Pixels> {
+        ListState::item_height(self, ix)
+    }
+}
+
+/// Whether a line from content y `y`, `line` tall, reaches below `top`.
+fn in_view(y: Pixels, line: Pixels, top: Pixels) -> bool {
+    y + line > top
+}
+
 pub(super) enum Reveal {
     /// The caret, with a line of margin, once its line has its geometry.
     Caret,
@@ -119,45 +177,44 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.viewport.limit = viewport.limit;
     }
 
-    /// Call before the list splices its items, which moves its scroll top: a
-    /// scroll the list made since the last layout becomes content first.
-    pub(super) fn before_list_splice(&mut self) {
+    /// Makes a scroll the list made itself since the last layout (wheel,
+    /// scrollbar, a direct write) content, while its items still describe
+    /// the document: before an edit changes the text they were laid out from,
+    /// and before the list splices them, which moves its scroll top.
+    pub(super) fn settle_list_scroll(&mut self) {
         let list_top = self.list_state.logical_scroll_top();
-        if self.viewport.scrolled
-            || self
-                .viewport
-                .resolved
-                .is_some_and(|resolved| !same_offset(resolved, list_top))
+        if self
+            .viewport
+            .resolved
+            .is_none_or(|resolved| same_offset(resolved, list_top))
         {
-            self.viewport.scrolled = false;
-            self.anchor_list_offset(list_top);
+            return;
         }
+        self.viewport.resolved = Some(list_top);
+        let Some(ix) = self.anchorable_item(list_top.item_ix) else {
+            return;
+        };
+        // The anchored item may lie on either side of the list top's item.
+        let delta = match (
+            self.list_state.item_top(list_top.item_ix),
+            self.list_state.item_top(ix),
+        ) {
+            (Some(top), Some(item)) => top + list_top.offset_in_item - item,
+            _ => list_top.offset_in_item,
+        };
+        self.anchor_item(ix, delta);
     }
 
-    /// Call after the list spliced its items: its new scroll top is not a scroll.
-    pub(super) fn after_list_splice(&mut self) {
+    /// Splices the list's items through `splice`. The scroll top it leaves is
+    /// the splice's, not a scroll.
+    pub(super) fn splice_list<R>(&mut self, splice: impl FnOnce(&ListState) -> R) -> R {
+        self.settle_list_scroll();
+        let result = splice(&self.list_state);
         if self.viewport.resolved.is_some() {
             self.viewport.resolved = Some(self.list_state.logical_scroll_top());
         }
         self.viewport.painted_stale = true;
-    }
-
-    /// Anchors the content at a list offset of the current items, outside layout.
-    fn anchor_list_offset(&mut self, offset: ListOffset) {
-        let Some(ix) = self.anchorable_item(offset.item_ix) else {
-            return;
-        };
-        // The distance from the anchored item, while the list can tell it.
-        let delta = match (
-            self.list_state.bounds_for_item(offset.item_ix.min(ix)),
-            self.list_state.bounds_for_item(ix),
-        ) {
-            (Some(top), Some(item)) if ix > offset.item_ix => {
-                offset.offset_in_item - (item.top() - top.top())
-            }
-            _ => offset.offset_in_item,
-        };
-        self.anchor_item(ix, delta);
+        result
     }
 
     /// Scrolls by `delta` at the next layout, as input does.
@@ -310,25 +367,37 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         Ok(())
     }
 
-    /// The fraction [`Self::pin_scroll_above`] would hold `position` at in the
-    /// last layout, or `None` when `position` is not laid out.
-    pub fn scroll_hold_fraction(
+    /// Where [`Self::pin_scroll_above`] would hold `position` in the current
+    /// layout, measured as each layout resolves the viewport, or `None` when
+    /// `position` is not laid out.
+    pub fn scroll_hold(
         &self,
         position: &DocumentPosition<I>,
         trailing: &DocumentPosition<I>,
         clearance: Pixels,
         fractions: RangeInclusive<f32>,
-    ) -> Option<f32> {
+    ) -> Option<ScrollHold> {
         self.resolve_position(position).ok()?;
-        let (_, anchor) = self.layout_point_for_position(position)?;
-        let viewport = self.list_state.viewport_bounds();
-        Some(hold_fraction(
-            anchor?.y,
-            self.layout_bottom_for_position(trailing),
-            clearance,
-            fractions,
-            viewport.size.height,
-        ))
+        let height = self.list_state.viewport_bounds().size.height;
+        if height <= Pixels::ZERO {
+            return None;
+        }
+        let list = &self.list_state;
+        let painted = !self.viewport.painted_stale;
+        let (target, line) = self.content_line(list, position, painted)?;
+        let bottom = self
+            .resolve_position(trailing)
+            .ok()
+            .and_then(|_| self.content_line(list, trailing, painted))
+            .map(|(y, line)| y + line);
+        let fraction = hold_fraction(target, bottom, clearance, fractions, height);
+        let scroll_top = list.logical_scroll_top();
+        let top = list.item_top(scroll_top.item_ix)? + scroll_top.offset_in_item;
+        Some(ScrollHold {
+            fraction,
+            offset: (target - top) / height - fraction,
+            in_view: in_view(target, line, top),
+        })
     }
 
     fn remove_scroll_pin_anchors(&mut self, pin: &ScrollPin<I>) {
@@ -434,7 +503,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
 
     /// The user scrolled the list: reveals and following give way.
     pub(super) fn list_scrolled(&mut self, cx: &mut Context<Self>) {
-        self.viewport.scrolled = true;
         let wrapping = self
             .text_rows
             .as_ref()
@@ -466,14 +534,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             self.list_scrolled(cx);
         }
         let list_top = geometry.scroll_top();
-        let list_moved = self.viewport.scrolled
-            || self
-                .viewport
-                .resolved
-                .is_none_or(|resolved| !same_offset(resolved, list_top));
+        let list_moved = self
+            .viewport
+            .resolved
+            .is_none_or(|resolved| !same_offset(resolved, list_top));
         let painted_valid = !self.viewport.painted_stale;
         self.viewport.painted_stale = false;
-        self.viewport.scrolled = false;
         let list_y = geometry.y_for_offset(&list_top);
         let mut top = if list_moved {
             list_y
@@ -542,7 +608,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         };
         let mut delta = target - height * fraction - top;
         // A forward pin leaves an anchor above its hold, unless it left the viewport.
-        if pin.forward && delta < Pixels::ZERO && target + line > top {
+        if pin.forward && delta < Pixels::ZERO && in_view(target, line, top) {
             delta = Pixels::ZERO;
         }
         let pin = self.viewport.pin.as_mut().expect("pin is present");
@@ -753,7 +819,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// block's end is its bottom.
     fn content_line(
         &self,
-        geometry: &ListGeometry,
+        geometry: &impl ItemGeometry,
         position: &DocumentPosition<I>,
         painted: bool,
     ) -> Option<(Pixels, Pixels)> {
@@ -943,6 +1009,101 @@ mod tests {
         }
     }
 
+    // The list scrolled itself onto a row without text of its own, then an
+    // edit before it spliced the list ahead of the next layout: the viewport
+    // stays on that row.
+    #[gpui::test]
+    fn a_list_scroll_survives_a_splice_before_the_next_layout(cx: &mut TestAppContext) {
+        use super::super::DocumentLayoutItem;
+        use crate::document::{
+            AnchoredBlock, DocumentProjection, DocumentSnapshot, DocumentStyles, EditOrigin,
+            EditTransaction, TextEdit,
+        };
+        let (document, mut cx) = document(1, cx);
+        let history = (0..60).map(|ix| format!("line {ix}\n")).collect::<String>();
+        let line = |ix: usize| {
+            (0..ix)
+                .map(|ix| format!("line {ix}\n").len())
+                .sum::<usize>()
+        };
+        let (len, text) = (history.len(), history.clone() + "draft");
+        let note = |shift: usize| {
+            vec![AnchoredBlock::new(
+                "note",
+                DocumentPosition::new("history", line(30) + shift, Affinity::Before),
+            )]
+        };
+        document.update(&mut cx, |document, cx| {
+            document.set_block_renderer(|_, _, _| div().h(px(45.)).into_any_element(), cx);
+            document
+                .reset(
+                    DocumentSnapshot::new(
+                        text.clone(),
+                        vec![
+                            DocumentRegion::new("history", 0..len, EditPolicy::Readonly),
+                            DocumentRegion::new("draft", len..len + 5, EditPolicy::Editable),
+                        ],
+                        DocumentProjection::identity(len + 5),
+                        vec![],
+                        DocumentStyles::default(),
+                    )
+                    .anchored_blocks(note(0)),
+                    cx,
+                )
+                .unwrap();
+        });
+        draw(&mut cx);
+        draw(&mut cx);
+        let row = document.read_with(&cx, |document, _| {
+            let row = document
+                .layout_items
+                .iter()
+                .position(|item| matches!(item, DocumentLayoutItem::AnchoredBlock { .. }))
+                .unwrap();
+            document.list_state().scroll_to(ListOffset {
+                item_ix: row,
+                offset_in_item: px(10.),
+            });
+            row
+        });
+        document.update(&mut cx, |document, cx| {
+            let transaction = EditTransaction::new(
+                document.revision(),
+                EditOrigin::Host,
+                vec![TextEdit::new(0..0, "new\n")],
+                document.text().len(),
+            )
+            .unwrap();
+            document
+                .apply_host_transaction_with_anchored_blocks(
+                    transaction,
+                    vec![
+                        DocumentRegion::new("history", 0..len + 4, EditPolicy::Readonly),
+                        DocumentRegion::new("draft", len + 4..len + 9, EditPolicy::Editable),
+                    ],
+                    DocumentProjection::identity(len + 9),
+                    vec![],
+                    note(4),
+                    DocumentStyles::default(),
+                    cx,
+                )
+                .unwrap();
+        });
+        draw(&mut cx);
+        document.read_with(&cx, |document, _| {
+            // One row above it is new; the note is still 10px above the top.
+            let top = document.list_state().logical_scroll_top();
+            assert!(
+                matches!(
+                    document.layout_items[row + 1],
+                    DocumentLayoutItem::AnchoredBlock { .. }
+                ),
+                "{row}"
+            );
+            assert_eq!((top.item_ix, top.offset_in_item), (row + 1, px(10.)));
+        });
+    }
+
     #[gpui::test]
     fn a_forward_pin_keeps_the_viewport_until_its_anchor_passes_the_hold(cx: &mut TestAppContext) {
         let (document, mut cx) = document(1, cx);
@@ -974,22 +1135,31 @@ mod tests {
                 .map(|ix| format!("line {ix}\n").len())
                 .sum::<usize>()
         };
+        let hold = |ix: usize, cx: &mut VisualTestContext| {
+            document.read_with(cx, |document, _| {
+                document
+                    .scroll_hold(
+                        &DocumentPosition::new("history", line(ix), Affinity::After),
+                        &DocumentPosition::new("draft", 5, Affinity::After),
+                        px(0.),
+                        0.3..=0.5,
+                    )
+                    .unwrap()
+            })
+        };
+        // The hold reports what the pin will do: keep a line in view above it.
+        let above = hold(22, &mut cx);
+        assert!(above.is_in_view() && above.offset() < 0., "{above:?}");
         let before = fraction(&document, "history", line(22), &mut cx);
         pin(line(22), &mut cx);
         assert_eq!(fraction(&document, "history", line(22), &mut cx), before);
+        assert!(!hold(19, &mut cx).is_in_view());
         // Below the hold, the first frame already holds it there.
+        assert!(hold(50, &mut cx).offset() > 0.);
         pin(line(50), &mut cx);
         let held = fraction(&document, "history", line(50), &mut cx);
-        let hold = document.read_with(&cx, |document, _| {
-            document
-                .scroll_hold_fraction(
-                    &DocumentPosition::new("history", line(50), Affinity::After),
-                    &DocumentPosition::new("draft", 5, Affinity::After),
-                    px(0.),
-                    0.3..=0.5,
-                )
-                .unwrap()
-        });
-        assert!((held - hold).abs() < 0.01, "{held} {hold}");
+        let hold = hold(50, &mut cx);
+        assert!((held - hold.fraction()).abs() < 0.01, "{held} {hold:?}");
+        assert!(hold.offset().abs() < 0.01 && hold.is_in_view(), "{hold:?}");
     }
 }
