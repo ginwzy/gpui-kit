@@ -161,6 +161,8 @@ cap-std = { opt-level = 3 }
 [patch.crates-io]
 gpui-pre = { path = "../gpui-pre" }
 gpui-pre-linux = { path = "../gpui-pre-linux" }
+gpui-pre-macos = { path = "../gpui-pre-macos" }
+gpui-pre-wgpu = { path = "../gpui-pre-wgpu" }
 zed-xim = { path = "../zed-xim" }
 # LLRT's public modules still name their compatible binding dependency
 # `rquickjs`. Route those dependencies through a source-compatible facade so
