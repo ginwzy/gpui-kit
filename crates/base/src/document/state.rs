@@ -246,6 +246,10 @@ pub enum DocumentEvent<I> {
     },
     /// The user moved the viewport with the wheel or scrollbar.
     ViewportScrolled,
+    /// A layout placed another row at the viewport top, whether the user
+    /// scrolled, a reveal or pin moved it, or the content above it changed.
+    /// Read it with [`DocumentState::viewport_top`].
+    ViewportTopChanged,
     /// A click that selected nothing landed on text styled
     /// [`with_link`](super::DocumentInlineStyle::with_link); carries its target.
     LinkClicked(SharedString),
