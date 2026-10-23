@@ -1,8 +1,8 @@
 use gpui::{
     Animation, AnimationExt as _, App, Bounds, ContentMask, Element, ElementId, GlobalElementId,
     Hsla, InspectorElementId, IntoElement, LayoutId, LineLayout, ParentElement as _, Pixels, Point,
-    RenderOnce, SharedString, StyleRefinement, Styled, StyledText, TextAlign, Window, WrapBoundary,
-    div, point, px, size,
+    RenderOnce, SharedString, StyleRefinement, Styled, StyledText, TextAlign, Window, div, point,
+    px, size,
 };
 use instant::Duration;
 
@@ -278,77 +278,58 @@ impl ShimmerGlyphs {
 
         window.paint_layer(bounds, |window| {
             for wrapped_line in layout.line_layouts() {
-                let line = &wrapped_line.unwrapped_layout;
-                let baseline_offset = point(
-                    px(0.),
-                    (line_height - line.ascent - line.descent) / 2. + line.ascent,
-                );
-                let mut wraps = wrapped_line.wrap_boundaries.iter().peekable();
-                let mut glyph_origin = point(
-                    shimmer_aligned_origin_x(
-                        line_origin,
-                        bounds.size.width,
+                for (row_ix, row) in wrapped_line.rows().iter().enumerate() {
+                    let line = row.layout();
+                    let inset = wrapped_line.indent.for_row(row_ix);
+                    let baseline_offset = point(
                         px(0.),
-                        text_align,
-                        line,
-                        wraps.peek().copied(),
-                    ),
-                    line_origin.y,
-                );
-                let mut previous_glyph_position = Point::default();
+                        (line_height - line.ascent - line.descent) / 2. + line.ascent,
+                    );
+                    let row_origin = point(
+                        shimmer_aligned_origin_x(
+                            line_origin + point(inset, px(0.)),
+                            bounds.size.width - inset,
+                            text_align,
+                            line,
+                        ),
+                        line_origin.y + line_height * row_ix,
+                    );
 
-                for (run_index, run) in line.runs.iter().enumerate() {
-                    let glyph_size = cx
-                        .text_system()
-                        .bounding_box(run.font_id, line.font_size)
-                        .size;
+                    for run in &line.runs {
+                        let glyph_size = cx
+                            .text_system()
+                            .bounding_box(run.font_id, line.font_size)
+                            .size;
 
-                    for (glyph_index, glyph) in run.glyphs.iter().enumerate() {
-                        glyph_origin.x += glyph.position.x - previous_glyph_position.x;
+                        for glyph in &run.glyphs {
+                            let glyph_origin = row_origin + point(glyph.position.x, px(0.));
 
-                        if wraps.peek().is_some_and(|wrap| {
-                            wrap.run_ix == run_index && wrap.glyph_ix == glyph_index
-                        }) {
-                            wraps.next();
-                            glyph_origin.x = shimmer_aligned_origin_x(
-                                line_origin,
-                                bounds.size.width,
-                                glyph.position.x,
-                                text_align,
-                                line,
-                                wraps.peek().copied(),
-                            );
-                            glyph_origin.y += line_height;
-                        }
-
-                        previous_glyph_position = glyph.position;
-
-                        if glyph.is_emoji {
-                            continue;
-                        }
-
-                        let glyph_bounds = Bounds::new(glyph_origin, glyph_size);
-                        let paint_origin =
-                            glyph_origin + baseline_offset + point(px(0.), glyph.position.y);
-
-                        for mask in masks.iter().flatten() {
-                            if !glyph_bounds.intersects(&mask.bounds) {
+                            if glyph.is_emoji {
                                 continue;
                             }
 
-                            window.with_content_mask(Some(*mask), |window| {
-                                let _ = window.paint_glyph(
-                                    paint_origin,
-                                    run.font_id,
-                                    glyph.id,
-                                    line.font_size,
-                                    color,
-                                );
-                            });
+                            let glyph_bounds = Bounds::new(glyph_origin, glyph_size);
+                            let paint_origin =
+                                glyph_origin + baseline_offset + point(px(0.), glyph.position.y);
+
+                            for mask in masks.iter().flatten() {
+                                if !glyph_bounds.intersects(&mask.bounds) {
+                                    continue;
+                                }
+
+                                window.with_content_mask(Some(*mask), |window| {
+                                    let _ = window.paint_glyph(
+                                        paint_origin,
+                                        run.font_id,
+                                        glyph.id,
+                                        line.font_size,
+                                        color,
+                                    );
+                                });
+                            }
                         }
                     }
                 }
-
                 line_origin.y += wrapped_line.size(line_height).height;
             }
         });
@@ -483,15 +464,10 @@ fn shimmer_band_bounds(
 fn shimmer_aligned_origin_x(
     origin: Point<Pixels>,
     align_width: Pixels,
-    previous_glyph_x: Pixels,
     align: TextAlign,
     layout: &LineLayout,
-    next_wrap: Option<&WrapBoundary>,
 ) -> Pixels {
-    let line_end = next_wrap
-        .map(|wrap| layout.runs[wrap.run_ix].glyphs[wrap.glyph_ix].position.x)
-        .unwrap_or(layout.width);
-    let line_width = line_end - previous_glyph_x;
+    let line_width = layout.width;
 
     match align {
         TextAlign::Left => origin.x,

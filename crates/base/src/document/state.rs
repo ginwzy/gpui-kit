@@ -2395,35 +2395,25 @@ fn closest_caret_index(
                 .is_boundary(text, 0)
                 .unwrap_or(true)
     };
-    let row = ((position.y / line_height).max(0.) as usize).min(line.wrap_boundaries().len());
-    let position = point(position.x - line.indent.for_row(row), position.y);
-    let boundary = |boundary: &gpui::WrapBoundary| {
-        let glyph = &line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix];
-        (glyph.index, glyph.position.x)
+    let row_ix =
+        ((position.y / line_height).max(0.) as usize).min(line.rows().len().saturating_sub(1));
+    let Some(row) = line.rows().get(row_ix) else {
+        return 0;
     };
-    let (start, origin_x) = row
-        .checked_sub(1)
-        .and_then(|row| line.wrap_boundaries().get(row))
-        .map(boundary)
-        .unwrap_or((0, Pixels::ZERO));
-    let (end, end_x) = line
-        .wrap_boundaries()
-        .get(row)
-        .map(boundary)
-        .unwrap_or((line.len(), line.unwrapped_layout.width));
+    let position = point(position.x - line.indent.for_row(row_ix), position.y);
+    let range = row.range();
+    let (start, end) = (range.start, range.end);
     let mut closest = start;
     let mut distance = position.x.abs();
-    for glyph in line.runs().iter().flat_map(|run| &run.glyphs) {
-        if glyph.index < start || glyph.index >= end {
-            continue;
-        }
-        let delta = (glyph.position.x - origin_x - position.x).abs();
-        if delta < distance && is_boundary(glyph.index) {
-            closest = glyph.index;
+    for glyph in row.layout().runs.iter().flat_map(|run| &run.glyphs) {
+        let index = start + glyph.index;
+        let delta = (glyph.position.x - position.x).abs();
+        if delta < distance && is_boundary(index) {
+            closest = index;
             distance = delta;
         }
     }
-    if (end_x - origin_x - position.x).abs() < distance {
+    if (row.layout().width - position.x).abs() < distance {
         end
     } else {
         closest
@@ -8709,8 +8699,7 @@ mod tests {
             // Wrapped rows start under the text, and the indent itself maps to
             // the start of the row.
             let line = first.layout.text().line_layout_for_index(0).unwrap();
-            let boundary = line.wrap_boundaries[0];
-            let wrap = line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+            let wrap = line.rows()[1].range().start;
             let row = first.bounds.top() + first.layout.line_height() * 1.5;
             assert_eq!(
                 first
@@ -8820,8 +8809,7 @@ mod tests {
                 let origin = title.layout.position_for_index(1).unwrap();
                 let start = point(origin.x, origin.y + title.layout.line_height() / 2.);
                 let line = body.layout.text().line_layout_for_index(0).unwrap();
-                let boundary = line.wrap_boundaries[0];
-                let wrap = line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+                let wrap = line.rows()[1].range().start;
                 let wrap_y = body.bounds.top() + body.layout.line_height();
                 (
                     start,

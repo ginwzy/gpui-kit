@@ -610,13 +610,13 @@ fn readonly_body_pointer_keyboard_copy_gutter_and_hidden_projection(cx: &mut Tes
                     .find(|record| record.display.start == display)
                     .unwrap();
                 assert!(
-                    !line
-                        .layout
+                    line.layout
                         .text()
                         .line_layout_for_index(0)
                         .unwrap()
-                        .wrap_boundaries
-                        .is_empty()
+                        .rows()
+                        .len()
+                        > 1
                 );
             }
         });

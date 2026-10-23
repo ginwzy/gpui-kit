@@ -581,34 +581,26 @@ impl Inline {
     ) -> Vec<Bounds<Pixels>> {
         let origin = text_layout.bounds().origin;
         let lines = text_layout.line_layouts();
-        let row_count: usize = lines
-            .iter()
-            .map(|line| line.wrap_boundaries.len() + 1)
-            .sum();
+        let row_count: usize = lines.iter().map(|line| line.rows().len()).sum();
         let mut line_bounds = Vec::with_capacity(row_count);
         let mut row_ix = 0;
         let mut y = origin.y;
         for line in &lines {
-            let layout = &line.unwrapped_layout;
-            let mut row_start = 0;
-            let row_ends = line
-                .wrap_boundaries
-                .iter()
-                .map(|boundary| layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index)
-                .chain([line.len()]);
-            for row_end in row_ends {
-                let mut width = layout.x_for_index(row_end) - layout.x_for_index(row_start);
+            for (ix, row) in line.rows().iter().enumerate() {
+                let mut width = row.layout().width;
                 row_ix += 1;
                 if row_ix < row_count {
                     width += line_height.half();
                 }
-                let bounds = Bounds::new(point(origin.x, y), size(width, line_height))
-                    .intersect(&mask_bounds);
+                let bounds = Bounds::new(
+                    point(origin.x + line.indent.for_row(ix), y),
+                    size(width, line_height),
+                )
+                .intersect(&mask_bounds);
                 if bounds.size.width > px(0.) && bounds.size.height > px(0.) {
                     line_bounds.push(bounds);
                 }
                 y += line_height;
-                row_start = row_end;
             }
         }
         line_bounds
