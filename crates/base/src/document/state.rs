@@ -381,6 +381,12 @@ impl<I: Clone + Eq + Hash> DocumentStructure<I> {
             .iter()
             .filter(|region| {
                 region.range().start >= start
+                    // Empty readonly nodes at the boundary belong to the host
+                    // prefix. Retaining them would make user undo depend on a
+                    // submitted node that acceptance is allowed to remove.
+                    && !(region.range().start == start
+                        && region.range().is_empty()
+                        && region.policy() == EditPolicy::Readonly)
                     && matches!(
                         region.policy(),
                         EditPolicy::Editable | EditPolicy::Atomic | EditPolicy::Readonly
@@ -5813,6 +5819,30 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn structure_suffix_does_not_retain_an_empty_readonly_prefix() {
+        // A send freezes its trailing empty text and creates a new draft at
+        // the same offset. Only the latter belongs to subsequent user undo.
+        let before = DocumentModel::new(
+            "sent",
+            vec![
+                DocumentRegion::new("sent", 0..4, EditPolicy::Readonly),
+                DocumentRegion::new("sent-tail", 4..4, EditPolicy::Readonly),
+                DocumentRegion::new("draft", 4..4, EditPolicy::Editable),
+            ],
+        )
+        .unwrap();
+        let accepted = DocumentModel::new(
+            "",
+            vec![DocumentRegion::new("draft", 0..0, EditPolicy::Editable)],
+        )
+        .unwrap();
+        assert_eq!(
+            DocumentStructure::suffix(&before, 4),
+            DocumentStructure::suffix(&accepted, 0)
+        );
     }
 
     #[gpui::test]
