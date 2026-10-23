@@ -278,13 +278,12 @@ impl ShimmerGlyphs {
 
         window.paint_layer(bounds, |window| {
             for wrapped_line in layout.line_layouts() {
+                // Every row shares the wrapped line's baseline, as StyledText paints it.
+                let (ascent, descent) = (wrapped_line.ascent(), wrapped_line.descent());
+                let baseline_offset = point(px(0.), (line_height - ascent - descent) / 2. + ascent);
                 for (row_ix, row) in wrapped_line.rows().iter().enumerate() {
                     let line = row.layout();
                     let inset = wrapped_line.indent.for_row(row_ix);
-                    let baseline_offset = point(
-                        px(0.),
-                        (line_height - line.ascent - line.descent) / 2. + line.ascent,
-                    );
                     let row_origin = point(
                         shimmer_aligned_origin_x(
                             line_origin + point(inset, px(0.)),
