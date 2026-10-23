@@ -23,6 +23,8 @@ pub(super) struct Viewport<I> {
     resolved: Option<ListOffset>,
     /// A splice since the last paint renumbered the items it recorded.
     painted_stale: bool,
+    /// The top offset the last `ViewportTopChanged` reported.
+    reported_top: Option<usize>,
     /// Scrolling asked for in pixels since the last layout.
     scroll: Pixels,
     pub(super) pin: Option<ScrollPin<I>>,
@@ -39,6 +41,7 @@ impl<I> Default for Viewport<I> {
             top: None,
             resolved: None,
             painted_stale: false,
+            reported_top: None,
             scroll: Pixels::ZERO,
             pin: None,
             reveal: None,
@@ -148,8 +151,19 @@ fn in_view(y: Pixels, line: Pixels, top: Pixels) -> bool {
 pub(super) enum Reveal {
     /// The caret, with a line of margin, once its line has its geometry.
     Caret,
-    /// The row that owns a position.
+    /// The row that owns a position, scrolled the least that shows it.
     Position(DocumentAnchor),
+    /// The row that owns a position, at the viewport top.
+    Top(DocumentAnchor),
+}
+
+impl Reveal {
+    fn anchor(&self) -> Option<DocumentAnchor> {
+        match self {
+            Self::Caret => None,
+            Self::Position(anchor) | Self::Top(anchor) => Some(*anchor),
+        }
+    }
 }
 
 impl<I> ScrollPin<I> {
@@ -440,17 +454,38 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         position: &DocumentPosition<I>,
         cx: &mut Context<Self>,
     ) -> Result<(), PositionError> {
+        let anchor = self.reveal_anchor(position, cx)?;
+        self.set_reveal(Some(Reveal::Position(anchor)));
+        cx.notify();
+        Ok(())
+    }
+
+    /// Scrolls so the row that owns `position` starts at the viewport top at
+    /// the next layout, as far as the scroll range allows.
+    pub fn reveal_position_at_top(
+        &mut self,
+        position: &DocumentPosition<I>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), PositionError> {
+        let anchor = self.reveal_anchor(position, cx)?;
+        self.set_reveal(Some(Reveal::Top(anchor)));
+        cx.notify();
+        Ok(())
+    }
+
+    fn reveal_anchor(
+        &mut self,
+        position: &DocumentPosition<I>,
+        cx: &mut Context<Self>,
+    ) -> Result<DocumentAnchor, PositionError> {
         let offset = self.resolve_position(position)?;
         self.stop_following(cx);
-        let anchor = self.model.anchors.create_for_node(
+        Ok(self.model.anchors.create_for_node(
             offset,
             AnchorBias::Right,
             Some(position.node_id().clone()),
             position.affinity(),
-        );
-        self.set_reveal(Some(Reveal::Position(anchor)));
-        cx.notify();
-        Ok(())
+        ))
     }
 
     /// Scrolls the caret into view at the next layout, which measures the
@@ -470,7 +505,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     }
 
     pub(super) fn set_reveal(&mut self, reveal: Option<Reveal>) {
-        if let Some(Reveal::Position(anchor)) = std::mem::replace(&mut self.viewport.reveal, reveal)
+        if let Some(anchor) = std::mem::replace(&mut self.viewport.reveal, reveal)
+            .as_ref()
+            .and_then(Reveal::anchor)
         {
             self.model.anchors.remove(anchor);
         }
@@ -478,10 +515,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
 
     /// The position a reveal waits to place, which its rows wrap first.
     pub(super) fn reveal_target(&self) -> Option<usize> {
-        match &self.viewport.reveal {
-            Some(Reveal::Position(anchor)) => self.model.anchors.resolve(*anchor),
-            _ => None,
-        }
+        self.viewport
+            .reveal
+            .as_ref()
+            .and_then(Reveal::anchor)
+            .and_then(|anchor| self.model.anchors.resolve(anchor))
     }
 
     /// The content at the viewport top, which visible rows wrap around.
@@ -490,6 +528,14 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .top
             .as_ref()
             .and_then(|top| self.model.anchors.resolve(top.anchor))
+    }
+
+    /// The start of the row at the viewport top as the last layout placed
+    /// it, or `None` before the first layout. Rows that only partly show at
+    /// the top count as the top row.
+    pub fn viewport_top(&self) -> Option<DocumentPosition<I>> {
+        let top = self.viewport.top.as_ref()?;
+        self.model.position_for_anchor(top.anchor).ok()
     }
 
     pub(super) fn stop_following(&mut self, cx: &mut Context<Self>) {
@@ -508,7 +554,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .as_ref()
             .is_some_and(|rows| rows.is_wrapping());
         if matches!(self.viewport.reveal, Some(Reveal::Caret))
-            || matches!(self.viewport.reveal, Some(Reveal::Position(_))) && wrapping
+            || matches!(
+                self.viewport.reveal,
+                Some(Reveal::Position(_) | Reveal::Top(_))
+            ) && wrapping
         {
             self.set_reveal(None);
         }
@@ -558,6 +607,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         top = self.reveal_in_layout(geometry, top, painted_valid, cx);
         top = self.fit_scroll_range(geometry, top);
         self.anchor_viewport_top(geometry, top);
+        let placed = self.viewport_top_offset();
+        if std::mem::replace(&mut self.viewport.reported_top, placed) != placed {
+            cx.emit(DocumentEvent::ViewportTopChanged);
+        }
         self.record_painted(geometry, top);
         // This layout paints the records again.
         self.text_layouts.clear();
@@ -671,7 +724,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     top
                 }
             }
-            Some(Reveal::Position(anchor)) => {
+            Some(reveal @ (Reveal::Position(anchor) | Reveal::Top(anchor))) => {
+                let at_top = matches!(reveal, Reveal::Top(_));
                 let row = self
                     .model
                     .position_for_anchor(*anchor)
@@ -683,7 +737,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     self.set_reveal(None);
                 }
                 match row {
-                    Some((row_top, _)) if row_top < top => row_top,
+                    Some((row_top, _)) if at_top || row_top < top => row_top,
                     // A row taller than the viewport shows its top.
                     Some((row_top, row)) if row_top + row > top + height => {
                         (row_top + row - height).min(row_top)
@@ -1161,5 +1215,68 @@ mod tests {
         let hold = hold(50, &mut cx);
         assert!((held - hold.fraction()).abs() < 0.01, "{held} {hold:?}");
         assert!(hold.offset().abs() < 0.01 && hold.is_in_view(), "{hold:?}");
+    }
+
+    #[gpui::test]
+    fn a_top_reveal_starts_its_row_at_the_viewport_top_and_reports_the_move(
+        cx: &mut TestAppContext,
+    ) {
+        use std::{cell::Cell, rc::Rc};
+
+        use super::super::DocumentEvent;
+
+        let (document, mut cx) = document(1, cx);
+        let moves = Rc::new(Cell::new(0));
+        let _subscription = cx.update(|_, cx| {
+            let moves = moves.clone();
+            cx.subscribe(&document, move |_, event, _| {
+                if matches!(event, DocumentEvent::ViewportTopChanged) {
+                    moves.set(moves.get() + 1);
+                }
+            })
+        });
+        let line = |ix: usize| {
+            (0..ix)
+                .map(|ix| format!("line {ix}\n").len())
+                .sum::<usize>()
+        };
+        let top = |cx: &mut VisualTestContext| {
+            document.read_with(cx, |document, _| {
+                document
+                    .viewport_top()
+                    .map(|top| (*top.node_id(), top.offset()))
+            })
+        };
+        assert_eq!(top(&mut cx), Some(("history", 0)));
+
+        let reveal = |ix: usize, at_top: bool, cx: &mut VisualTestContext| {
+            document.update(cx, |document, cx| {
+                let position = DocumentPosition::new("history", line(ix), Affinity::After);
+                if at_top {
+                    document.reveal_position_at_top(&position, cx).unwrap();
+                } else {
+                    document.reveal_position(&position, cx).unwrap();
+                }
+            });
+            draw(cx);
+        };
+        reveal(20, true, &mut cx);
+        assert_eq!(fraction(&document, "history", line(20), &mut cx), 0.);
+        assert_eq!(top(&mut cx), Some(("history", line(20))));
+        assert_eq!(moves.get(), 1);
+
+        // Another frame, or revealing a row already in view, moves nothing.
+        draw(&mut cx);
+        reveal(22, false, &mut cx);
+        assert_eq!(top(&mut cx), Some(("history", line(20))));
+        assert_eq!(moves.get(), 1);
+
+        // A top reveal moves up as well as down; a scroll reports its move too.
+        reveal(5, true, &mut cx);
+        assert_eq!(top(&mut cx), Some(("history", line(5))));
+        document.update(&mut cx, |document, cx| document.scroll_by(px(200.), cx));
+        draw(&mut cx);
+        assert_ne!(top(&mut cx), Some(("history", line(5))));
+        assert_eq!(moves.get(), 3);
     }
 }
