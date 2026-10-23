@@ -859,7 +859,11 @@ impl PopupMenu {
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
         match self.selected_index {
             Some(index) => {
-                let item = self.menu_items.get(index);
+                // A disabled item stays inert from the keyboard as from the pointer.
+                let item = self
+                    .menu_items
+                    .get(index)
+                    .filter(|item| item.is_clickable());
                 match item {
                     Some(PopupMenuItem::Item {
                         handler, action, ..
@@ -932,7 +936,8 @@ impl PopupMenu {
     fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
         let Some(ix) = self.selected_index else {
-            self.set_selected_index(0, cx);
+            let first_clickable_ix = self.clickable_menu_items().next().map(|(ix, _)| ix);
+            self.set_selected_index(first_clickable_ix.unwrap_or(0), cx);
             return;
         };
 

@@ -338,11 +338,16 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
                                     menu.set_previous_focus(previous_focus_handle, cx);
                                 });
 
-                                // Set up the subscription for dismiss handling
+                                // Set up the subscription for dismiss handling. The
+                                // state owns the subscription, so it is held weakly
+                                // here: a strong handle would keep the state, and
+                                // with it the menu, alive after the element is gone.
                                 let _subscription = window.subscribe(&menu, cx, {
-                                    let shared_state = shared_state.clone();
+                                    let shared_state = Rc::downgrade(&shared_state);
                                     move |_, _: &DismissEvent, window, _cx| {
-                                        shared_state.borrow_mut().open = false;
+                                        if let Some(shared_state) = shared_state.upgrade() {
+                                            shared_state.borrow_mut().open = false;
+                                        }
                                         window.refresh();
                                     }
                                 });
