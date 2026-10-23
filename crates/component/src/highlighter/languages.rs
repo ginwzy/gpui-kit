@@ -537,7 +537,7 @@ impl Language {
             #[cfg(feature = "tree-sitter-tsx")]
             Self::Tsx => (
                 tree_sitter_typescript::LANGUAGE_TSX,
-                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+                include_str!("languages/typescript/highlights.scm"),
                 "",
                 tree_sitter_typescript::LOCALS_QUERY,
             ),
@@ -622,6 +622,28 @@ impl Language {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "tree-sitter-tsx")]
+    #[test]
+    fn tsx_highlights_javascript_tokens_as_well_as_types() {
+        use crate::highlighter::{HighlightTheme, SyntaxHighlighter};
+        use ropey::Rope;
+
+        let source = "const text: string = 'hello'; const el = <div>{text}</div>;";
+        let mut highlighter = SyntaxHighlighter::new("tsx");
+        assert_eq!(highlighter.language().as_ref(), "tsx");
+        assert!(highlighter.update(None, &Rope::from(source), None));
+        let styles = highlighter.styles(&(0..source.len()), &*HighlightTheme::default_light());
+        for token in ["const", "string", "'hello'"] {
+            let start = source.find(token).unwrap();
+            assert!(
+                styles
+                    .iter()
+                    .any(|(range, style)| { range.contains(&start) && style.color.is_some() }),
+                "missing TSX token: {token}"
+            );
+        }
+    }
 
     #[test]
     fn test_language_name() {
