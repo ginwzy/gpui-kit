@@ -11,6 +11,7 @@ pub(super) struct FontOverride<'a> {
     weight: Option<FontWeight>,
     style: Option<FontStyle>,
     family: Option<&'a SharedString>,
+    pub(super) scale: Option<u8>,
 }
 
 impl FontOverride<'_> {
@@ -27,91 +28,55 @@ impl FontOverride<'_> {
     }
 }
 
-/// The maximal ranges with the same font overrides, including inherited gaps.
-///
-/// DocumentModel validates nonoverlapping source styles. Projection and clipping
-/// preserve the order of both endpoints, although display ranges can overlap.
-/// Each field therefore needs only its latest covering value: when that value
-/// ends, every earlier value of the same field has ended too. This is NOT an
-/// arbitrary-overlap sweep (nested ranges would need a stack).
-///
-/// Merge the two ordered start streams with the three current field ends,
-/// consuming all events at a boundary before emitting its half-open interval.
-/// Each input is consumed once; adjacent equal intervals are coalesced without
-/// sorting, allocation, or rescanning. O(N + R) time, O(1) auxiliary space.
+/// Read the same resolved display intervals that StyledText paints. Adjacent
+/// paint-only differences coalesce, keeping wrap identity independent of color.
 pub(super) fn font_runs(
     presentation: &DocumentTextPresentation,
     len: usize,
 ) -> impl Iterator<Item = (Range<usize>, FontOverride<'_>)> {
-    let mut highlights = presentation
-        .highlights
-        .iter()
-        .filter(|(range, style)| {
-            !range.is_empty() && (style.font_weight.is_some() || style.font_style.is_some())
-        })
-        .peekable();
-    let mut families = presentation
-        .font_family_overrides
-        .iter()
-        .filter(|(range, _)| !range.is_empty())
-        .peekable();
-    let mut weight = None;
-    let mut style = None;
-    let mut family = None;
+    let mut highlights = presentation.highlights.iter();
+    let mut families = presentation.font_family_overrides.iter().peekable();
+    let mut scales = presentation.font_scales.iter().peekable();
     let mut position = 0;
     let mut segments = from_fn(move || {
         if position == len {
             return None;
         }
-        // Expire first, then apply every start here in input priority order.
-        if weight.is_some_and(|(end, _)| end <= position) {
-            weight = None;
-        }
-        if style.is_some_and(|(end, _)| end <= position) {
-            style = None;
-        }
-        if family.is_some_and(|(end, _)| end <= position) {
-            family = None;
-        }
-        while highlights
-            .peek()
-            .is_some_and(|(range, _)| range.start <= position)
-        {
-            let (range, highlight) = highlights.next().unwrap();
-            if let Some(value) = highlight.font_weight {
-                weight = Some((range.end, value));
-            }
-            if let Some(value) = highlight.font_style {
-                style = Some((range.end, value));
-            }
-        }
         while families
             .peek()
-            .is_some_and(|(range, _)| range.start <= position)
+            .is_some_and(|(range, _)| range.end <= position)
         {
-            let (range, value) = families.next().unwrap();
-            family = Some((range.end, value));
+            families.next();
         }
-        let end = [
-            highlights.peek().map(|(range, _)| range.start),
-            families.peek().map(|(range, _)| range.start),
-            weight.map(|(end, _)| end),
-            style.map(|(end, _)| end),
-            family.map(|(end, _)| end),
-        ]
-        .into_iter()
-        .flatten()
-        .fold(len, usize::min);
-        let run = (
-            position..end,
-            FontOverride {
-                weight: weight.map(|(_, value)| value),
-                style: style.map(|(_, value)| value),
-                family: family.map(|(_, value)| value),
-            },
-        );
-        position = end;
-        Some(run)
+        while scales
+            .peek()
+            .is_some_and(|(range, _)| range.end <= position)
+        {
+            scales.next();
+        }
+        let scale = scales
+            .peek()
+            .and_then(|(range, scale)| (range.start <= position).then_some(*scale));
+        let family = families
+            .peek()
+            .and_then(|(range, family)| (range.start <= position).then_some(family));
+        let (range, font) = match highlights.next() {
+            Some((range, highlight)) => {
+                debug_assert_eq!(range.start, position);
+                (
+                    range.clone(),
+                    FontOverride {
+                        weight: highlight.font_weight,
+                        style: highlight.font_style,
+                        family,
+                        scale,
+                    },
+                )
+            }
+            None => (position..len, FontOverride::default()),
+        };
+        position = range.end;
+        Some((range, font))
     })
     .peekable();
     from_fn(move || {

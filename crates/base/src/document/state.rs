@@ -51,6 +51,7 @@ pub(super) mod inline_objects;
 mod inline_styles;
 mod layout_items;
 mod layout_window;
+mod presentation;
 mod text_rows;
 mod viewport;
 use layout_items::LayoutItems;
@@ -824,6 +825,7 @@ struct ResolvedInlineStyle {
     display: Range<usize>,
     highlight: HighlightStyle,
     font_family: Option<SharedString>,
+    font_scale: Option<u8>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -832,6 +834,7 @@ pub(super) struct DocumentTextPresentation {
     pub(super) indent: Option<DocumentTextIndent>,
     pub(super) highlights: Vec<(Range<usize>, HighlightStyle)>,
     pub(super) font_family_overrides: Vec<(Range<usize>, SharedString)>,
+    pub(super) font_scales: Vec<(Range<usize>, u8)>,
     pub(super) objects: Vec<(Range<usize>, super::InlineSize)>,
 }
 
@@ -1474,6 +1477,7 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         });
         let mut highlights = Vec::new();
         let mut font_family_overrides = Vec::new();
+        let mut font_scales = Vec::new();
         // Resolved inline endpoints are monotonic. A line only
         // needs its intersecting styles, even in a document with many matches.
         let inline = &self.resolved_styles.inline;
@@ -1493,7 +1497,10 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             let local = start - display.start..end - display.start;
             highlights.push((local.clone(), inline.highlight));
             if let Some(font_family) = &inline.font_family {
-                font_family_overrides.push((local, font_family.clone()));
+                font_family_overrides.push((local.clone(), font_family.clone()));
+            }
+            if let Some(scale) = inline.font_scale {
+                font_scales.push((local, scale));
             }
         }
         // Most lines carry no styles; they skip building and comparing one.
@@ -1503,12 +1510,21 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             || !font_family_overrides.is_empty()
             || !objects.is_empty();
         let presentation = styled
-            .then(|| DocumentTextPresentation {
-                text_style,
-                indent,
-                highlights,
-                font_family_overrides,
-                objects,
+            .then(|| {
+                let mut presentation = DocumentTextPresentation {
+                    text_style,
+                    indent,
+                    highlights,
+                    font_family_overrides,
+                    font_scales,
+                    objects,
+                };
+                presentation.resolve_inline(display.len());
+                debug_assert!(presentation.highlights.iter().all(|(range, _)| {
+                    display_text.is_char_boundary(display.start + range.start)
+                        && display_text.is_char_boundary(display.start + range.end)
+                }));
+                presentation
             })
             .filter(|presentation| *presentation != DocumentTextPresentation::default())
             .map(std::sync::Arc::new);
@@ -1975,10 +1991,10 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             shift(&mut style.source);
             shift(&mut style.display);
         }
-        let replacement = self.styles.inline[inline]
-            .iter()
-            .filter_map(|style| resolve_inline_style(&self.projection_map, style))
-            .collect::<Vec<_>>();
+        let mut replacement = Vec::new();
+        for style in &self.styles.inline[inline] {
+            resolve_inline_style(&self.projection_map, style, &mut replacement);
+        }
         self.resolved_styles.inline.splice(from..to, replacement);
         self.reconcile_anchor_nodes_in(region.start..end);
         self.revision = self.revision.next();
@@ -2265,11 +2281,10 @@ fn resolve_document_styles<I: Eq>(
         .iter()
         .map(|style| resolve_paragraph_style(projection, style.source(), style))
         .collect::<Result<_, _>>()?;
-    let inline = styles
-        .inline()
-        .iter()
-        .filter_map(|style| resolve_inline_style(projection, style))
-        .collect();
+    let mut inline = Vec::new();
+    for style in styles.inline() {
+        resolve_inline_style(projection, style, &mut inline);
+    }
     Ok(ResolvedDocumentStyles { paragraphs, inline })
 }
 
@@ -2304,20 +2319,18 @@ fn resolve_paragraph_style(
 fn resolve_inline_style(
     projection: &ProjectionMap,
     style: &DocumentInlineStyle,
-) -> Option<ResolvedInlineStyle> {
+    resolved: &mut Vec<ResolvedInlineStyle>,
+) {
     let source = style.source();
-    let display = projection
-        .source_to_display(source.start, Affinity::Before)
-        .expect("validated style start must map")
-        ..projection
-            .source_to_display(source.end, Affinity::After)
-            .expect("validated style end must map");
-    (!display.is_empty()).then(|| ResolvedInlineStyle {
-        source,
-        display,
-        highlight: style.highlight(),
-        font_family: style.font_family_override().cloned(),
-    })
+    projection.project_source_range(source.clone(), |display| {
+        resolved.push(ResolvedInlineStyle {
+            source: source.clone(),
+            display,
+            highlight: style.highlight(),
+            font_family: style.font_family_override().cloned(),
+            font_scale: style.font_scale_override(),
+        });
+    });
 }
 
 fn validate_style_ranges<I: Eq>(
@@ -4635,10 +4648,24 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .take_while(|style| style.source().start <= offset)
             .find_map(|style| {
                 let link = style.link()?;
-                style
-                    .source()
-                    .contains(&offset)
-                    .then(|| (style.source(), link.clone()))
+                style.source().contains(&offset).then(|| {
+                    let mut range = style.source();
+                    let at = inline.partition_point(|style| style.source().end <= range.start);
+                    for previous in inline[..at].iter().rev() {
+                        if previous.source().end != range.start || previous.link() != Some(link) {
+                            break;
+                        }
+                        range.start = previous.source().start;
+                    }
+                    let at = inline.partition_point(|style| style.source().start < range.end);
+                    for next in &inline[at..] {
+                        if next.source().start != range.end || next.link() != Some(link) {
+                            break;
+                        }
+                        range.end = next.source().end;
+                    }
+                    (range, link.clone())
+                })
             })
     }
 
@@ -5366,6 +5393,47 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     }
                 }
                 let display = self.pending_row_paint_range(display.clone(), wrapped.0);
+                if let Some(hovered) = &self.hovered_link {
+                    let mut changed = false;
+                    let inline = self.model.styles.inline();
+                    let from = inline.partition_point(|style| style.source().end <= hovered.start);
+                    for style in inline[from..]
+                        .iter()
+                        .take_while(|style| style.source().start < hovered.end)
+                    {
+                        let Some(color) = style.link_hover_color() else {
+                            continue;
+                        };
+                        self.model
+                            .projection_map
+                            .project_source_range(style.source(), |range| {
+                                let start = range.start.max(display.start);
+                                let end = range.end.min(display.end);
+                                if start < end {
+                                    changed = true;
+                                    presentation.highlights.push((
+                                        start - display.start..end - display.start,
+                                        HighlightStyle {
+                                            color: Some(color),
+                                            underline: Some(gpui::UnderlineStyle {
+                                                thickness: px(1.),
+                                                color: Some(color),
+                                                wavy: false,
+                                            }),
+                                            ..Default::default()
+                                        },
+                                    ));
+                                }
+                            });
+                    }
+                    if changed {
+                        presentation.resolve_inline(display.len());
+                    }
+                }
+                presentation.font_scales.retain_mut(|(range, _)| {
+                    range.end = range.end.min(display.len());
+                    range.start < range.end
+                });
                 presentation.highlights.retain_mut(|(range, _)| {
                     range.end = range.end.min(display.len());
                     range.start < range.end
@@ -5377,7 +5445,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 presentation
                     .objects
                     .retain(|(range, _)| range.end <= display.len());
-                if !presentation.objects.is_empty() {
+                if !presentation.objects.is_empty()
+                    || (self.text_rows.is_some() && !presentation.font_scales.is_empty())
+                {
                     let frame = frame.0.expect("inline rows have resolved geometry");
                     let limit = self.inline_width_limit(frame);
                     for (_, object) in &mut presentation.objects {
@@ -5414,11 +5484,14 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                         element: super::element::inline::InlineRow::new(
                             cx.entity(),
                             item_ix,
-                            display.clone(),
-                            self.model.display_text()[display.clone()].into(),
+                            (
+                                display.clone(),
+                                self.model.display_text()[display.clone()].into(),
+                            ),
                             presentation,
                             frame,
                             elements,
+                            window,
                         )
                         .into_any_element(),
                     }
@@ -7285,8 +7358,18 @@ mod tests {
                     .set_node_inline_styles(
                         &"history",
                         vec![
-                            super::super::DocumentInlineStyle::new(2..5, Default::default())
-                                .with_link("https://example.com"),
+                            super::super::DocumentInlineStyle::new(2..3, Default::default())
+                                .with_link("https://example.com")
+                                .with_link_hover_color(gpui::blue()),
+                            super::super::DocumentInlineStyle::new(
+                                3..5,
+                                HighlightStyle {
+                                    font_weight: Some(gpui::FontWeight::BOLD),
+                                    ..Default::default()
+                                },
+                            )
+                            .with_link("https://example.com")
+                            .with_link_hover_color(gpui::blue()),
                         ],
                         cx,
                     )
@@ -9045,11 +9128,13 @@ mod tests {
                 panic!("second item must be text");
             };
             let presentation = presentation.as_deref().unwrap();
-            assert_eq!(presentation.highlights.len(), 1);
-            assert_eq!(presentation.highlights[0].0, 6..10);
             assert_eq!(
-                presentation.highlights[0].1.font_weight,
-                Some(FontWeight::BOLD)
+                presentation
+                    .highlights
+                    .iter()
+                    .map(|(range, style)| { (range.clone(), style.font_weight) })
+                    .collect::<Vec<_>>(),
+                vec![(0..6, None), (6..10, Some(FontWeight::BOLD))]
             );
             assert!(
                 document.text_layouts[0].bounds.size.height

@@ -392,3 +392,82 @@ fn pending_mixed_long_line_stays_bounded_and_can_be_superseded(cx: &mut TestAppC
         fixture().text
     );
 }
+
+#[gpui::test]
+fn sized_text_after_wrapping_uses_the_same_painted_baseline(cx: &mut TestAppContext) {
+    use crate::document::DocumentInlineStyle;
+    let (document, mut view) = super::super::tests::document_view(cx);
+    let prefix = "正文 English prose before the link. ".repeat(8);
+    let source = format!("{prefix}文件README.md normal 中文");
+    let code = prefix.len()..prefix.len() + "文件README.md".len();
+    document.update(&mut view, |document, cx| {
+        document.set_text_rows(Some(TextRows::new()), cx);
+        document
+            .reset(
+                DocumentSnapshot::new(
+                    source.clone(),
+                    vec![DocumentRegion::new(
+                        "history",
+                        0..source.len(),
+                        EditPolicy::Readonly,
+                    )],
+                    DocumentProjection::identity(source.len()),
+                    vec![],
+                    DocumentStyles::new(
+                        vec![],
+                        vec![
+                            DocumentInlineStyle::new(code.clone(), Default::default())
+                                .font_scale(90),
+                        ],
+                    ),
+                ),
+                cx,
+            )
+            .unwrap();
+        document.set_selection(code.clone(), false, cx);
+    });
+    let mut checked = 0;
+    for width in [550., 240., 550.] {
+        view.simulate_resize(size(px(width), px(1200.)));
+        settle(&document, &mut view);
+        document.read_with(&view, |document, _| {
+            assert_eq!(document.selected_range(), code);
+            assert_eq!(document.text(), source);
+            for record in &document.text_layouts {
+                let LineLayout::Inline { parts, bounds } = &record.layout else {
+                    continue;
+                };
+                let baselines: Vec<_> = parts
+                    .iter()
+                    .filter_map(|part| {
+                        let text = part.text.as_ref()?;
+                        let line = text.line_layout_for_index(0)?;
+                        Some(
+                            part.bounds.top()
+                                + (text.line_height() - line.ascent() - line.descent()) / 2.
+                                + line.ascent(),
+                        )
+                    })
+                    .collect();
+                for pair in baselines.windows(2) {
+                    assert!(
+                        (pair[0] - pair[1]).abs() < px(0.1),
+                        "text baselines differ at width {width}: {baselines:?}, row {bounds:?}"
+                    );
+                    checked += 1;
+                }
+                for part in parts {
+                    assert!(
+                        part.bounds.bottom() <= bounds.bottom() + px(1.),
+                        "text fell below its row: {:?} vs {bounds:?}",
+                        part.bounds
+                    );
+                }
+            }
+        });
+    }
+    assert!(
+        checked > 0,
+        "must exercise normal and sized text on the same wrapped row"
+    );
+}

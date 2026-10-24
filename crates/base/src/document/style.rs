@@ -1,6 +1,6 @@
-use std::ops::Range;
+use std::{collections::BinaryHeap, ops::Range};
 
-use gpui::{HighlightStyle, SharedString, TextStyleRefinement};
+use gpui::{HighlightStyle, Hsla, SharedString, TextStyleRefinement};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DocumentStyles {
@@ -174,10 +174,116 @@ pub struct DocumentInlineStyle {
     highlight: HighlightStyle,
     font_family: Option<SharedString>,
     link: Option<SharedString>,
+    link_hover: Option<Hsla>,
+    font_scale: Option<u8>,
 }
 
 impl DocumentInlineStyle {
-    pub(super) fn shifted(mut self, offset: usize) -> Self {
+    /// Merge overlapping byte ranges in input order, taking the last explicit
+    /// value independently for each field. Empty ranges only add boundaries;
+    /// default-only layers retain coverage. All ranges use the same coordinates.
+    pub fn flatten(styles: Vec<Self>) -> Vec<Self> {
+        let mut events = styles
+            .iter()
+            .enumerate()
+            .flat_map(|(ix, style)| {
+                [
+                    (style.source.start, ix, true),
+                    (style.source.end, ix, false),
+                ]
+            })
+            .collect::<Vec<_>>();
+        events.sort_unstable_by_key(|event| event.0);
+
+        // Each field independently takes the last covering Some in input order.
+        // A layer enters/leaves each heap at most once: O(S log S) time and O(S)
+        // space even for fully nested ranges, without rescanning active layers.
+        let mut fields: [BinaryHeap<usize>; 11] = std::array::from_fn(|_| BinaryHeap::new());
+        let mut active = 0_usize;
+        let mut result = Vec::with_capacity(styles.len());
+        let mut boundaries = events.chunk_by(|a, b| a.0 == b.0).peekable();
+        while let Some(events) = boundaries.next() {
+            let start = events[0].0;
+            let Some(next) = boundaries.peek() else { break };
+            for &(_, ix, entering) in events {
+                let style = &styles[ix];
+                // Empty/reversed ranges still contribute boundaries, as before.
+                if style.source.is_empty() {
+                    continue;
+                }
+                if !entering {
+                    active -= 1;
+                    continue;
+                }
+                active += 1;
+                let layer = style.highlight;
+                let present = [
+                    layer.color.is_some(),
+                    layer.font_weight.is_some(),
+                    layer.font_style.is_some(),
+                    layer.background_color.is_some(),
+                    layer.underline.is_some(),
+                    layer.strikethrough.is_some(),
+                    layer.fade_out.is_some(),
+                    style.font_family.is_some(),
+                    style.link.is_some(),
+                    style.link_hover.is_some(),
+                    style.font_scale.is_some(),
+                ];
+                for (heap, present) in fields.iter_mut().zip(present) {
+                    if present {
+                        heap.push(ix);
+                    }
+                }
+            }
+            // Coverage is separate from the heaps: a default-only layer emits a run.
+            if active == 0 {
+                continue;
+            }
+            let [
+                color,
+                font_weight,
+                font_style,
+                background_color,
+                underline,
+                strikethrough,
+                fade_out,
+                font_family,
+                link,
+                link_hover,
+                font_scale,
+            ] = fields.each_mut().map(|heap| {
+                while heap
+                    .peek()
+                    .is_some_and(|&ix| styles[ix].source.end <= start)
+                {
+                    heap.pop();
+                }
+                heap.peek().map(|&ix| &styles[ix])
+            });
+            let highlight = HighlightStyle {
+                color: color.and_then(|s| s.highlight.color),
+                font_weight: font_weight.and_then(|s| s.highlight.font_weight),
+                font_style: font_style.and_then(|s| s.highlight.font_style),
+                background_color: background_color.and_then(|s| s.highlight.background_color),
+                underline: underline.and_then(|s| s.highlight.underline),
+                strikethrough: strikethrough.and_then(|s| s.highlight.strikethrough),
+                fade_out: fade_out.and_then(|s| s.highlight.fade_out),
+            };
+            result.push(Self {
+                source: start..next[0].0,
+                highlight,
+                font_family: font_family.and_then(|s| s.font_family.clone()),
+                font_scale: font_scale.and_then(|s| s.font_scale),
+                link: link.and_then(|s| s.link.clone()),
+                link_hover: link_hover.and_then(|s| s.link_hover),
+            });
+        }
+        result
+    }
+
+    /// Rebase a fragment-local style into its composed document.
+    pub fn shifted(mut self, offset: usize) -> Self {
         self.source = self.source.start + offset..self.source.end + offset;
         self
     }
@@ -188,6 +294,8 @@ impl DocumentInlineStyle {
             highlight,
             font_family: None,
             link: None,
+            link_hover: None,
+            font_scale: None,
         }
     }
 
@@ -203,6 +311,30 @@ impl DocumentInlineStyle {
     pub fn with_link(mut self, target: impl Into<SharedString>) -> Self {
         self.link = Some(target.into());
         self
+    }
+
+    /// Reduce the run's size to a percentage of its paragraph font in display-row
+    /// mode. The paragraph retains its line height and baseline; source stays text.
+    /// Measured-line mode uses the paragraph size, retaining this override for
+    /// when display rows are enabled again.
+    pub fn font_scale(mut self, percent: u8) -> Self {
+        assert!((1..=100).contains(&percent));
+        self.font_scale = Some(percent);
+        self
+    }
+
+    pub fn font_scale_override(&self) -> Option<u8> {
+        self.font_scale
+    }
+
+    /// Paint-only emphasis for a link under the pointer: color and underline.
+    pub fn with_link_hover_color(mut self, color: Hsla) -> Self {
+        self.link_hover = Some(color);
+        self
+    }
+
+    pub fn link_hover_color(&self) -> Option<Hsla> {
+        self.link_hover
     }
 
     pub fn source(&self) -> Range<usize> {
@@ -271,3 +403,6 @@ impl std::fmt::Display for DocumentStyleError {
 }
 
 impl std::error::Error for DocumentStyleError {}
+
+#[cfg(test)]
+mod tests;

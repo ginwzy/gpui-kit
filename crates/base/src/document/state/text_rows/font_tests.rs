@@ -131,7 +131,9 @@ fn projected_font_fields_match_ordered_covering_semantics() {
 }
 
 fn assert_font_fields(p: &super::super::DocumentTextPresentation, text: &str) {
-    let runs: Vec<_> = font_runs(p, text.len()).collect();
+    let mut resolved = p.clone();
+    resolved.resolve_inline(text.len());
+    let runs: Vec<_> = font_runs(&resolved, text.len()).collect();
     assert_eq!(runs.first().unwrap().0.start, 0);
     assert_eq!(runs.last().unwrap().0.end, text.len());
     assert!(
@@ -176,7 +178,10 @@ fn item(
         display: 0..len,
         source: 0..len,
         node_id: Some(()),
-        presentation: presentation.map(std::sync::Arc::new),
+        presentation: presentation.map(|mut presentation| {
+            presentation.resolve_inline(len);
+            std::sync::Arc::new(presentation)
+        }),
         line: 0..len,
         line_key: 0,
         frame: Derived::default(),

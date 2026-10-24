@@ -1772,7 +1772,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 source: first_source,
                 node_id,
                 presentation,
-                line,
                 ..
             },
             DocumentLayoutItem::Text {
@@ -1838,9 +1837,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 (width, indent.hanging)
             });
         let line_height = window.pixel_snap(line_height.to_pixels(font_size.into(), rem_size));
-        let baseline = if self.model.inline_objects_in(line.clone()).is_empty() {
-            line_height
-        } else {
+        // This frame belongs to the entire source line. Sized text or an object
+        // can occur on a later wrapped row even when the first row is plain.
+        let baseline = {
             let mut style = base_style.clone();
             if let Some(refinement) = refinement {
                 style.refine(refinement);
@@ -2538,6 +2537,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .map(|(range, overrides)| {
                 let mut font = base.clone();
                 overrides.apply(&mut font);
+                let size = size * (f32::from(overrides.scale.unwrap_or(100)) / 100.);
                 (range.end, fonts.index(font, size))
             })
             .collect();

@@ -1,5 +1,10 @@
 //! Native shaping and real DocumentState layout, without physical window input.
 //! cargo test -p gpui-base --test text_width
+#[path = "text_width/projection.rs"]
+mod projection;
+#[path = "text_width/scaling.rs"]
+mod scaling;
+
 use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
@@ -45,6 +50,8 @@ fn main() {
                 .into(),
         ])
         .unwrap();
+    projection::check(&mut app);
+    scaling::check(&mut app);
     let texts = [
         "\tfn\tmain()\t{\t}\tlet\tx\t=\t1;\t".repeat(12),
         "family 👨\u{200d}👩\u{200d}👧\u{200d}👦 skin 👍🏽 flag 🏳\u{fe0f}\u{200d}🌈 ".repeat(12),
