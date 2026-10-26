@@ -7,15 +7,15 @@ use super::super::DocumentTextPresentation;
 /// Sparse overrides, not a resolved font: explicit NORMAL still overrides an
 /// inherited bold paragraph. Paint attributes never enter this representation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub(super) struct FontOverride<'a> {
+pub(in crate::document) struct FontOverride<'a> {
     weight: Option<FontWeight>,
     style: Option<FontStyle>,
     family: Option<&'a SharedString>,
-    pub(super) scale: Option<u8>,
+    pub(in crate::document) scale: Option<u8>,
 }
 
 impl FontOverride<'_> {
-    pub(super) fn apply(self, font: &mut Font) {
+    pub(in crate::document) fn apply(self, font: &mut Font) {
         if let Some(weight) = self.weight {
             font.weight = weight;
         }
@@ -30,7 +30,7 @@ impl FontOverride<'_> {
 
 /// Read the same resolved display intervals that StyledText paints. Adjacent
 /// paint-only differences coalesce, keeping wrap identity independent of color.
-pub(super) fn font_runs(
+pub(in crate::document) fn font_runs(
     presentation: &DocumentTextPresentation,
     len: usize,
 ) -> impl Iterator<Item = (Range<usize>, FontOverride<'_>)> {

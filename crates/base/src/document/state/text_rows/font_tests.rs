@@ -186,6 +186,7 @@ fn item(
         line_key: 0,
         frame: Derived::default(),
         wrapped: Derived::default(),
+        table: Derived::default(),
     }
 }
 

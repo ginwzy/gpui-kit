@@ -262,6 +262,15 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         display_delta: isize,
         keep_prefix: usize,
     ) {
+        // Later rows move with their geometry; only replaced rows change tables.
+        if self
+            .layout_items
+            .range(old.clone())
+            .chain(&replacement)
+            .any(DocumentLayoutItem::is_table_row)
+        {
+            self.tables.invalidate();
+        }
         self.layout_items
             .map_range(old.end..self.layout_items.len(), |item| {
                 item.shift(source_delta, display_delta);

@@ -34,6 +34,7 @@ pub(in crate::document) struct InlineRow<I: 'static> {
     /// Full-size text determines the row's strut, including actual fallback glyphs.
     text_layouts: Vec<gpui::TextLayout>,
     has_objects: bool,
+    origin: Option<gpui::Point<Pixels>>,
 }
 
 impl<I: Clone + Eq + Hash + 'static> InlineRow<I> {
@@ -159,7 +160,14 @@ impl<I: Clone + Eq + Hash + 'static> InlineRow<I> {
             line_height: frame.line_height(),
             text_layouts,
             has_objects: !presentation.objects.is_empty(),
+            origin: None,
         }
+    }
+
+    /// A table places text using the same unsnapped advances it measured.
+    pub(super) fn with_origin(mut self, origin: gpui::Point<Pixels>) -> Self {
+        self.origin = Some(origin);
+        self
     }
 }
 
@@ -212,15 +220,25 @@ impl<I: Clone + Eq + Hash + 'static> Element for InlineRow<I> {
         } else {
             self.paragraph_baseline
         };
-        self.baseline.set(bounds.top() + baseline);
-        self.content.prepaint(window, cx);
+        let mut drawn = bounds;
+        if let Some(origin) = self.origin {
+            drawn.origin = origin;
+        }
+        self.baseline.set(drawn.top() + baseline);
+        window.with_element_offset(drawn.origin - bounds.origin, |window| {
+            self.content.prepaint(window, cx)
+        });
         let layout = LineLayout::Inline {
             parts: self.parts.borrow().clone(),
-            bounds,
+            bounds: drawn,
         };
-        self.state.update(cx, |state, _| {
-            state.update_text_layout(self.item_ix, self.display.clone(), layout.clone(), bounds)
-        });
+        // Table subrows retain their paint geometry locally; the enclosing
+        // table registers the one Grid used for document hit testing.
+        if self.origin.is_none() {
+            self.state.update(cx, |state, _| {
+                state.update_text_layout(self.item_ix, self.display.clone(), layout.clone(), drawn)
+            });
+        }
         layout
     }
     fn paint(

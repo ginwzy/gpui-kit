@@ -72,6 +72,7 @@ pub(super) fn check(app: &mut TestApp) {
                 document,
                 family: "JetBrains Mono",
                 width: px(320.),
+                height: px(8000.),
             }
         });
         for width in [320., 31., 120., 320.] {

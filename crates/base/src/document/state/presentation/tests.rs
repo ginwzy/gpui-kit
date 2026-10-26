@@ -103,3 +103,45 @@ fn family_edges_split_paint_and_nested_layers_restore_inherited_fields() {
         vec![(0..3, "mono".into()), (6..9, "mono".into()),]
     );
 }
+
+#[test]
+fn a_line_owns_the_markup_its_text_hides_at_its_end() {
+    let source = "**bold**\nnext";
+    let mut model = DocumentModel::new(
+        source,
+        vec![DocumentRegion::new(
+            (),
+            0..source.len(),
+            EditPolicy::Readonly,
+        )],
+    )
+    .unwrap();
+    model
+        .set_rich_presentation(
+            DocumentProjection::new(
+                source.len(),
+                vec![ProjectionSpan::hide(0..2), ProjectionSpan::hide(6..8)],
+            )
+            .unwrap(),
+            vec![],
+            DocumentStyles::new(vec![], vec![]),
+        )
+        .unwrap();
+    let text = model.display_text();
+    assert_eq!(text, "bold\nnext");
+    let source_of = |display| {
+        let DocumentLayoutItem::Text { source, .. } =
+            model.text_layout_item(text, display, 0..source.len(), 0..4, 0)
+        else {
+            panic!("text item")
+        };
+        source
+    };
+    // The whole line ends after the closing delimiter, so selecting or
+    // clicking to its end reaches the source a copy needs.
+    assert_eq!(source_of(0..4), 2..8);
+    // A soft-wrapped row ends where its text does; the line's last row owns
+    // the delimiter.
+    assert_eq!(source_of(0..2), 2..4);
+    assert_eq!(source_of(2..4), 4..8);
+}

@@ -30,5 +30,7 @@ pub use state::{
     ScrollPinError, StructureError, StructureReplacement, StructureReplay, TextFrame, TextRows,
     UndoCheckpoint,
 };
-pub use style::{DocumentInlineStyle, DocumentParagraphStyle, DocumentStyleError, DocumentStyles};
+pub use style::{
+    DocumentInlineStyle, DocumentParagraphStyle, DocumentStyleError, DocumentStyles, TableRow,
+};
 pub use transaction::{EditDecision, EditOrigin, EditTransaction, TextEdit, TransactionError};

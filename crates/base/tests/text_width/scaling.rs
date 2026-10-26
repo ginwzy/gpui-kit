@@ -52,6 +52,7 @@ pub(super) fn check(app: &mut TestApp) {
             document,
             family: "JetBrains Mono",
             width: px(320.),
+            height: px(8000.),
         }
     });
     for scale in [90, 75, 90] {
@@ -177,6 +178,7 @@ fn check_modes(app: &mut TestApp) {
             document,
             family: "JetBrains Mono",
             width: px(400.),
+            height: px(8000.),
         }
     });
     for rows in [false, true, false, true] {

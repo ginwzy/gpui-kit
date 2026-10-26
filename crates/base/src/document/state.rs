@@ -52,6 +52,7 @@ mod inline_styles;
 mod layout_items;
 mod layout_window;
 mod presentation;
+pub(in crate::document) mod table;
 mod text_rows;
 mod viewport;
 use layout_items::LayoutItems;
@@ -814,9 +815,20 @@ struct ResolvedDocumentStyles {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct ResolvedParagraphStyle {
+    source: Range<usize>,
     display: Range<usize>,
     text_style: TextStyleRefinement,
     hanging_marker: Option<SharedString>,
+    table_row: Option<super::TableRow>,
+}
+
+impl ResolvedParagraphStyle {
+    fn shift(&mut self, source_delta: isize, display_delta: isize) {
+        self.source = shift_offset(self.source.start, source_delta)
+            ..shift_offset(self.source.end, source_delta);
+        self.display = shift_offset(self.display.start, display_delta)
+            ..shift_offset(self.display.end, display_delta);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -830,6 +842,7 @@ struct ResolvedInlineStyle {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct DocumentTextPresentation {
+    pub(super) table_row: Option<super::TableRow>,
     pub(super) text_style: Option<TextStyleRefinement>,
     pub(super) indent: Option<DocumentTextIndent>,
     pub(super) highlights: Vec<(Range<usize>, HighlightStyle)>,
@@ -868,6 +881,9 @@ enum DocumentLayoutItem<I> {
         frame: Derived<Option<text_rows::RowFrame>>,
         /// What the line's rows were wrapped for, once text rows wrapped it.
         wrapped: Derived<Option<text_rows::WrapKey>>,
+        /// A table row's cells, once text rows laid out its table. It moves
+        /// with the row; layout replaces it when the row's inputs change.
+        table: Derived<Option<std::sync::Arc<table::Resolved>>>,
     },
     Block {
         id: I,
@@ -1432,16 +1448,26 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
     ) -> DocumentLayoutItem<I> {
         // A hidden object shares display offsets with both adjacent text runs.
         // Keep the source extent so caret ownership does not cross that object.
+        // A line's end owns the markup its text hides there, such as a closing
+        // delimiter; a soft-wrapped row's end leaves the rest to the next row.
         let source_start = self
             .projection_map
             .display_to_source_from(display.start, Affinity::After, &mut cursor.run)
             .unwrap_or(segment.end)
             .clamp(segment.start, segment.end);
-        let source_end = self
+        let mut source_end = self
             .projection_map
             .display_to_source_from(display.end, Affinity::Before, &mut cursor.run)
-            .unwrap_or(segment.end)
-            .clamp(source_start, segment.end);
+            .unwrap_or(segment.end);
+        if display.end == line.end {
+            // A generated line break can map back over the text before it;
+            // the end only ever moves forward over hidden markup.
+            source_end = self
+                .projection_map
+                .display_to_source_from(display.end, Affinity::After, &mut cursor.run)
+                .map_or(source_end, |after| after.max(source_end));
+        }
+        let source_end = source_end.clamp(source_start, segment.end);
         let source = source_start..source_end;
         let mut node_id = self.node_after_from(source_start, &mut cursor.region);
         let objects = self.inline_objects_in(display.clone());
@@ -1468,6 +1494,8 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         let paragraph = paragraphs
             .get(from)
             .filter(|style| style.display.start <= display.start);
+        let table = paragraph
+            .filter(|style| style.display.start == line.start && style.table_row.is_some());
         let text_style = paragraph.map(|style| style.text_style.clone());
         let indent = paragraph.and_then(|style| {
             Some(DocumentTextIndent {
@@ -1512,6 +1540,7 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         let presentation = styled
             .then(|| {
                 let mut presentation = DocumentTextPresentation {
+                    table_row: table.and_then(|style| style.table_row.clone()),
                     text_style,
                     indent,
                     highlights,
@@ -1538,6 +1567,7 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             line_key,
             frame: Derived::default(),
             wrapped: Derived::default(),
+            table: Derived::default(),
         }
     }
 
@@ -1981,7 +2011,7 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         };
         let paragraphs = &mut self.resolved_styles.paragraphs;
         for style in &mut paragraphs[touched.end..] {
-            shift(&mut style.display);
+            style.shift(delta, delta);
         }
         paragraphs.splice(touched, resolved);
         let resolved_inline = &mut self.resolved_styles.inline;
@@ -2279,7 +2309,23 @@ fn resolve_document_styles<I: Eq>(
     let paragraphs = styles
         .paragraphs()
         .iter()
-        .map(|style| resolve_paragraph_style(projection, style.source(), style))
+        .map(|style| {
+            let source = style.source();
+            if let Some(row) = style.table_row() {
+                let cells = row
+                    .cells()
+                    .iter()
+                    .map(|(cell, _)| {
+                        if cell.start > cell.end || cell.end > source.len() {
+                            return Err(DocumentStyleError::ParagraphBoundary(source.clone()));
+                        }
+                        Ok(source.start + cell.start..source.start + cell.end)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                validate_style_ranges(text, regions, cells, false)?;
+            }
+            resolve_paragraph_style(projection, source, style)
+        })
         .collect::<Result<_, _>>()?;
     let mut inline = Vec::new();
     for style in styles.inline() {
@@ -2308,10 +2354,62 @@ fn resolve_paragraph_style(
     if !starts_line || !ends_line {
         return Err(DocumentStyleError::ParagraphBoundary(source));
     }
+    let table_row = style
+        .table_row()
+        .map(|row| {
+            // Source rows may include hidden Markdown delimiters. The projected
+            // row, excluding its terminating newline, must remain one line.
+            let content = display_text[display.clone()]
+                .strip_suffix('\n')
+                .unwrap_or(&display_text[display.clone()]);
+            if content.contains('\n') {
+                return Err(DocumentStyleError::ParagraphBoundary(source.clone()));
+            }
+            let content_end = display.start + content.len();
+            let cells = row
+                .cells()
+                .iter()
+                .map(|(cell, align)| {
+                    if cell.start > cell.end || cell.end > source.len() {
+                        return Err(DocumentStyleError::ParagraphBoundary(source.clone()));
+                    }
+                    let mut projected: Option<Range<usize>> = None;
+                    projection.project_source_range(
+                        source.start + cell.start..source.start + cell.end,
+                        |range| {
+                            projected = Some(match projected.take() {
+                                Some(previous) => {
+                                    previous.start.min(range.start)..previous.end.max(range.end)
+                                }
+                                None => range,
+                            });
+                        },
+                    );
+                    let range = projected.unwrap_or_else(|| {
+                        let at = projection
+                            .source_to_display(source.start + cell.start, Affinity::After)
+                            .unwrap_or(display.start)
+                            .clamp(display.start, content_end);
+                        at..at
+                    });
+                    // Normalized cell whitespace can share the source span
+                    // of the generated row newline; that newline is not cell text.
+                    Ok((
+                        range.start.clamp(display.start, content_end) - display.start
+                            ..range.end.clamp(display.start, content_end) - display.start,
+                        *align,
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(super::TableRow::new(row.table()).with_cells(cells))
+        })
+        .transpose()?;
     Ok(ResolvedParagraphStyle {
+        source,
         display,
         text_style: style.text_style().clone(),
         hanging_marker: style.hanging_marker().cloned(),
+        table_row,
     })
 }
 
@@ -2527,6 +2625,7 @@ pub struct DocumentState<I> {
     _cursor_subscriptions: [gpui::Subscription; 2],
     cursor_focus_subscriptions: Option<[gpui::Subscription; 3]>,
     text_layouts: Vec<TextLayoutRecord>,
+    tables: table::Tables<I>,
     block_layouts: Vec<BlockLayoutRecord>,
     trailer_layout: Option<(usize, Bounds<Pixels>)>,
     last_bounds: Option<Bounds<Pixels>>,
@@ -2637,6 +2736,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             _cursor_subscriptions: cursor_subscriptions,
             cursor_focus_subscriptions: None,
             text_layouts: Vec::new(),
+            tables: table::Tables::default(),
             block_layouts: Vec::new(),
             trailer_layout: None,
             last_bounds: None,
@@ -4231,6 +4331,14 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             return Some(cursor);
         };
         let x = *self.preferred_x.get_or_insert(position.x);
+        // Short cells leave blank space below their final visual line. That
+        // space is not another keyboard row, even if a neighboring cell is tall.
+        let bounds = self
+            .text_layouts
+            .iter()
+            .find(|record| record.item_ix == item_ix)
+            .and_then(|record| record.layout.cell_text_bounds(position))
+            .unwrap_or(bounds);
         let distance = if page {
             self.list_state
                 .viewport_bounds()
@@ -4675,7 +4783,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         point: Point<Pixels>,
     ) -> Option<DocumentPosition<I>> {
         let DocumentLayoutItem::Text {
-            source, node_id, ..
+            source,
+            node_id,
+            line,
+            ..
         } = self.layout_items.get(record.item_ix)?
         else {
             return None;
@@ -4706,16 +4817,35 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .unwrap_or_default();
             record.layout.closest_index(point, text)
         };
-        let affinity = if local == record.display.len() && local > 0 {
+        // A line's end follows the markup its text hides there, as the item
+        // does. The caret at a soft-wrapped row's end stays on that row, and
+        // at its node's end stays in that node.
+        let at_end = local == record.display.len() && local > 0;
+        let at_line_end = at_end && record.display.end == line.end;
+        let offset = if at_line_end {
+            source.end
+        } else {
+            self.model
+                .display_to_source(
+                    record.display.start + local,
+                    if at_end {
+                        Affinity::Before
+                    } else {
+                        Affinity::After
+                    },
+                )
+                .expect("laid out display positions map to source")
+                .clamp(source.start, source.end)
+        };
+        let node_end = node_id
+            .as_ref()
+            .and_then(|node| self.region(node))
+            .is_some_and(|region| region.range().end == offset);
+        let affinity = if at_end && (!at_line_end || node_end) {
             Affinity::Before
         } else {
             Affinity::After
         };
-        let offset = self
-            .model
-            .display_to_source(record.display.start + local, affinity)
-            .expect("laid out display positions map to source")
-            .clamp(source.start, source.end);
         self.position_for_offset(
             offset,
             if offset == self.model.text.len() {
@@ -4781,6 +4911,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.drag_table(event, cx) {
+            return;
+        }
         if event.pressed_button != Some(gpui::MouseButton::Left) {
             self.auto_scroll.stop();
             let link = hovered
@@ -4824,6 +4957,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) {
         if event.button != gpui::MouseButton::Left {
+            return;
+        }
+        if self.tables.end_drag() {
+            cx.notify();
             return;
         }
         self.auto_scroll.stop();
@@ -5392,7 +5529,13 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                         text_top = frame.0.map(|frame| frame.text_top(display, line));
                     }
                 }
-                let display = self.pending_row_paint_range(display.clone(), wrapped.0);
+                // Tables clip individual cell lines against the viewport; their
+                // geometry always addresses the complete row, including pending cells.
+                let display = if presentation.table_row.is_some() {
+                    display.clone()
+                } else {
+                    self.pending_row_paint_range(display.clone(), wrapped.0)
+                };
                 if let Some(hovered) = &self.hovered_link {
                     let mut changed = false;
                     let inline = self.model.styles.inline();
@@ -5445,7 +5588,25 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 presentation
                     .objects
                     .retain(|(range, _)| range.end <= display.len());
-                if !presentation.objects.is_empty()
+                // Planning gives every table row geometry before the list
+                // renders; a row not yet planned paints as ordinary text.
+                let table = (self.text_rows.is_some() && presentation.table_row.is_some())
+                    .then(|| self.table_view(&self.layout_items[item_ix]).zip(frame.0))
+                    .flatten();
+                if let Some((view, frame)) = table {
+                    DocumentChild::Inline {
+                        element: super::element::table::Row::new(
+                            cx.entity(),
+                            item_ix,
+                            display.clone(),
+                            self.model.display_text()[display.clone()].into(),
+                            presentation,
+                            frame,
+                            view,
+                        )
+                        .into_any_element(),
+                    }
+                } else if !presentation.objects.is_empty()
                     || (self.text_rows.is_some() && !presentation.font_scales.is_empty())
                 {
                     let frame = frame.0.expect("inline rows have resolved geometry");

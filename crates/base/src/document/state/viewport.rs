@@ -549,10 +549,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
 
     /// The user scrolled the list: reveals and following give way.
     pub(super) fn list_scrolled(&mut self, cx: &mut Context<Self>) {
-        let wrapping = self
-            .text_rows
-            .as_ref()
-            .is_some_and(|rows| rows.is_wrapping());
+        let wrapping = self.is_laying_out_text();
         if matches!(self.viewport.reveal, Some(Reveal::Caret))
             || matches!(
                 self.viewport.reveal,
@@ -598,7 +595,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .as_ref()
                 .and_then(|top| {
                     let position = self.model.position_for_anchor(top.anchor).ok()?;
-                    Some(geometry.item_top(self.position_item(&position)?)? + top.delta)
+                    let (ix, line_top, _) = self.scroll_line(&position)?;
+                    Some(geometry.item_top(ix)? + line_top + top.delta)
                 })
                 .unwrap_or(list_y)
         };
@@ -690,10 +688,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) -> Pixels {
         let height = geometry.viewport_height();
-        let wrapping = self
-            .text_rows
-            .as_ref()
-            .is_some_and(|rows| rows.is_wrapping());
+        let wrapping = self.is_laying_out_text();
         match &self.viewport.reveal {
             None => top,
             Some(Reveal::Caret) => {
@@ -730,8 +725,13 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     .model
                     .position_for_anchor(*anchor)
                     .ok()
-                    .and_then(|position| self.position_item(&position))
-                    .and_then(|ix| Some((geometry.item_top(ix)?, geometry.item_height(ix)?)));
+                    .and_then(|position| {
+                        let (ix, line_top, height) = self.scroll_line(&position)?;
+                        Some((
+                            geometry.item_top(ix)? + line_top,
+                            height.or_else(|| geometry.item_height(ix))?,
+                        ))
+                    });
                 // The target's own rows may still be one unwrapped line.
                 if !wrapping {
                     self.set_reveal(None);
@@ -814,12 +814,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         if let Some(previous) = self.viewport.top.take() {
             self.model.anchors.remove(previous.anchor);
         }
-        let offset = match &self.layout_items[ix] {
-            DocumentLayoutItem::Text { source, .. } | DocumentLayoutItem::Block { source, .. } => {
-                source.start
-            }
-            _ => unreachable!("anchored items are text or blocks"),
-        };
+        let (offset, delta) = self.scroll_anchor(ix, delta);
         // The viewport holds content, not a node: content inserted before it
         // pushes it down, and replacing its text leaves the viewport where the
         // replacement starts.
@@ -855,6 +850,31 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     }
 
     /// The item that owns `position`: its block, or its text row.
+    /// The line `position` scrolls by: its item, the line's top below the
+    /// item's top, and its height when not the item's own. A table row
+    /// scrolls by its cells' wrapped lines; any other item is one line.
+    fn scroll_line(
+        &self,
+        position: &DocumentPosition<I>,
+    ) -> Option<(usize, Pixels, Option<Pixels>)> {
+        match self.table_line_for_position(position) {
+            Some((ix, line_top, height)) => Some((ix, line_top, Some(height))),
+            None => Some((self.position_item(position)?, Pixels::ZERO, None)),
+        }
+    }
+
+    /// The inverse of [`Self::scroll_line`]: the content `delta` below the
+    /// top of item `ix`, as a source offset and its distance below the top
+    /// of the line it scrolls by.
+    fn scroll_anchor(&self, ix: usize, delta: Pixels) -> (usize, Pixels) {
+        self.table_anchor_in_item(ix, delta)
+            .unwrap_or_else(|| match &self.layout_items[ix] {
+                DocumentLayoutItem::Text { source, .. }
+                | DocumentLayoutItem::Block { source, .. } => (source.start, delta),
+                _ => unreachable!("anchored items are text or blocks"),
+            })
+    }
+
     fn position_item(&self, position: &DocumentPosition<I>) -> Option<usize> {
         self.block_item(position.node_id())
             .or_else(|| self.text_item_for_position(position))
@@ -901,6 +921,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             return Some((top, height.unwrap_or_default()));
         };
         if self.text_rows.is_some() {
+            if let Some((_, in_row, line)) = self.table_line_for_position(position) {
+                return Some((top + in_row, line));
+            }
             // Each display row is one line of text: its frame places it.
             return Some(match frame.0 {
                 Some(frame) => {

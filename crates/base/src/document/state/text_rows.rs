@@ -31,7 +31,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use super::{Derived, DocumentLayoutItem, DocumentState, DocumentTextContext};
 use crate::document::DocumentRegion;
 
-mod font_runs;
+pub(in crate::document) mod font_runs;
 mod wrap;
 use font_runs::{FontOverride, font_runs};
 use wrap::{Breaks, Previous, Wrap};
@@ -200,6 +200,7 @@ pub(in crate::document) struct RowFrame {
     indent: Pixels,
     /// The line starts at the marker, so only its later rows are indented.
     hanging: bool,
+    table_height: Option<Pixels>,
 }
 
 impl RowFrame {
@@ -221,7 +222,9 @@ impl RowFrame {
         if self.hidden {
             return px(0.);
         }
-        let mut height = self.inline_metrics(presentation).0;
+        let mut height = self
+            .table_height
+            .unwrap_or_else(|| self.inline_metrics(presentation).0);
         if row.start == line.start {
             height += self.space_before;
         }
@@ -273,7 +276,7 @@ impl RowFrame {
     }
 
     /// The widths the line's first and later rows wrap to in a document `width` wide.
-    fn widths(&self, width: Pixels) -> (Pixels, Pixels) {
+    pub(super) fn widths(&self, width: Pixels) -> (Pixels, Pixels) {
         let available = (width - self.inset_start - self.inset_end).max(px(0.));
         let text = self.max_width.map_or(available, |max| max.min(available));
         let indented = (text - self.indent).max(px(0.));
@@ -867,9 +870,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// geometry remains internally consistent, but may be a bounded initial
     /// placeholder or the preceding complete wrap.
     pub fn is_laying_out_text(&self) -> bool {
-        self.text_rows
-            .as_ref()
-            .is_some_and(|rows| rows.is_wrapping())
+        self.tables.is_pending()
+            || self
+                .text_rows
+                .as_ref()
+                .is_some_and(|rows| rows.is_wrapping())
     }
 
     pub(super) fn retained_row_style(
@@ -967,6 +972,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 self.layout_items_changed();
             }
             (None, Some(_)) => {
+                self.tables.suspend();
                 self.text_rows = None;
                 self.reconcile_layout_items_from(0);
                 // Geometry belongs to the rows that derived it. Without any,
@@ -1021,6 +1027,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             }
             return;
         }
+        if items.iter().any(|&ix| self.layout_items[ix].is_table_row()) {
+            self.tables.invalidate();
+        }
         let lines: Vec<_> = items
             .iter()
             .filter_map(|&ix| match &self.layout_items[ix] {
@@ -1046,8 +1055,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let mut ix = 0;
         while ix < self.layout_items.len() {
             match &self.layout_items[ix] {
-                DocumentLayoutItem::Text { node_id, line, .. } => {
+                item @ DocumentLayoutItem::Text { node_id, line, .. } => {
                     if owned(node_id.as_ref()) {
+                        if item.is_table_row() {
+                            self.tables.invalidate();
+                        }
                         self.text_rows
                             .as_mut()
                             .unwrap()
@@ -1083,8 +1095,16 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         cleared
     }
 
+    /// Some items dropped their frames; the next prepare resolves them.
+    pub(super) fn resolve_dropped_frames(&mut self) {
+        if let Some(state) = self.text_rows.as_mut() {
+            state.resolve = true;
+        }
+    }
+
     /// Layout items were added or replaced; layout resolves and wraps them.
     pub(super) fn layout_items_changed(&mut self) {
+        self.tables.invalidate();
         if let Some(state) = self.text_rows.as_mut() {
             state.invalidate();
             state.edit = None;
@@ -1175,6 +1195,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         };
         let style = RowsStyle::new(window);
         if state.style.as_ref() != Some(&style) {
+            self.tables.invalidate();
             // Before the first style, rows have derived no geometry to clear.
             state.ascii_advance = None;
             if let Some(old_style) = state.style.replace(style) {
@@ -1210,6 +1231,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         } else {
             state.resize_pending = false;
         }
+        self.prepare_tables(bounds, resized, window, cx);
+        let state = self.text_rows.as_mut().expect("text rows are on");
         // Replaced items resolve now, or with a whole-document pass.
         if state.resolve {
             state.resolve = false;
@@ -1411,7 +1434,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     // As the wrap check decides it, without a second pass.
                     let wrap = width.filter(|_| !keep_old).and_then(|width| {
                         let widths = resolved.widths(width);
-                        let whole = resolved.hidden
+                        let whole = item.is_table_row()
+                            || resolved.hidden
                             || line.is_empty()
                             || presentation.is_none()
                                 && ascii_advance.is_some_and(|advance| {
@@ -1759,7 +1783,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         start..end
     }
 
-    fn resolve_line_frame(
+    pub(super) fn resolve_line_frame(
         &self,
         first: &DocumentLayoutItem<I>,
         last: &DocumentLayoutItem<I>,
@@ -1850,6 +1874,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .baseline_offset(font, font_size, line_height)
         };
         RowFrame {
+            table_height: match first {
+                DocumentLayoutItem::Text { table, .. } => {
+                    table.0.as_ref().map(|table| table.geometry.height)
+                }
+                _ => None,
+            },
             space_before: frame.space_before.to_pixels(rem_size),
             space_after: frame.space_after.to_pixels(rem_size),
             inset_start: frame.inset_start.to_pixels(rem_size),
@@ -2002,7 +2032,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 if wrapped.0 == Some(wrap) && item_frame == frame {
                     continue;
                 }
-                if frame.hidden || line.is_empty() {
+                if frame.hidden || line.is_empty() || item.is_table_row() {
                     if rows.len() == 1 {
                         push_settled(&mut settled, rows, wrap);
                     } else {

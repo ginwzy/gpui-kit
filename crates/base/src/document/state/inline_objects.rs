@@ -1,6 +1,7 @@
 //! Inline object projection and layout stay part of the document owner.
-use std::{hash::Hash, ops::Range};
+use std::{hash::Hash, ops::Range, sync::Arc};
 
+use super::table::Geometry;
 use super::*;
 
 #[cfg(test)]
@@ -38,6 +39,11 @@ pub(in crate::document) enum LineLayout {
         parts: Vec<InlinePartLayout>,
         bounds: Bounds<Pixels>,
     },
+    Grid {
+        geometry: Arc<Geometry>,
+        offset: Pixels,
+        bounds: Bounds<Pixels>,
+    },
 }
 
 impl From<gpui::TextLayout> for LineLayout {
@@ -57,6 +63,14 @@ impl LineLayout {
     pub(in crate::document) fn position_for_index(&self, ix: usize) -> Option<Point<Pixels>> {
         match self {
             Self::Text(layout) => layout.position_for_index(ix),
+            Self::Grid {
+                geometry,
+                bounds,
+                offset,
+                ..
+            } => geometry
+                .position_for_index(ix)
+                .map(|position| bounds.origin + position - point(*offset, px(0.))),
             Self::Inline { parts, bounds } => {
                 let part = parts
                     .iter()
@@ -77,13 +91,48 @@ impl LineLayout {
         match self {
             Self::Text(layout) => layout.line_height(),
             Self::Inline { bounds, .. } => bounds.size.height,
+            Self::Grid { geometry, .. } => geometry.line_height,
         }
+    }
+
+    pub(super) fn cell_text_bounds(&self, position: Point<Pixels>) -> Option<Bounds<Pixels>> {
+        let Self::Grid {
+            geometry,
+            bounds,
+            offset,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let cell = geometry.cell_at(position.x - bounds.left() + *offset)?;
+        Some(Bounds::new(
+            bounds.origin + point(cell.x - *offset, geometry.padding),
+            gpui::size(cell.width, geometry.line_height * cell.lines.len() as f32),
+        ))
     }
 
     /// The display index of the glyph under `point`, if any; objects have none.
     pub(super) fn index_at(&self, point: Point<Pixels>) -> Option<usize> {
         match self {
             Self::Text(layout) => layout.index_for_position(point).ok(),
+            Self::Grid {
+                geometry,
+                bounds,
+                offset,
+                ..
+            } => {
+                let local = point - bounds.origin + gpui::point(*offset, px(0.));
+                let cell = geometry.cell_at(local.x)?;
+                if local.y < geometry.padding || local.x < cell.x || local.x >= cell.x + cell.width
+                {
+                    return None;
+                }
+                let row = (f32::from(local.y - geometry.padding) / f32::from(geometry.line_height))
+                    .floor() as usize;
+                let line = cell.lines.get(row)?;
+                line.index_at(local.x - cell.text_x(line, geometry.padding))
+            }
             Self::Inline { parts, .. } => {
                 let part = parts
                     .iter()
@@ -103,6 +152,21 @@ impl LineLayout {
                     text,
                 )
             }),
+            Self::Grid {
+                geometry,
+                bounds,
+                offset,
+                ..
+            } => {
+                let local = point - bounds.origin + gpui::point(*offset, px(0.));
+                geometry
+                    .cell_at(local.x)
+                    .and_then(|cell| {
+                        let line = geometry.line_at(cell, local.y)?;
+                        Some(line.closest_index(local.x - cell.text_x(line, geometry.padding)))
+                    })
+                    .unwrap_or(0)
+            }
             Self::Inline { parts, .. } => {
                 let Some(part) = parts.iter().min_by(|a, b| {
                     let distance = |bounds: Bounds<Pixels>| {

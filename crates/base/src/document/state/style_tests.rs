@@ -1,7 +1,175 @@
 use super::*;
 use crate::document::{
-    DocumentInlineStyle, DocumentParagraphStyle, ProjectionMapping, ProjectionSpan,
+    DocumentInlineStyle, DocumentParagraphStyle, DocumentProjection, EditOrigin, EditTransaction,
+    ProjectionMapping, ProjectionSpan, TableRow, TextEdit,
 };
+
+#[gpui::test]
+fn editing_a_prefix_rebases_paragraph_source_and_display_together(cx: &mut gpui::TestAppContext) {
+    for table in [false, true] {
+        let source = "x\nplain\nA|B";
+        let document = cx.new(|cx| {
+            let mut document = DocumentState::new(
+                source,
+                vec![
+                    DocumentRegion::new(0u8, 0..2, EditPolicy::Editable),
+                    DocumentRegion::new(1u8, 2..source.len(), EditPolicy::Readonly),
+                ],
+                cx,
+            )
+            .unwrap();
+            let mut paragraph = DocumentParagraphStyle::new(8..source.len(), Default::default());
+            if table {
+                paragraph = paragraph.with_table_row(TableRow::new(6).with_cells([
+                    (0..1, gpui::TextAlign::Left),
+                    (2..3, gpui::TextAlign::Right),
+                ]));
+            }
+            document
+                .set_rich_presentation(
+                    DocumentProjection::identity(source.len()),
+                    Vec::new(),
+                    DocumentStyles::new(vec![paragraph], Vec::new()),
+                    cx,
+                )
+                .unwrap();
+            document
+        });
+        for (range, replacement) in [(0..1, "long"), (0..4, "y")] {
+            document.update(cx, |document, cx| {
+                let transaction = EditTransaction::new(
+                    document.revision(),
+                    EditOrigin::User,
+                    vec![TextEdit::new(range, replacement)],
+                    document.text().len(),
+                )
+                .unwrap();
+                document.apply_transaction(transaction, cx);
+                let start = replacement.len() + "\nplain\n".len();
+                let paragraph = &document.model.resolved_styles.paragraphs[0];
+                assert_eq!(paragraph.source, start..document.text().len());
+                assert_eq!(paragraph.display, paragraph.source);
+            });
+        }
+    }
+}
+
+#[gpui::test]
+fn table_rows_reject_multiple_display_lines_but_allow_hidden_source_lines(
+    cx: &mut gpui::TestAppContext,
+) {
+    for (source, projection, cell, accepted) in [
+        ("a\nb", DocumentProjection::identity(3), 2..3, false),
+        (
+            "a\nb",
+            DocumentProjection::new(3, vec![ProjectionSpan::hide(0..2)]).unwrap(),
+            2..3,
+            true,
+        ),
+        ("a\n", DocumentProjection::identity(2), 0..1, true),
+        ("a\n", DocumentProjection::identity(2), 0..2, true),
+    ] {
+        let document = cx.new(|cx| {
+            DocumentState::new(
+                source,
+                vec![DocumentRegion::new(
+                    0u8,
+                    0..source.len(),
+                    EditPolicy::Readonly,
+                )],
+                cx,
+            )
+            .unwrap()
+        });
+        document.update(cx, |document, cx| {
+            let result = document.set_rich_presentation(
+                projection,
+                Vec::new(),
+                DocumentStyles::new(
+                    vec![
+                        DocumentParagraphStyle::new(0..source.len(), Default::default())
+                            .with_table_row(
+                                TableRow::new(0).with_cells([(cell, gpui::TextAlign::Left)]),
+                            ),
+                    ],
+                    Vec::new(),
+                ),
+                cx,
+            );
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "source={source:?}, result={result:?}"
+            );
+            if accepted {
+                assert_eq!(
+                    document.model.resolved_styles.paragraphs[0]
+                        .table_row
+                        .as_ref()
+                        .unwrap()
+                        .cells()[0]
+                        .0,
+                    0..1
+                );
+            }
+        });
+    }
+}
+
+#[gpui::test]
+fn table_cells_validate_source_boundaries_and_overlap_before_layout(cx: &mut gpui::TestAppContext) {
+    let source = "中文|x";
+    let document = cx.new(|cx| {
+        DocumentState::<u8>::new(
+            source,
+            vec![DocumentRegion::new(
+                0,
+                0..source.len(),
+                EditPolicy::Readonly,
+            )],
+            cx,
+        )
+        .unwrap()
+    });
+    let styles = |cells: Vec<Range<usize>>| {
+        DocumentStyles::new(
+            vec![
+                DocumentParagraphStyle::new(0..source.len(), Default::default()).with_table_row(
+                    TableRow::new(0).with_cells(
+                        cells
+                            .into_iter()
+                            .map(|range| (range, gpui::TextAlign::Left)),
+                    ),
+                ),
+            ],
+            Vec::new(),
+        )
+    };
+    for cells in [vec![1..3], vec![0..source.len() + 1], vec![0..6, 3..6]] {
+        document.update(cx, |document, cx| {
+            assert!(
+                document
+                    .set_rich_presentation(
+                        DocumentProjection::identity(source.len()),
+                        Vec::new(),
+                        styles(cells),
+                        cx
+                    )
+                    .is_err()
+            )
+        });
+    }
+    document.update(cx, |document, cx| {
+        document
+            .set_rich_presentation(
+                DocumentProjection::identity(source.len()),
+                Vec::new(),
+                styles(vec![0..3, 3..6, 7..8]),
+                cx,
+            )
+            .unwrap()
+    });
+}
 
 // The previous full scan is an oracle for error order, including its treatment
 // of empty ranges. Keep it only in tests.

@@ -136,6 +136,43 @@ pub struct DocumentParagraphStyle {
     source: Range<usize>,
     text_style: TextStyleRefinement,
     hanging_marker: Option<SharedString>,
+    table_row: Option<TableRow>,
+}
+
+/// One row of a table. Cell source ranges are relative to the paragraph's
+/// source start; the table identity is local to the owning document node.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableRow {
+    table: usize,
+    cells: Vec<(Range<usize>, gpui::TextAlign)>,
+}
+
+impl TableRow {
+    /// `table` identifies the table within its document node, such as the
+    /// table's source start; rows sharing it share column widths.
+    pub fn new(table: usize) -> Self {
+        Self {
+            table,
+            cells: Vec::new(),
+        }
+    }
+
+    /// Appends cells in order, each a source range relative to the paragraph.
+    pub fn with_cells(
+        mut self,
+        cells: impl IntoIterator<Item = (Range<usize>, gpui::TextAlign)>,
+    ) -> Self {
+        self.cells.extend(cells);
+        self
+    }
+
+    pub fn table(&self) -> usize {
+        self.table
+    }
+
+    pub fn cells(&self) -> &[(Range<usize>, gpui::TextAlign)] {
+        &self.cells
+    }
 }
 
 impl DocumentParagraphStyle {
@@ -144,6 +181,7 @@ impl DocumentParagraphStyle {
             source,
             text_style,
             hanging_marker: None,
+            table_row: None,
         }
     }
 
@@ -157,6 +195,17 @@ impl DocumentParagraphStyle {
 
     pub fn hanging_marker(&self) -> Option<&SharedString> {
         self.hanging_marker.as_ref()
+    }
+
+    /// Display-row mode lays out cells with shared column widths. Measured-line
+    /// mode retains this declaration and paints the ordinary projected text.
+    pub fn with_table_row(mut self, row: TableRow) -> Self {
+        self.table_row = Some(row);
+        self
+    }
+
+    pub fn table_row(&self) -> Option<&TableRow> {
+        self.table_row.as_ref()
     }
 
     pub fn source(&self) -> Range<usize> {

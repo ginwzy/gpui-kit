@@ -14,6 +14,7 @@ use super::{
 use crate::editing::blink_cursor::caret_bounds;
 
 pub(super) mod inline;
+pub(super) mod table;
 
 pub(super) enum DocumentChild<I: 'static> {
     Inline {

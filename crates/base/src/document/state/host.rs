@@ -299,7 +299,8 @@ impl<I> DocumentLayoutItem<I> {
         }
     }
 
-    /// Drops the geometry layout derived for this item.
+    /// Drops the geometry layout derived for this item. A table row keeps its
+    /// cells: they are shown until its table is laid out for the new frame.
     pub(super) fn forget_geometry(&mut self) {
         match self {
             Self::Text { frame, wrapped, .. } => {
@@ -317,15 +318,22 @@ impl<I> DocumentLayoutItem<I> {
     pub(super) fn keep_geometry(&mut self, old: &Self) {
         match (self, old) {
             (
-                Self::Text { frame, wrapped, .. },
+                Self::Text {
+                    frame,
+                    wrapped,
+                    table,
+                    ..
+                },
                 Self::Text {
                     frame: old_frame,
                     wrapped: old_wrapped,
+                    table: old_table,
                     ..
                 },
             ) => {
                 *frame = *old_frame;
                 *wrapped = *old_wrapped;
+                *table = old_table.clone();
             }
             (
                 Self::Block { height, .. } | Self::AnchoredBlock { height, .. },
@@ -388,10 +396,10 @@ impl ResolvedDocumentStyles {
             .paragraphs
             .partition_point(|style| style.display.start < range.end);
         for style in &mut replacement.paragraphs {
-            style.display = shifted(style.display.clone(), range.start as isize);
+            style.shift(source.start as isize, range.start as isize);
         }
         for style in &mut self.paragraphs[to..] {
-            style.display = shifted(style.display.clone(), delta);
+            style.shift(source_delta, delta);
         }
         self.paragraphs.splice(from..to, replacement.paragraphs);
         let from = self

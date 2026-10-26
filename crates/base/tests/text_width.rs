@@ -4,6 +4,8 @@
 mod projection;
 #[path = "text_width/scaling.rs"]
 mod scaling;
+#[path = "text_width/table.rs"]
+mod table;
 
 use std::{cell::RefCell, rc::Rc};
 
@@ -21,13 +23,14 @@ struct Root {
     document: Entity<DocumentState<u8>>,
     family: &'static str,
     width: gpui::Pixels,
+    height: gpui::Pixels,
 }
 
 impl Render for Root {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
             .w(self.width)
-            .h(px(8000.))
+            .h(self.height)
             .font_family(self.family)
             .text_size(px(14.))
             .child(self.document.clone())
@@ -52,6 +55,7 @@ fn main() {
         .unwrap();
     projection::check(&mut app);
     scaling::check(&mut app);
+    table::check(&mut app);
     let texts = [
         "\tfn\tmain()\t{\t}\tlet\tx\t=\t1;\t".repeat(12),
         "family 👨\u{200d}👩\u{200d}👧\u{200d}👦 skin 👍🏽 flag 🏳\u{fe0f}\u{200d}🌈 ".repeat(12),
@@ -92,6 +96,7 @@ fn main() {
                     document,
                     family,
                     width: px(600.),
+                    height: px(8000.),
                 }
             });
             // Both shrinking and expanding the same retained document.
