@@ -396,7 +396,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             let unchanged = counts.get(&key) == Some(&rows.len())
                 && rows.iter().enumerate().all(|(ix, row)| {
                     row.previous.as_ref().is_some_and(|old| {
-                        !old.provisional
+                        old.is_measured()
+                            && !old.provisional
                             && old.input == row.input
                             && old.geometry.fits(ix == 0, ix == last)
                     })

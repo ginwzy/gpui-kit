@@ -158,6 +158,38 @@ fn table_results_publish_one_complete_table_per_layout_frame(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+fn replanning_unfinished_tables_keeps_layout_scheduled(cx: &mut TestAppContext) {
+    for completed in [false, true] {
+        let (document, mut cx) = isolated_document(cx);
+        install(&document, &mut cx, "second words ");
+        prepare(&document, &mut cx);
+        if completed {
+            cx.run_until_parked();
+        }
+        document.update(&mut cx, |document, _| {
+            assert!(geometries(document).iter().all(|row| !row.is_measured()));
+            assert_eq!(document.tables.ready.is_some(), completed);
+            document.tables.invalidate();
+        });
+        prepare(&document, &mut cx);
+        document.read_with(&cx, |document, _| {
+            assert!(
+                document.tables.is_pending(),
+                "unmeasured placeholders must not settle a table during replanning"
+            );
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            prepare(&document, &mut cx);
+        }
+        document.read_with(&cx, |document, _| {
+            assert!(!document.tables.is_pending());
+            assert!(geometries(document).iter().all(|row| row.is_measured()));
+        });
+    }
+}
+
+#[gpui::test]
 fn stale_table_completion_cannot_replace_or_clear_the_current_task(cx: &mut TestAppContext) {
     let (document, mut cx) = isolated_document(cx);
     install(&document, &mut cx, "old words ");
