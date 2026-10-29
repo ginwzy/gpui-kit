@@ -1,9 +1,9 @@
 // From:
 // https://github.com/zed-industries/zed/blob/56daba28d40301ee4c05546fadb691d070b7b2b6/crates/gpui/examples/window_shadow.rs
 use gpui::{
-    AnyElement, App, CursorStyle, Decorations, Edges, Hsla, InteractiveElement as _, IntoElement,
-    MouseButton, ParentElement, Pixels, Point, RenderOnce, ResizeEdge, Size, Styled as _, Tiling,
-    Window, div, point, prelude::FluentBuilder as _, px,
+    AnyElement, App, Corners, CursorStyle, Decorations, Edges, Hsla, InteractiveElement as _,
+    IntoElement, MouseButton, ParentElement, Pixels, Point, RenderOnce, ResizeEdge, Size,
+    Styled as _, Tiling, Window, div, point, prelude::FluentBuilder as _, px, rounded_clip,
 };
 
 use crate::ActiveTheme;
@@ -15,12 +15,6 @@ pub(crate) const SHADOW_SIZE: Pixels = px(20.0);
 const BORDER_SIZE: Pixels = px(1.0);
 /// Half-width of the resize hit band on each side of the visible frame (inner border).
 const RESIZE_HIT_SIZE: Pixels = px(4.0);
-///
-/// GPUI currently clips overflowing children to a rectangular content mask. A non-zero
-/// radius here would round the frame itself but leave child backgrounds visible in the
-/// corners, so keep the generic window wrapper square until rounded content masks exist.
-pub(crate) const BORDER_RADIUS: Pixels = px(0.0);
-
 /// Create a new window border.
 pub fn window_border() -> WindowBorder {
     WindowBorder::new()
@@ -84,6 +78,32 @@ fn client_frame_insets(shadow_size: Pixels, tiling: &Tiling) -> Edges<Pixels> {
     insets
 }
 
+/// A corner is rounded only when neither of its adjacent edges is tiled.
+fn frame_radii(tiling: &Tiling, radius: Pixels) -> Corners<Pixels> {
+    Corners {
+        top_left: if tiling.top || tiling.left {
+            px(0.)
+        } else {
+            radius
+        },
+        top_right: if tiling.top || tiling.right {
+            px(0.)
+        } else {
+            radius
+        },
+        bottom_right: if tiling.bottom || tiling.right {
+            px(0.)
+        } else {
+            radius
+        },
+        bottom_left: if tiling.bottom || tiling.left {
+            px(0.)
+        } else {
+            radius
+        },
+    }
+}
+
 /// Get the window paddings.
 pub fn window_paddings(window: &Window) -> Edges<Pixels> {
     let shadow_size = window.client_inset().unwrap_or(SHADOW_SIZE);
@@ -130,6 +150,11 @@ impl ParentElement for WindowBorder {
 impl RenderOnce for WindowBorder {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let decorations = window.window_decorations();
+        let radii = match decorations {
+            Decorations::Client { tiling } => frame_radii(&tiling, cx.theme().radius_tokens().xl),
+            Decorations::Server => Corners::default(),
+        };
+        let content_radii = radii.map(|radius| (*radius - BORDER_SIZE).max(px(0.)));
         // Keep the platform client inset stable. When the window is tiled on all sides we stop drawing
         // shadow padding, but `set_client_inset` must still use the full shadow size. Clearing it
         // makes the first resize after restore double-count the shadow in `compute_outer_size`, and
@@ -175,12 +200,6 @@ impl RenderOnce for WindowBorder {
                     .flex_col()
                     .overflow_hidden()
                     .bg(gpui::transparent_black())
-                    .when(!(tiling.top || tiling.right), |div| {
-                        div.rounded_tr(BORDER_RADIUS)
-                    })
-                    .when(!(tiling.top || tiling.left), |div| {
-                        div.rounded_tl(BORDER_RADIUS)
-                    })
                     .when(!tiling.top, |div| div.pt(visual_shadow))
                     .when(!tiling.bottom, |div| div.pb(visual_shadow))
                     .when(!tiling.left, |div| div.pl(visual_shadow))
@@ -213,12 +232,10 @@ impl RenderOnce for WindowBorder {
                             .min_h_0()
                             .min_w_0()
                             .overflow_hidden()
-                            .when(!(tiling.top || tiling.right), |div| {
-                                div.rounded_tr(BORDER_RADIUS)
-                            })
-                            .when(!(tiling.top || tiling.left), |div| {
-                                div.rounded_tl(BORDER_RADIUS)
-                            })
+                            .rounded_tl(radii.top_left)
+                            .rounded_tr(radii.top_right)
+                            .rounded_br(radii.bottom_right)
+                            .rounded_bl(radii.bottom_left)
                             .border_color(border_color)
                             .when(!tiling.top, |div| div.border_t(BORDER_SIZE))
                             .when(!tiling.bottom, |div| div.border_b(BORDER_SIZE))
@@ -265,7 +282,14 @@ impl RenderOnce for WindowBorder {
                         cx.stop_propagation();
                     })
                     .bg(gpui::transparent_black())
-                    .children(self.children),
+                    .child(
+                        rounded_clip(
+                            "window-content-clip",
+                            content_radii,
+                            div().size_full().children(self.children),
+                        )
+                        .overlay_host(true),
+                    ),
             )
             .when(matches!(decorations, Decorations::Client { .. }), |this| {
                 let Decorations::Client { tiling, .. } = decorations else {
@@ -449,3 +473,6 @@ fn resize_edge(
     }
     None
 }
+
+#[cfg(test)]
+mod tests;
