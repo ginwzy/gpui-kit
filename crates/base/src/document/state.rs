@@ -1484,11 +1484,14 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         }
         // Source styles are ordered and nonoverlapping; projection preserves
         // endpoint order (but can collapse or overlap display ranges). Find the
-        // first end that can contain this line, then check its start. Keep equal
-        // ends: an empty line at a shared boundary belongs to the first match.
+        // first end that can contain this line, then check its start. At a shared
+        // display end, skip a paragraph whose source ends before this row.
         let paragraphs = &self.resolved_styles.paragraphs;
         let from = partition_from(paragraphs, cursor.paragraph, |style| {
             style.display.end < display.end
+                || (style.display.end == display.start
+                    && style.source.start < source.start
+                    && style.source.end <= source.start)
         });
         cursor.paragraph = from;
         let paragraph = paragraphs

@@ -1,9 +1,52 @@
 use super::super::{DocumentLayoutItem, DocumentModel, DocumentTextPresentation};
 use crate::document::{
-    DocumentInlineStyle, DocumentProjection, DocumentRegion, DocumentStyles, EditPolicy,
-    ProjectionSpan,
+    DocumentInlineStyle, DocumentParagraphStyle, DocumentProjection, DocumentRegion,
+    DocumentStyles, EditPolicy, ProjectionSpan,
 };
 use gpui::{FontStyle, FontWeight, HighlightStyle, blue, red};
+
+#[test]
+fn empty_rows_keep_styles_only_inside_their_paragraph() {
+    for (source, projection) in [
+        ("item\n\n", DocumentProjection::identity(6)),
+        (
+            "x",
+            DocumentProjection::new(1, vec![ProjectionSpan::replace(0..1, "item\n\n")]).unwrap(),
+        ),
+    ] {
+        let mut model = DocumentModel::new(
+            source,
+            vec![
+                DocumentRegion::new("history", 0..source.len(), EditPolicy::Readonly),
+                DocumentRegion::new("draft", source.len()..source.len(), EditPolicy::Editable),
+            ],
+        )
+        .unwrap();
+        model
+            .set_rich_presentation(
+                projection,
+                vec![],
+                DocumentStyles::new(
+                    vec![
+                        DocumentParagraphStyle::new(0..source.len(), Default::default())
+                            .with_hanging_marker("• "),
+                    ],
+                    vec![],
+                ),
+            )
+            .unwrap();
+        let styled: Vec<_> = model
+            .layout_items(None)
+            .into_iter()
+            .filter_map(|item| match item {
+                DocumentLayoutItem::Text { presentation, .. } => Some(presentation.is_some()),
+                _ => None,
+            })
+            .collect();
+        // The paragraph's internal blank line keeps its style; the empty draft does not.
+        assert_eq!(styled, [true, true, false]);
+    }
+}
 
 #[test]
 fn projected_styles_merge_fields_and_split_the_same_paint_and_font_intervals() {
