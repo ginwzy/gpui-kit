@@ -486,13 +486,14 @@ fn hash_font_refinement(style: &TextStyleRefinement, hasher: &mut DefaultHasher)
     style.font_style.hash(hasher);
 }
 
-/// What changes every advance: cached wraps of another base style are stale.
+/// The base style and device scale whose frames and cached wraps are valid.
 #[derive(Clone, Debug, PartialEq)]
 struct RowsStyle {
     font: Font,
     font_size: Pixels,
     line_height: Pixels,
     rem_size: Pixels,
+    scale_factor: f32,
 }
 
 impl RowsStyle {
@@ -505,6 +506,7 @@ impl RowsStyle {
             font_size,
             line_height: style.line_height.to_pixels(font_size.into(), rem_size),
             rem_size,
+            scale_factor: window.scale_factor(),
         }
     }
 }
