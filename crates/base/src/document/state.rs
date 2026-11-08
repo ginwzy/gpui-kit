@@ -3355,6 +3355,17 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.commit_user_transaction(transaction, None, cx)
     }
 
+    /// Commit an editor transformation with a cursor relative to its edited region.
+    /// Both undo and redo retain the caller's cursor; invalid results do not mutate.
+    pub fn apply_transaction_with_cursor(
+        &mut self,
+        transaction: EditTransaction,
+        cursor: usize,
+        cx: &mut Context<Self>,
+    ) -> EditDecision<I> {
+        self.commit_transaction(transaction, None, Some(cursor), cx)
+    }
+
     /// Replace a consumer-owned suffix as one user edit. Its inverse stays in
     /// the same stack as text edits; the consumer supplies current presentation
     /// when replay is requested, so host-owned history is never snapshotted.
@@ -3545,6 +3556,16 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         composition_selection: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) -> EditDecision<I> {
+        self.commit_transaction(transaction, composition_selection, None, cx)
+    }
+
+    fn commit_transaction(
+        &mut self,
+        transaction: EditTransaction,
+        composition_selection: Option<Range<usize>>,
+        final_cursor: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> EditDecision<I> {
         self.settle_list_scroll();
         let origin = transaction.origin();
         if !matches!(
@@ -3560,14 +3581,40 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             cx.emit(DocumentEvent::Rejected(reason));
             return EditDecision::Reject;
         }
-        if let Some(request) = self.inline_replacement(&transaction) {
-            cx.emit(DocumentEvent::ReplaceRequested(request));
-            return EditDecision::StructureRequested;
-        }
         let target = self
             .model
             .target_region_for_transaction(&transaction, None)
             .ok();
+        if final_cursor.is_some()
+            && target.is_none_or(|index| {
+                self.model.regions.as_slice()[index].policy() != EditPolicy::Editable
+            })
+        {
+            cx.emit(DocumentEvent::Rejected(
+                DocumentEditRejection::InvalidBoundary,
+            ));
+            return EditDecision::Reject;
+        }
+        if let Some(request) = self.inline_replacement(&transaction) {
+            cx.emit(DocumentEvent::ReplaceRequested(request));
+            return EditDecision::StructureRequested;
+        }
+        if let (Some(cursor), Some(index)) = (final_cursor, target) {
+            let range = self.model.regions.as_slice()[index].range();
+            let mut next = self.model.text.slice(range.clone()).to_string();
+            for edit in transaction.edits() {
+                next.replace_range(
+                    edit.range().start - range.start..edit.range().end - range.start,
+                    edit.replacement(),
+                );
+            }
+            if cursor > next.len() || !next.is_char_boundary(cursor) {
+                cx.emit(DocumentEvent::Rejected(
+                    DocumentEditRejection::InvalidBoundary,
+                ));
+                return EditDecision::Reject;
+            }
+        }
         let undo_seed = target
             .filter(|index| self.model.regions.as_slice()[*index].policy() == EditPolicy::Editable)
             .map(|index| {
@@ -3645,6 +3692,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
 
         let index = target.expect("applied edits have a target region");
         let start = self.model.regions.as_slice()[index].range().start;
+        let caret = final_cursor.map_or(caret, |offset| start + offset);
         let selected = composition
             .as_ref()
             .map_or(caret..caret, |(_, selected)| selected.clone());
