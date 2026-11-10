@@ -326,7 +326,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.tables.stale = false;
         self.tables.restart();
         let style = window.text_style();
-        let padding = window.pixel_snap(style.font_size.to_pixels(window.rem_size()) * 0.6);
+        let padding = window.pixel_snap(style.font_size.to_pixels(window.rem_size()) * 0.3);
         // Adjacent rows of one table, in order.
         let mut tables: Vec<(Key<I>, Vec<Row>)> = Vec::new();
         for (ix, item) in self.layout_items.iter().enumerate() {

@@ -93,8 +93,8 @@ impl<I: Clone + Eq + Hash + 'static> Row<I> {
                             .border_b_1()
                             .when(column == 0, |this| this.border_l_1())
                             .when(geometry.first, |this| this.border_t_1())
-                            .border_color(border.opacity(0.65))
-                            .when(geometry.first, |this| this.bg(border.opacity(0.18)))
+                            .border_color(border)
+                            .when(geometry.first, |this| this.bg(border.opacity(0.35)))
                             .into_any_element();
                         let lines = cell.lines.iter().enumerate().take(last).skip(first).map(
                             |(row, line)| {
