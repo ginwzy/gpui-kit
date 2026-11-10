@@ -82,8 +82,7 @@ impl<I: Clone + Eq + Hash + 'static> Row<I> {
                         cell.x + cell.width > offset && cell.x < offset + geometry.viewport
                     })
                     .flat_map(|(column, cell)| {
-                        // Neighbors share one border: every cell draws its right and
-                        // bottom edges, the first column and first row the outer ones.
+                        // Draw shared edges once, keeping column boundaries visible.
                         let frame = div()
                             .absolute()
                             .left(cell.x)
@@ -94,7 +93,8 @@ impl<I: Clone + Eq + Hash + 'static> Row<I> {
                             .border_b_1()
                             .when(column == 0, |this| this.border_l_1())
                             .when(geometry.first, |this| this.border_t_1())
-                            .border_color(border)
+                            .border_color(border.opacity(0.65))
+                            .when(geometry.first, |this| this.bg(border.opacity(0.18)))
                             .into_any_element();
                         let lines = cell.lines.iter().enumerate().take(last).skip(first).map(
                             |(row, line)| {
