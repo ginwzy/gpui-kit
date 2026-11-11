@@ -216,7 +216,7 @@ fn table_layouts_stay_complete_through_style_resize_and_background_publication(
             cx.update(|window, cx| {
                 window.set_rem_size(px(rem));
                 window.refresh();
-                window.draw(cx);
+                window.draw(cx).clear(cx);
                 assert_table_layouts(document.read(cx));
             });
             cx.run_until_parked();
@@ -329,7 +329,7 @@ fn changing_a_rows_kind_preserves_text_selection_and_publishes_matching_geometry
                 .unwrap();
         });
         cx.update(|window, cx| {
-            window.draw(cx);
+            window.draw(cx).clear(cx);
             let document = document.read(cx);
             let DocumentLayoutItem::Text {
                 layout,
