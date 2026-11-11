@@ -231,7 +231,7 @@ fn mixed_geometry_drives_hit_testing_selection_ime_and_reflow(cx: &mut TestAppCo
             let DocumentLayoutItem::Text {
                 display,
                 line,
-                frame,
+                layout,
                 ..
             } = item
             else {
@@ -239,9 +239,9 @@ fn mixed_geometry_drives_hit_testing_selection_ime_and_reflow(cx: &mut TestAppCo
             };
             assert!(
                 (document.list_state.bounds_for_item(ix).unwrap().size.height
-                    - frame
+                    - layout
                         .0
-                        .unwrap()
+                        .as_ref().unwrap().frame()
                         .row_height(display, line, item.presentation()))
                 .abs()
                     < px(0.001)

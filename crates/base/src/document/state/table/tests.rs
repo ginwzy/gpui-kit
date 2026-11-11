@@ -1,13 +1,33 @@
 use crate::document::{
-    DocumentParagraphStyle, DocumentProjection, DocumentRegion, DocumentSnapshot, DocumentState,
-    DocumentStyles, EditPolicy, TableRow, TextRows, state::tests::document_view,
+    DocumentInlineStyle, DocumentParagraphStyle, DocumentProjection, DocumentRegion,
+    DocumentSnapshot, DocumentState, DocumentStyles, EditPolicy, TableRow, TextFrame, TextRows,
+    state::{DocumentLayoutItem, row::Layout, tests::document_view},
 };
 use gpui::{
-    AppContext, Bounds, Entity, TestAppContext, TextAlign, VisualTestContext, point, px, size,
+    AppContext, Bounds, Context, Entity, IntoElement, ParentElement, Pixels, Render, Styled,
+    TestAppContext, TextAlign, VisualTestContext, Window, div, point, px, size,
 };
 use std::sync::{Arc, atomic::Ordering};
 
 use super::{Resolved, table_item};
+
+struct Root {
+    document: Entity<DocumentState<&'static str>>,
+    family: &'static str,
+    font_size: Pixels,
+    width: Pixels,
+}
+
+impl Render for Root {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(self.width)
+            .h(px(400.))
+            .font_family(self.family)
+            .text_size(self.font_size)
+            .child(self.document.clone())
+    }
+}
 
 /// Each table row's geometry, in document order.
 fn geometries(document: &DocumentState<&'static str>) -> Vec<Arc<Resolved>> {
@@ -111,9 +131,229 @@ fn prepare(document: &Entity<DocumentState<&'static str>>, cx: &mut VisualTestCo
                 false,
                 window,
                 cx,
-            )
+            );
+            assert_table_layouts(document);
         });
     });
+}
+
+fn assert_table_layouts(document: &DocumentState<&'static str>) {
+    for (ix, item) in document
+        .layout_items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.is_table_row())
+    {
+        let DocumentLayoutItem::Text {
+            display,
+            line,
+            layout,
+            ..
+        } = item
+        else {
+            unreachable!()
+        };
+        let layout = layout
+            .0
+            .as_ref()
+            .expect("every table row is published during preparation");
+        assert!(matches!(layout, Layout::Table(_)));
+        let cells = layout.cells().unwrap();
+        assert_eq!(layout.frame().line_height(), cells.geometry.line_height);
+        assert_eq!(cells.input.viewport, cells.geometry.viewport);
+        assert_eq!(
+            document.list_state.item_height(ix),
+            Some(
+                layout
+                    .frame()
+                    .row_height(display, line, item.presentation())
+            )
+        );
+    }
+}
+
+#[gpui::test]
+fn table_layouts_stay_complete_through_style_resize_and_background_publication(
+    cx: &mut TestAppContext,
+) {
+    let (document, _) = isolated_document(cx);
+    let (root, cx) = cx.add_window_view(|_, _| Root {
+        document: document.clone(),
+        family: "first",
+        font_size: px(14.),
+        width: px(600.),
+    });
+    install_rows(
+        &document,
+        cx,
+        &[format!("{}|value", "words 中文 ".repeat(500))],
+    );
+    document.update(cx, |document, cx| {
+        document
+            .set_node_inline_styles(
+                &"history",
+                vec![DocumentInlineStyle::new(0..5, Default::default()).font_scale(90)],
+                cx,
+            )
+            .unwrap();
+    });
+    for (family, font_size, rem, width, scale) in [
+        ("first", 14., 16., 600., 1.),
+        ("second", 14., 16., 600., 1.5),
+        ("second", 20., 24., 120., 2.),
+        ("first", 14., 16., 400., 1.),
+    ] {
+        root.update(cx, |root, cx| {
+            root.family = family;
+            root.font_size = px(font_size);
+            root.width = px(width);
+            cx.notify();
+        });
+        cx.simulate_scale_factor_change(scale);
+        // Check the placeholder/retained result and the eventual background
+        // publication independently, before any unrelated text wrap can help.
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                window.set_rem_size(px(rem));
+                window.refresh();
+                window.draw(cx);
+                assert_table_layouts(document.read(cx));
+            });
+            cx.run_until_parked();
+        }
+        document.read_with(cx, |document, _| {
+            assert!(!document.tables.is_pending());
+            assert!(geometries(document).iter().all(|row| row.is_measured()));
+        });
+    }
+}
+
+#[gpui::test]
+fn unchanged_cells_publish_a_new_host_frame_and_list_height_together(cx: &mut TestAppContext) {
+    let (document, mut cx) = isolated_document(cx);
+    install_rows(&document, &mut cx, &["cell|value".into()]);
+    prepare(&document, &mut cx);
+    let (cells, height) = document.read_with(&cx, |document, _| {
+        (
+            geometries(document)[0].clone(),
+            document.list_state.item_height(0).unwrap(),
+        )
+    });
+    document.update(&mut cx, |document, cx| {
+        document.set_text_frame_resolver(
+            |_, _, _| {
+                TextFrame::new()
+                    .with_space_before(px(7.))
+                    .with_space_after(px(11.))
+            },
+            cx,
+        );
+    });
+    prepare(&document, &mut cx);
+    document.read_with(&cx, |document, _| {
+        assert!(
+            Arc::ptr_eq(&cells, &geometries(document)[0]),
+            "cell geometry should remain reusable"
+        );
+        assert_eq!(document.list_state.item_height(0), Some(height + px(18.)));
+    });
+}
+
+#[gpui::test]
+fn table_publication_rejects_same_text_with_obsolete_fonts_or_width(cx: &mut TestAppContext) {
+    let (document, mut cx) = isolated_document(cx);
+    install_rows(&document, &mut cx, &["code|value".into()]);
+    prepare(&document, &mut cx);
+    let old = document.read_with(&cx, |document, _| geometries(document)[0].clone());
+    document.update(&mut cx, |document, cx| {
+        document
+            .set_node_inline_styles(
+                &"history",
+                vec![DocumentInlineStyle::new(0..4, Default::default()).font_scale(90)],
+                cx,
+            )
+            .unwrap();
+    });
+    prepare(&document, &mut cx);
+    cx.update(|window, cx| {
+        document.update(cx, |document, cx| {
+            let current = geometries(document)[0].clone();
+            assert_eq!(current.input.text, old.input.text);
+            assert_eq!(current.geometry.line_height, old.geometry.line_height);
+            document.install_table_rows(vec![(0, old)], px(600.), window, cx);
+            assert!(document.tables.stale);
+            assert!(Arc::ptr_eq(&current, &geometries(document)[0]));
+            // Width is a dependency even when content and fonts still match.
+            document.tables.stale = false;
+            document.install_table_rows(vec![(0, current.clone())], px(300.), window, cx);
+            assert!(document.tables.stale);
+            assert!(Arc::ptr_eq(&current, &geometries(document)[0]));
+            assert_table_layouts(document);
+        });
+    });
+}
+
+#[gpui::test]
+fn changing_a_rows_kind_preserves_text_selection_and_publishes_matching_geometry(
+    cx: &mut TestAppContext,
+) {
+    let (document, mut cx) = document_view(cx);
+    let source = "code|value";
+    install_rows(&document, &mut cx, &[source.into()]);
+    document.update(&mut cx, |document, cx| {
+        document.set_selection(1..4, false, cx)
+    });
+    for tabular in [true, false, true] {
+        document.update(&mut cx, |document, cx| {
+            let paragraphs = if tabular {
+                vec![
+                    DocumentParagraphStyle::new(0..source.len(), Default::default())
+                        .with_table_row(TableRow::new(0).with_cells([
+                            (0..4, TextAlign::Left),
+                            (5..source.len(), TextAlign::Right),
+                        ])),
+                ]
+            } else {
+                Vec::new()
+            };
+            document
+                .set_rich_presentation(
+                    DocumentProjection::identity(source.len()),
+                    Vec::new(),
+                    DocumentStyles::new(
+                        paragraphs,
+                        vec![DocumentInlineStyle::new(0..4, Default::default()).font_scale(90)],
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.update(|window, cx| {
+            window.draw(cx);
+            let document = document.read(cx);
+            let DocumentLayoutItem::Text {
+                layout,
+                display,
+                line,
+                ..
+            } = &document.layout_items[0]
+            else {
+                unreachable!()
+            };
+            let layout = layout.0.as_ref().unwrap();
+            assert_eq!(matches!(layout, Layout::Table(_)), tabular);
+            assert_eq!(document.text(), source);
+            assert_eq!(document.selected_range(), 1..4);
+            assert_eq!(
+                document.list_state.item_height(0),
+                Some(layout.frame().row_height(
+                    display,
+                    line,
+                    document.layout_items[0].presentation(),
+                ))
+            );
+        });
+    }
 }
 
 #[gpui::test]

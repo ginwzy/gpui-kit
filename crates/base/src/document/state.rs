@@ -52,6 +52,7 @@ mod inline_styles;
 mod layout_items;
 mod layout_window;
 mod presentation;
+mod row;
 pub(in crate::document) mod table;
 mod text_rows;
 mod viewport;
@@ -877,13 +878,9 @@ enum DocumentLayoutItem<I> {
         line: Range<usize>,
         /// Identifies the line's text and fonts, keying its wrap in text rows.
         line_key: u64,
-        /// The line's resolved frame in text rows, once layout resolved it.
-        frame: Derived<Option<text_rows::RowFrame>>,
-        /// What the line's rows were wrapped for, once text rows wrapped it.
-        wrapped: Derived<Option<text_rows::WrapKey>>,
-        /// A table row's cells, once text rows laid out its table. It moves
-        /// with the row; layout replaces it when the row's inputs change.
-        table: Derived<Option<std::sync::Arc<table::Resolved>>>,
+        /// A complete published layout, or no layout before preparation.
+        /// Its geometry and text wrap or table cells are replaced together.
+        layout: Derived<Option<row::Layout>>,
     },
     Block {
         id: I,
@@ -1568,9 +1565,7 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             presentation,
             line,
             line_key,
-            frame: Derived::default(),
-            wrapped: Derived::default(),
-            table: Derived::default(),
+            layout: Derived::default(),
         }
     }
 
@@ -5549,8 +5544,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 node_id,
                 presentation,
                 line,
-                frame,
-                wrapped,
+                layout,
                 ..
             } => {
                 if let Some(node_id) = node_id {
@@ -5566,18 +5560,25 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                         last_row: display.end == line.end,
                     });
                 }
+                let prepared = layout.0.as_ref();
+                assert!(
+                    self.text_rows.is_none() || prepared.is_some(),
+                    "text rows must be prepared before rendering"
+                );
+                let frame = prepared.map(row::Layout::frame);
+                let wrapped = prepared.and_then(row::Layout::wrapped);
                 let mut presentation = presentation.as_deref().cloned().unwrap_or_default();
-                self.retained_row_style(wrapped.0, &mut presentation);
+                self.retained_row_style(wrapped, &mut presentation);
                 if self.text_rows.is_some() {
                     // A display row is one line; its wrap was decided with the geometry.
                     presentation.text_style.get_or_insert_default().white_space =
                         Some(gpui::WhiteSpace::Nowrap);
-                    hidden = frame.0.is_some_and(|frame| {
+                    hidden = frame.is_some_and(|frame| {
                         frame.row_height(display, line, Some(&presentation)) == px(0.)
                     });
                     #[cfg(debug_assertions)]
                     {
-                        text_top = frame.0.map(|frame| frame.text_top(display, line));
+                        text_top = frame.map(|frame| frame.text_top(display, line));
                     }
                 }
                 // Tables clip individual cell lines against the viewport; their
@@ -5585,7 +5586,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 let display = if presentation.table_row.is_some() {
                     display.clone()
                 } else {
-                    self.pending_row_paint_range(display.clone(), wrapped.0)
+                    self.pending_row_paint_range(display.clone(), wrapped)
                 };
                 if let Some(hovered) = &self.hovered_link {
                     let mut changed = false;
@@ -5639,12 +5640,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 presentation
                     .objects
                     .retain(|(range, _)| range.end <= display.len());
-                // Planning gives every table row geometry before the list
-                // renders; a row not yet planned paints as ordinary text.
-                let table = (self.text_rows.is_some() && presentation.table_row.is_some())
-                    .then(|| self.table_view(&self.layout_items[item_ix]).zip(frame.0))
-                    .flatten();
-                if let Some((view, frame)) = table {
+                if let Some(prepared @ row::Layout::Table(_)) = prepared {
+                    let view = self
+                        .table_view(&self.layout_items[item_ix])
+                        .expect("a published table has its row identity");
                     DocumentChild::Inline {
                         element: super::element::table::Row::new(
                             cx.entity(),
@@ -5652,7 +5651,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                             display.clone(),
                             self.model.display_text()[display.clone()].into(),
                             presentation,
-                            frame,
+                            prepared.frame(),
                             view,
                         )
                         .into_any_element(),
@@ -5660,7 +5659,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 } else if !presentation.objects.is_empty()
                     || (self.text_rows.is_some() && !presentation.font_scales.is_empty())
                 {
-                    let frame = frame.0.expect("inline rows have resolved geometry");
+                    let frame = frame.expect("inline objects require prepared text rows");
                     let limit = self.inline_width_limit(frame);
                     for (_, object) in &mut presentation.objects {
                         *object = object.constrained_to(frame.rem_size(), limit);

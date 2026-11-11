@@ -28,7 +28,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use super::{Derived, DocumentLayoutItem, DocumentState, DocumentTextContext};
+use super::{Derived, DocumentLayoutItem, DocumentState, DocumentTextContext, row::Layout};
 use crate::document::DocumentRegion;
 
 pub(in crate::document) mod font_runs;
@@ -204,6 +204,11 @@ pub(in crate::document) struct RowFrame {
 }
 
 impl RowFrame {
+    pub(super) fn with_table_height(mut self, height: Pixels) -> Self {
+        self.table_height = Some(height);
+        self
+    }
+
     /// How far below the top of `row` its text starts.
     pub(in crate::document) fn text_top(&self, row: &Range<usize>, line: &Range<usize>) -> Pixels {
         if self.hidden || row.start != line.start {
@@ -585,6 +590,14 @@ struct WrappedLine {
 }
 
 impl<I: Clone> TextRowsState<I> {
+    pub(super) fn table_published(&mut self, key: &(Option<I>, Range<usize>))
+    where
+        I: Eq + Hash,
+    {
+        self.invalid_frames.remove(key);
+        self.frames.remove(key);
+    }
+
     fn invalidate(&mut self) {
         self.nearby = true;
         self.cancel.store(true, Ordering::Relaxed);
@@ -1379,8 +1392,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 DocumentLayoutItem::Text {
                     line,
                     node_id,
-                    frame,
-                    wrapped,
+                    layout,
                     presentation,
                     ..
                 } => {
@@ -1395,7 +1407,14 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     }
                     let rows = ix..ix + count;
                     ix = rows.end;
-                    if frame.0.is_some()
+                    // Tables publish their frame and cells together in prepare_tables.
+                    // They never participate in text wrapping or retain its generation.
+                    if item.is_table_row() {
+                        continue;
+                    }
+                    let frame = layout.0.as_ref().map(Layout::frame);
+                    let wrapped = layout.0.as_ref().and_then(Layout::wrapped);
+                    if frame.is_some()
                         && (invalid.is_empty()
                             || !invalid.contains(&(node_id.clone(), line.clone())))
                     {
@@ -1415,12 +1434,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                             frame
                         }
                     };
-                    let keep_old = wrapped.0.is_some_and(|wrap| wrap.generation != generation);
+                    let keep_old = wrapped.is_some_and(|wrap| wrap.generation != generation);
                     // Most lines are in neither map; skip building their key.
                     if keep_old || keyed {
                         keys.push(((node_id.clone(), line.clone()), resolved, keep_old));
                     }
-                    if !keep_old && count > 1 && frame.0 != Some(resolved) {
+                    if !keep_old && count > 1 && frame != Some(resolved) {
                         // The host changed the frame, and its renderer cannot
                         // reproduce the old one: one pending row until reflow.
                         collapses.push((rows, resolved));
@@ -1429,15 +1448,14 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     }
                     // Existing complete rows keep their old geometry until
                     // the candidate is published.
-                    if count > 1 || keep_old && wrapped.0.is_some() {
+                    if count > 1 || keep_old {
                         whole = false;
                         continue;
                     }
                     // As the wrap check decides it, without a second pass.
                     let wrap = width.filter(|_| !keep_old).and_then(|width| {
                         let widths = resolved.widths(width);
-                        let whole = item.is_table_row()
-                            || resolved.hidden
+                        let whole = resolved.hidden
                             || line.is_empty()
                             || presentation.is_none()
                                 && ascii_advance.is_some_and(|advance| {
@@ -1526,8 +1544,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 display_line.clone(),
                 *line_key,
             );
-            if let DocumentLayoutItem::Text { frame, .. } = &mut item {
-                frame.0 = Some(resolved);
+            if let DocumentLayoutItem::Text { layout, .. } = &mut item {
+                layout.0 = Some(Layout::Text {
+                    frame: resolved,
+                    wrap: None,
+                });
             }
             let mut heights = gpui::PreparedListItems::new();
             heights.extend([Some(resolved.row_height(
@@ -1582,16 +1603,15 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 if let DocumentLayoutItem::Text {
                     display,
                     line,
-                    frame,
-                    wrapped,
+                    layout,
                     presentation,
                     ..
                 } = item
                 {
-                    frame.0 = Some(segment.frame);
-                    if segment.wrap.is_some() {
-                        wrapped.0 = segment.wrap;
-                    }
+                    layout.0 = Some(Layout::Text {
+                        frame: segment.frame,
+                        wrap: segment.wrap,
+                    });
                     heights.push(Some(segment.frame.row_height(
                         display,
                         line,
@@ -1640,10 +1660,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         fn is_plain<I>(item: &DocumentLayoutItem<I>) -> bool {
             matches!(
                 item,
-                DocumentLayoutItem::Text { display, line, frame, wrapped, presentation, .. }
+                DocumentLayoutItem::Text { display, line, layout, presentation, .. }
                     if display == line
-                        && frame.0.is_none()
-                        && wrapped.0.is_none()
+                        && layout.0.is_none()
                         && presentation.is_none()
             )
         }
@@ -1678,17 +1697,15 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             let DocumentLayoutItem::Text {
                 display,
                 line,
-                frame: line_frame,
-                wrapped,
+                layout,
                 ..
             } = item
             else {
                 unreachable!("plain items are text");
             };
             let (display, line) = (&*display, &*line);
-            line_frame.0 = Some(frame);
             // As the wrap check decides it, without a second pass.
-            wrapped.0 = widths
+            let wrap = widths
                 .filter(|widths| {
                     frame.hidden
                         || line.is_empty()
@@ -1697,7 +1714,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                         })
                 })
                 .map(|widths| WrapKey { generation, widths });
-            whole &= wrapped.0.is_some();
+            layout.0 = Some(Layout::Text { frame, wrap });
+            whole &= wrap.is_some();
             heights.push(Some(frame.row_height(display, line, None)));
         });
         let framed = heights.len();
@@ -1876,12 +1894,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .baseline_offset(font, font_size, line_height)
         };
         RowFrame {
-            table_height: match first {
-                DocumentLayoutItem::Text { table, .. } => {
-                    table.0.as_ref().map(|table| table.geometry.height)
-                }
-                _ => None,
-            },
+            table_height: None,
             space_before: frame.space_before.to_pixels(rem_size),
             space_after: frame.space_after.to_pixels(rem_size),
             inset_start: frame.inset_start.to_pixels(rem_size),
@@ -1903,10 +1916,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             DocumentLayoutItem::Text {
                 display,
                 line,
-                frame,
+                layout,
                 presentation,
                 ..
-            } => frame.0.map_or(px(0.), |frame| {
+            } => layout.0.as_ref().map_or(px(0.), |layout| {
+                let frame = layout.frame();
                 frame.row_height(display, line, presentation.as_deref())
             }),
             DocumentLayoutItem::Block { height, .. }
@@ -1999,8 +2013,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     line_key,
                     presentation,
                     node_id,
-                    frame: Derived(Some(item_frame)),
-                    wrapped,
+                    layout: Derived(Some(Layout::Text { frame: item_frame, wrap: wrapped })),
                     ..
                 } = item
                 else {
@@ -2031,10 +2044,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     generation,
                     widths: frame.widths(width),
                 };
-                if wrapped.0 == Some(wrap) && item_frame == frame {
+                if *wrapped == Some(wrap) && item_frame == frame {
                     continue;
                 }
-                if frame.hidden || line.is_empty() || item.is_table_row() {
+                if frame.hidden || line.is_empty() {
                     if rows.len() == 1 {
                         push_settled(&mut settled, rows, wrap);
                     } else {
@@ -2076,7 +2089,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                         items: rows,
                         line: line.clone(),
                         bytes: line.len(),
-                        wrapped_before: cached.is_some() || wrapped.0.is_some(),
+                        wrapped_before: cached.is_some() || wrapped.is_some(),
                         widths: wrap.widths,
                     }),
                 }
@@ -2381,25 +2394,26 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     display,
                     line,
                     node_id,
-                    frame,
-                    wrapped,
+                    layout: Derived(Some(layout @ Layout::Text { .. })),
                     presentation,
                     ..
                 } = item
                 else {
                     return;
                 };
-                wrapped.0 = Some(*wrap);
                 // A frame kept for an older style takes over with the wrap.
+                let frame = frames
+                    .get(&(node_id.clone(), line.clone()))
+                    .copied()
+                    .unwrap_or_else(|| layout.frame());
+                *layout = Layout::Text {
+                    frame,
+                    wrap: Some(*wrap),
+                };
                 if !frames.is_empty() {
-                    if let Some(retained) = frames.get(&(node_id.clone(), line.clone())) {
-                        frame.0 = Some(*retained);
-                    }
                     heights.push((
                         here,
-                        frame
-                            .0
-                            .map(|frame| frame.row_height(display, line, presentation.as_deref())),
+                        Some(frame.row_height(display, line, presentation.as_deref())),
                     ));
                 }
             });
@@ -2770,7 +2784,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 line,
                 line_key,
                 node_id,
-                frame,
+                layout: Derived(Some(Layout::Text { frame: published_frame, .. })),
                 ..
             } = &self.layout_items[rows.start]
             else {
@@ -2784,12 +2798,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             let segment = first.start..last.end;
             let frames = &self.text_rows.as_ref().unwrap().frames;
             let frame = if frames.is_empty() {
-                frame.0
+                *published_frame
             } else {
                 frames
                     .get(&(node_id.clone(), line.clone()))
                     .copied()
-                    .or(frame.0)
+                    .unwrap_or(*published_frame)
             };
             let count = (starts.len() + 1 - work.row).min(budget);
             let mut items = Vec::with_capacity(count);
@@ -2820,16 +2834,17 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     )
                 };
                 if let DocumentLayoutItem::Text {
-                    frame: row_frame,
-                    wrapped,
+                    layout,
                     ..
                 } = &mut item
                 {
-                    row_frame.0 = frame;
-                    wrapped.0 = Some(wrap);
+                    layout.0 = Some(Layout::Text {
+                        frame,
+                        wrap: Some(wrap),
+                    });
                 }
                 heights
-                    .push(frame.map(|frame| frame.row_height(&range, &line, item.presentation())));
+                    .push(Some(frame.row_height(&range, &line, item.presentation())));
                 items.push(item);
             }
             budget -= count;
@@ -2883,14 +2898,14 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             let DocumentLayoutItem::Text {
                 display,
                 line,
-                frame: Derived(Some(frame)),
+                layout: Derived(Some(layout)),
                 presentation,
                 ..
             } = item
             else {
                 return None;
             };
-            heights.push(Some(frame.row_height(
+            heights.push(Some(layout.frame().row_height(
                 display,
                 line,
                 presentation.as_deref(),
@@ -3173,7 +3188,7 @@ mod tests {
                     lines: vec![WrappedLine { item: 0, range: 0..text.len(), key: *line_key, widths: input.widths, starts: Breaks::default(), input }].into(),
                 });
                 doc.prepare_text_rows(bounds(160.), window, cx);
-                assert!(matches!(&doc.layout_items[0], DocumentLayoutItem::Text { wrapped, .. } if wrapped.0.is_none()), "a late result cannot publish even when text and font still match");
+            assert!(matches!(&doc.layout_items[0], DocumentLayoutItem::Text { layout, .. } if layout.0.as_ref().and_then(Layout::wrapped).is_none()), "a late result cannot publish even when text and font still match");
             });
         });
         settle_rows(&document, &mut cx);
@@ -3327,7 +3342,7 @@ mod tests {
             assert!(
                 doc.layout_items.iter().all(|item| !matches!(
                     item,
-                    DocumentLayoutItem::Text { wrapped, .. } if wrapped.0.is_none()
+                    DocumentLayoutItem::Text { layout, .. } if layout.0.as_ref().and_then(Layout::wrapped).is_none()
                 )),
                 "the edited paragraph showed unwrapped rows"
             );
@@ -3500,9 +3515,9 @@ mod tests {
         cx.update(|window, cx| {
             document.update(cx, |doc, cx| {
                 let widths = match &doc.layout_items[0] {
-                    DocumentLayoutItem::Text { frame, .. } => frame
+                    DocumentLayoutItem::Text { layout, .. } => layout
                         .0
-                        .unwrap()
+                        .as_ref().unwrap().frame()
                         .widths(doc.text_rows.as_ref().unwrap().width.unwrap()),
                     _ => unreachable!(),
                 };
@@ -3737,9 +3752,9 @@ mod tests {
                     DocumentLayoutItem::Text {
                         display,
                         line,
-                        frame,
+                        layout,
                         ..
-                    } => frame.0.expect("every row is framed").row_height(
+                    } => layout.0.as_ref().expect("every row is prepared").frame().row_height(
                         display,
                         line,
                         item.presentation(),
@@ -3921,10 +3936,10 @@ mod tests {
                     .layout_items
                     .iter()
                     .find_map(|item| match item {
-                        DocumentLayoutItem::Text { display, frame, .. }
+                        DocumentLayoutItem::Text { display, layout, .. }
                             if &document.display_text()[display.clone()] == text =>
                         {
-                            frame.0.map(|frame| frame.line_height)
+                            layout.0.as_ref().map(|layout| layout.frame().line_height)
                         }
                         _ => None,
                     })

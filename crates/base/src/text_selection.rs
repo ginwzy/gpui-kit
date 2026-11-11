@@ -2806,7 +2806,7 @@ mod tests {
     use super::*;
     use crate::ElementExt as _;
     use gpui::{
-        Bounds, ContentMask, Context, Hitbox, HitboxBehavior, HitboxId, InteractiveElement as _,
+        Bounds, Context, Hitbox, HitboxBehavior, InteractiveElement as _,
         IntoElement, ParentElement as _, Render, SharedString, Styled as _, StyledText,
         TestAppContext, TextLayout, Window, div, point, prelude::FluentBuilder as _, px, size,
     };
@@ -2980,12 +2980,7 @@ mod tests {
             selection_state.register_participant(
                 self.selection.clone(),
                 TextSelectionRegistration::new(
-                    Hitbox {
-                        id: HitboxId::placeholder(),
-                        bounds,
-                        content_mask: ContentMask { bounds },
-                        behavior: HitboxBehavior::Normal,
-                    },
+                    Hitbox::for_test(bounds),
                     bounds,
                 )
                 .with_scope(scope)
@@ -3139,12 +3134,7 @@ mod tests {
     #[gpui::test]
     fn public_selection_data_uses_builders_and_readers(cx: &mut TestAppContext) {
         let bounds = Bounds::new(point(px(1.), px(2.)), size(px(30.), px(10.)));
-        let hitbox = Hitbox {
-            id: HitboxId::placeholder(),
-            bounds,
-            content_mask: ContentMask { bounds },
-            behavior: HitboxBehavior::Normal,
-        };
+        let hitbox = Hitbox::for_test(bounds);
         let scope = TextSelectionScopeId::from_raw(7);
         let endpoint = TextSelectionEndpoint::new(None, bounds.origin)
             .with_content_key(TextSelectionContentKey::new(11));
@@ -3950,12 +3940,7 @@ mod tests {
                     state.register_participant(
                         participant.selection.clone(),
                         TextSelectionRegistration::new(
-                            Hitbox {
-                                id: HitboxId::placeholder(),
-                                bounds: collapsed,
-                                content_mask: ContentMask { bounds: collapsed },
-                                behavior: HitboxBehavior::Normal,
-                            },
+                            Hitbox::for_test(collapsed),
                             collapsed,
                         )
                         .with_text_bounds(vec![collapsed]),
@@ -4112,12 +4097,7 @@ mod tests {
             let selection = TextSelectionHandle::new("registered", cx);
             selection.set_local_selection(true, cx);
             let bounds = Bounds::new(point(px(0.), px(0.)), size(px(100.), px(20.)));
-            let hitbox = Hitbox {
-                id: HitboxId::placeholder(),
-                bounds,
-                content_mask: ContentMask { bounds },
-                behavior: HitboxBehavior::Normal,
-            };
+            let hitbox = Hitbox::for_test(bounds);
             selection.register(
                 TextSelectionRegistration::new(hitbox, bounds).with_text_bounds(vec![bounds]),
                 window,

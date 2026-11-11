@@ -6,6 +6,7 @@ use gpui_base::document::{
 };
 
 pub(super) fn check(app: &mut TestApp) {
+    scaled_table_font_change(app);
     natural_widths(app);
     long_first_cell_before_a_blank_line(app);
     let rows = [
@@ -236,6 +237,51 @@ pub(super) fn check(app: &mut TestApp) {
             assert_eq!(document.selected_range(), selection);
         });
     }
+}
+
+fn scaled_table_font_change(app: &mut TestApp) {
+    let source = "code | value";
+    let mut window = app.open_window(|_, cx| {
+        let document = cx.new(|cx| {
+            let mut document = DocumentState::new(
+                source,
+                vec![DocumentRegion::new(0, 0..source.len(), EditPolicy::Readonly)],
+                cx,
+            )
+            .unwrap();
+            document.set_text_rows(Some(TextRows::new()), cx);
+            document
+                .set_rich_presentation(
+                    DocumentProjection::identity(source.len()),
+                    Vec::new(),
+                    DocumentStyles::new(
+                        vec![
+                            DocumentParagraphStyle::new(0..source.len(), Default::default())
+                                .with_table_row(TableRow::new(0).with_cells([
+                                    (0..4, TextAlign::Left),
+                                    (7..source.len(), TextAlign::Left),
+                                ])),
+                        ],
+                        vec![DocumentInlineStyle::new(0..4, Default::default()).font_scale(90)],
+                    ),
+                    cx,
+                )
+                .unwrap();
+            document
+        });
+        Root {
+            document,
+            family: "JetBrains Mono",
+            width: px(600.),
+            height: px(400.),
+        }
+    });
+    window.draw();
+    window.update(|root, _, cx| {
+        root.family = "Noto Sans SC";
+        cx.notify();
+    });
+    window.draw();
 }
 
 fn long_first_cell_before_a_blank_line(app: &mut TestApp) {

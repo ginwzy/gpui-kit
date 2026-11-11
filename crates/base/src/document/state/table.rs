@@ -13,7 +13,9 @@ use std::{
 
 use gpui::{AppContext as _, Bounds, Context, Pixels, Task, Window, WindowTextSystem, px};
 
-use super::{Affinity, DocumentLayoutItem, DocumentPosition, DocumentState};
+use super::{
+    Affinity, DocumentLayoutItem, DocumentPosition, DocumentState, row::Layout, text_rows::RowFrame,
+};
 pub(in crate::document) use layout::Geometry;
 pub(super) use layout::Resolved;
 use layout::{Input, Row};
@@ -171,7 +173,7 @@ fn table_item<I: Clone>(item: &DocumentLayoutItem<I>) -> Option<TableItem<'_, I>
         node_id,
         presentation: Some(presentation),
         line_key,
-        table,
+        layout,
         ..
     } = item
     else {
@@ -181,7 +183,7 @@ fn table_item<I: Clone>(item: &DocumentLayoutItem<I>) -> Option<TableItem<'_, I>
     Some(TableItem {
         key: (node_id.clone(), row.table()),
         content: *line_key,
-        geometry: table.0.as_ref(),
+        geometry: layout.0.as_ref().and_then(Layout::cells),
     })
 }
 
@@ -206,7 +208,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let DocumentLayoutItem::Text {
             line,
             display,
-            frame,
+            layout,
             ..
         } = item
         else {
@@ -220,10 +222,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let point = row.geometry.position_for_index(at)?;
         Some((
             ix,
-            frame
-                .0
-                .map_or(px(0.), |frame| frame.text_top(display, line))
-                + point.y,
+            layout.0.as_ref()?.frame().text_top(display, line) + point.y,
             row.geometry.line_height,
         ))
     }
@@ -235,16 +234,14 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let DocumentLayoutItem::Text {
             line,
             display,
-            frame,
+            layout,
             ..
         } = item
         else {
             return None;
         };
         let geometry = &row.geometry;
-        let inset = frame
-            .0
-            .map_or(px(0.), |frame| frame.text_top(display, line));
+        let inset = layout.0.as_ref()?.frame().text_top(display, line);
         let visual = (f32::from((delta - inset - geometry.padding).max(px(0.)))
             / f32::from(geometry.line_height))
         .floor() as usize;
@@ -282,7 +279,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         if let Some(ready) = self.tables.ready.take()
             && ready.request == self.tables.request
         {
-            self.install_table_rows(ready.rows, window);
+            self.install_table_rows(ready.rows, bounds.size.width, window, cx);
         }
         let mut bytes = 0;
         let mut cells = 0;
@@ -296,7 +293,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 if let Some(rows) =
                     smol::block_on(layout::compute(rows, window.text_system(), &cancel))
                 {
-                    self.install_table_rows(rows, window);
+                    self.install_table_rows(rows, bounds.size.width, window, cx);
                 }
             } else {
                 let system = cx.text_system().clone();
@@ -325,8 +322,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     fn plan_tables(&mut self, bounds: Bounds<Pixels>, window: &Window, cx: &mut Context<Self>) {
         self.tables.stale = false;
         self.tables.restart();
-        let style = window.text_style();
-        let padding = window.pixel_snap(style.font_size.to_pixels(window.rem_size()) * 0.3);
         // Adjacent rows of one table, in order.
         let mut tables: Vec<(Key<I>, Vec<Row>)> = Vec::new();
         for (ix, item) in self.layout_items.iter().enumerate() {
@@ -338,27 +333,13 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             else {
                 continue;
             };
-            let DocumentLayoutItem::Text {
-                line,
-                presentation: Some(presentation),
-                ..
-            } = item
-            else {
+            let Some((_, input)) = self.table_input(item, bounds.size.width, window, cx) else {
                 continue;
             };
-            let frame = self.resolve_line_frame(item, item, &style, window, cx);
             let row = Row {
                 item: ix,
                 content,
-                input: Arc::new(Input::new(
-                    self.model.display_text()[line.clone()].into(),
-                    presentation,
-                    &style,
-                    window.rem_size(),
-                    frame.line_height(),
-                    padding,
-                    frame.widths(bounds.size.width).0,
-                )),
+                input: Arc::new(input),
                 previous: geometry
                     .or_else(|| self.tables.cache.get(&(key.clone(), content)))
                     .cloned(),
@@ -416,7 +397,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 let kept = row
                     .previous
                     .clone()
-                    .filter(|old| unchanged || old.reusable(&row.input));
+                    .filter(|old| unchanged || old.reusable(&row.input))
+                    .map(|old| old.reframe(row.input.clone(), ix == 0, ix == last));
                 let shown = kept.unwrap_or_else(|| {
                     let laid = widths
                         .as_ref()
@@ -438,7 +420,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     laid.unwrap_or_else(|| Arc::new(Resolved::pending(row.input.clone(), ix == 0)))
                 });
                 cache.insert((key.clone(), row.content), shown.clone());
-                self.set_table_geometry(row.item, shown);
+                if self
+                    .publish_table_row(row.item, shown, bounds.size.width, window, cx)
+                    .is_none()
+                {
+                    self.tables.stale = true;
+                }
             }
             if !unchanged {
                 work.push(rows);
@@ -455,23 +442,18 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.tables.work = work;
     }
 
-    /// Installs a laid-out table. A row whose item has since changed text or
-    /// moved is left for the next plan.
-    fn install_table_rows(&mut self, rows: Vec<(usize, Arc<Resolved>)>, window: &Window) {
+    /// Installs a laid-out table. Rows whose frozen inputs no longer match
+    /// the item at their index are left for the next plan.
+    fn install_table_rows(
+        &mut self,
+        rows: Vec<(usize, Arc<Resolved>)>,
+        width: Pixels,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         for (ix, row) in rows {
-            let Some(item) = self.layout_items.get(ix) else {
-                self.tables.stale = true;
-                continue;
-            };
-            let current = match (table_item(item), item) {
-                (Some(table), DocumentLayoutItem::Text { line, .. })
-                    if self.model.display_text()[line.clone()] == *row.input.text =>
-                {
-                    Some((table.key, table.content))
-                }
-                _ => None,
-            };
-            let Some((key, content)) = current else {
+            let Some((key, content)) = self.publish_table_row(ix, row.clone(), width, window, cx)
+            else {
                 self.tables.stale = true;
                 continue;
             };
@@ -490,37 +472,90 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 drag.maximum = maximum;
                 drag.ratio = ratio;
             }
-            self.set_table_geometry(ix, row);
         }
     }
 
-    /// Gives a row new geometry; a different geometry reframes the row.
-    fn set_table_geometry(&mut self, ix: usize, resolved: Arc<Resolved>) {
-        if self
-            .layout_items
-            .get(ix)
-            .and_then(table_item)
-            .and_then(|row| row.geometry)
-            .is_some_and(|old| Arc::ptr_eq(old, &resolved))
-        {
-            return;
+    /// Planning and publication freeze the same layout dependencies.
+    fn table_input(
+        &self,
+        item: &DocumentLayoutItem<I>,
+        width: Pixels,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(RowFrame, Input)> {
+        let DocumentLayoutItem::Text {
+            line,
+            presentation: Some(presentation),
+            ..
+        } = item
+        else {
+            return None;
+        };
+        let style = window.text_style();
+        let frame = self.resolve_line_frame(item, item, &style, window, cx);
+        let input = Input::new(
+            self.model.display_text()[line.clone()].into(),
+            presentation,
+            &style,
+            window.rem_size(),
+            frame.line_height(),
+            window.pixel_snap(style.font_size.to_pixels(window.rem_size()) * 0.3),
+            frame.widths(width).0,
+        );
+        Some((frame, input))
+    }
+
+    /// Publish cells, frame and list height together, returning the accepted
+    /// row's cache identity. A rejected result leaves the published row intact.
+    fn publish_table_row(
+        &mut self,
+        ix: usize,
+        resolved: Arc<Resolved>,
+        width: Pixels,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(Key<I>, u64)> {
+        let item = self.layout_items.get(ix)?;
+        let TableItem { key, content, .. } = table_item(item)?;
+        let (frame, input) = self.table_input(item, width, window, cx)?;
+        if input != *resolved.input {
+            return None;
         }
-        let mut reframe = false;
+        let DocumentLayoutItem::Text {
+            display,
+            line,
+            node_id,
+            layout,
+            ..
+        } = item
+        else {
+            return None;
+        };
+        let published = Layout::table(frame, resolved);
+        let height = published
+            .frame()
+            .row_height(display, line, item.presentation());
+        let unchanged = layout.0.as_ref().is_some_and(|old| {
+            old.frame() == published.frame()
+                && old
+                    .cells()
+                    .zip(published.cells())
+                    .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+        });
+        if let Some(rows) = self.text_rows.as_mut() {
+            let key = (node_id.clone(), line.clone());
+            rows.table_published(&key);
+        }
+        if unchanged {
+            return Some((key, content));
+        }
         self.layout_items.update(ix, |item| {
-            if let DocumentLayoutItem::Text { table, frame, .. } = item {
-                reframe = table
-                    .0
-                    .as_ref()
-                    .is_none_or(|old| old.geometry != resolved.geometry);
-                if reframe {
-                    frame.0 = None;
-                }
-                table.0 = Some(resolved);
+            if let DocumentLayoutItem::Text { layout, .. } = item {
+                layout.0 = Some(published);
             }
         });
-        if reframe {
-            self.resolve_dropped_frames();
-        }
+        self.list_state.set_item_heights(ix, [Some(height)]);
+        Some((key, content))
     }
 
     pub(in crate::document) fn scroll_table(

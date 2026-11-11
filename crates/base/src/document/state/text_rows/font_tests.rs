@@ -184,9 +184,7 @@ fn item(
         }),
         line: 0..len,
         line_key: 0,
-        frame: Derived::default(),
-        wrapped: Derived::default(),
-        table: Derived::default(),
+        layout: Derived::default(),
     }
 }
 
@@ -307,20 +305,18 @@ fn paint_restyles_keep_wrapped_geometry_and_refresh_presentation(cx: &mut TestAp
                     DocumentLayoutItem::Text {
                         display: a,
                         line_key: ak,
-                        frame: af,
-                        wrapped: aw,
+                        layout: al,
                         ..
                     },
                     DocumentLayoutItem::Text {
                         display: b,
                         line_key: bk,
-                        frame: bf,
-                        wrapped: bw,
+                        layout: bl,
                         ..
                     },
                 ) = (old, new)
                 {
-                    assert_eq!((a, ak, af, aw), (b, bk, bf, bw));
+                    assert_eq!((a, ak, &al.0), (b, bk, &bl.0));
                 }
             }
             assert_eq!(doc.selected_range(), 0..6);
@@ -339,7 +335,7 @@ fn paint_restyles_keep_wrapped_geometry_and_refresh_presentation(cx: &mut TestAp
             font_weight: Some(FontWeight::BOLD), font_style: Some(FontStyle::Italic), ..Default::default()
         }).font_family("Zed Mono")], cx).unwrap();
         assert_ne!(line_key(&doc.layout_items[0]), line_key(&before[0]));
-        assert!(matches!(&doc.layout_items[0], DocumentLayoutItem::Text { wrapped, .. } if wrapped.0.is_none()));
+        assert!(matches!(&doc.layout_items[0], DocumentLayoutItem::Text { layout, .. } if layout.0.as_ref().and_then(super::Layout::wrapped).is_none()));
     });
     super::tests::settle_rows(&document, &mut cx);
     cx.update(|window, cx| {

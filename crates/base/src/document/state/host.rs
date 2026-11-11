@@ -299,13 +299,12 @@ impl<I> DocumentLayoutItem<I> {
         }
     }
 
-    /// Drops the geometry layout derived for this item. A table row keeps its
-    /// cells: they are shown until its table is laid out for the new frame.
+    /// Drops the complete layout derived for this item. Tables can recover
+    /// compatible cell measurements from their input-keyed cache at prepare.
     pub(super) fn forget_geometry(&mut self) {
         match self {
-            Self::Text { frame, wrapped, .. } => {
-                frame.0 = None;
-                wrapped.0 = None;
+            Self::Text { layout, .. } => {
+                layout.0 = None;
             }
             Self::Block { height, .. } | Self::AnchoredBlock { height, .. } => {
                 height.0 = Default::default()
@@ -318,22 +317,10 @@ impl<I> DocumentLayoutItem<I> {
     pub(super) fn keep_geometry(&mut self, old: &Self) {
         match (self, old) {
             (
-                Self::Text {
-                    frame,
-                    wrapped,
-                    table,
-                    ..
-                },
-                Self::Text {
-                    frame: old_frame,
-                    wrapped: old_wrapped,
-                    table: old_table,
-                    ..
-                },
+                Self::Text { layout, .. },
+                Self::Text { layout: old, .. },
             ) => {
-                *frame = *old_frame;
-                *wrapped = *old_wrapped;
-                *table = old_table.clone();
+                *layout = old.clone();
             }
             (
                 Self::Block { height, .. } | Self::AnchoredBlock { height, .. },

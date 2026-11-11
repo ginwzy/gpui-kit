@@ -113,7 +113,9 @@ pub(in crate::document) struct Resolved {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(in crate::document) struct Geometry {
-    pub cells: Vec<Cell>,
+    /// Column and line measurements are immutable and shared while only the
+    /// viewport, borders or scrollbar placement is being reframed.
+    pub cells: Arc<[Cell]>,
     pub width: Pixels,
     pub viewport: Pixels,
     pub height: Pixels,
@@ -204,7 +206,7 @@ impl Geometry {
     }
 
     pub fn position_for_index(&self, ix: usize) -> Option<gpui::Point<Pixels>> {
-        for cell in &self.cells {
+        for cell in self.cells.iter() {
             let row = cell
                 .lines
                 .partition_point(|line| line.range.end <= ix && !line.range.is_empty());
@@ -244,7 +246,7 @@ impl Geometry {
 impl Resolved {
     pub(super) fn pending(input: Arc<Input>, first: bool) -> Self {
         let width = (input.viewport / input.cells.len().max(1) as f32).max(input.padding * 7.);
-        let cells = input
+        let cells: Vec<_> = input
             .cells
             .iter()
             .enumerate()
@@ -256,7 +258,7 @@ impl Resolved {
             })
             .collect();
         let geometry = Arc::new(Geometry {
-            cells,
+            cells: cells.into(),
             width: width * input.cells.len() as f32,
             viewport: input.viewport,
             height: input.line_height + input.padding * 2.,
@@ -296,6 +298,32 @@ impl Resolved {
             && self.input.cells == input.cells
             && self.input.line_height == input.line_height
             && self.input.padding == input.padding
+    }
+
+    /// Keep measured cell lines at their earlier column widths while a new
+    /// table is computed, but publish them against the current viewport and
+    /// row placement. The input and displayed geometry stay one snapshot.
+    pub(super) fn reframe(self: &Arc<Self>, input: Arc<Input>, first: bool, last: bool) -> Arc<Self> {
+        if self.input == input && self.geometry.fits(first, last) {
+            return self.clone();
+        }
+        debug_assert!(self.reusable(&input));
+        let mut geometry = (*self.geometry).clone();
+        if geometry.scrollbar {
+            geometry.height -= SCROLLBAR;
+        }
+        geometry.viewport = input.viewport;
+        geometry.first = first;
+        geometry.scrollbar = last && geometry.width > geometry.viewport;
+        if geometry.scrollbar {
+            geometry.height += SCROLLBAR;
+        }
+        Arc::new(Self {
+            input,
+            measured: self.measured.clone(),
+            geometry: Arc::new(geometry),
+            provisional: true,
+        })
     }
 }
 
@@ -571,7 +599,7 @@ fn place(
         x += *width;
     }
     let geometry = Arc::new(Geometry {
-        cells,
+        cells: cells.into(),
         width: widths.iter().copied().sum(),
         viewport,
         height: input.line_height * height as f32

@@ -913,7 +913,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let DocumentLayoutItem::Text {
             display,
             line,
-            frame,
+            layout,
             presentation,
             ..
         } = &self.layout_items[ix]
@@ -925,7 +925,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 return Some((top + in_row, line));
             }
             // Each display row is one line of text: its frame places it.
-            return Some(match frame.0 {
+            return Some(match layout.0.as_ref().map(super::row::Layout::frame) {
                 Some(frame) => {
                     let (_, _, inset) = frame.inline_metrics(presentation.as_deref());
                     (
