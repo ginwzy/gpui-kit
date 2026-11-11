@@ -309,9 +309,17 @@ fn assert_first_match(model: &DocumentModel<&str>) {
     for start in &offsets {
         for end in offsets.iter().filter(|end| *end >= start) {
             let line = *start..*end;
-            let expected = paragraphs
-                .iter()
-                .find(|style| style.display.start <= line.start && line.end <= style.display.end);
+            let source_start = model.display_to_source(*start, Affinity::After).unwrap();
+            let expected = paragraphs.iter().find(|style| {
+                let contains = style.display.start <= line.start && line.end <= style.display.end;
+                // A shared display endpoint can be the next source paragraph.
+                // Keep internal empty rows and explicitly styled empty paragraphs,
+                // but do not inherit a preceding paragraph's style past its source.
+                let owns_empty_row = line.start < style.display.end
+                    || source_start < style.source.end
+                    || source_start == style.source.start;
+                contains && owns_empty_row
+            });
             let DocumentLayoutItem::Text { presentation, .. } =
                 model.text_layout_item(display, line.clone(), 0..model.text.len(), line.clone(), 0)
             else {

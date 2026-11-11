@@ -49,6 +49,53 @@ fn empty_rows_keep_styles_only_inside_their_paragraph() {
 }
 
 #[test]
+fn empty_paragraphs_keep_their_own_style_at_shared_boundaries() {
+    let mut model = DocumentModel::new(
+        "\n\n",
+        vec![DocumentRegion::new("source", 0..2, EditPolicy::Readonly)],
+    )
+    .unwrap();
+    model
+        .set_rich_presentation(
+            DocumentProjection::identity(2),
+            vec![],
+            DocumentStyles::new(
+                [
+                    (0..1, "previous"),
+                    (1..1, "empty"),
+                    (1..2, "following"),
+                    (2..2, "tail"),
+                ]
+                .into_iter()
+                .map(|(source, marker)| {
+                    DocumentParagraphStyle::new(source, Default::default())
+                        .with_hanging_marker(marker)
+                })
+                .collect(),
+                vec![],
+            ),
+        )
+        .unwrap();
+    let markers: Vec<_> = model
+        .layout_items(None)
+        .into_iter()
+        .map(|item| {
+            let DocumentLayoutItem::Text { presentation, .. } = item else {
+                panic!("expected a text row");
+            };
+            presentation
+                .unwrap()
+                .indent
+                .as_ref()
+                .unwrap()
+                .marker
+                .clone()
+        })
+        .collect();
+    assert_eq!(markers, ["previous", "empty", "tail"]);
+}
+
+#[test]
 fn projected_styles_merge_fields_and_split_the_same_paint_and_font_intervals() {
     let mut model = DocumentModel::new(
         "abcd",
