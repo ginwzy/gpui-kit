@@ -53,6 +53,8 @@ mod layout_items;
 mod layout_window;
 mod presentation;
 mod row;
+mod splice;
+mod structure;
 pub(in crate::document) mod table;
 mod text_rows;
 mod viewport;
@@ -368,58 +370,6 @@ impl<I> DocumentStructure<I> {
 
     fn allocated_bytes(&self) -> usize {
         self.text.capacity() + self.regions.capacity() * std::mem::size_of::<DocumentRegion<I>>()
-    }
-}
-
-impl<I: Clone + Eq + Hash> DocumentStructure<I> {
-    fn suffix(model: &DocumentModel<I>, start: usize) -> Option<Self> {
-        if start > model.text.len() || model.text.clip_offset(start, Bias::Left) != start {
-            return None;
-        }
-        if model.regions.as_slice().iter().any(|region| {
-            let range = region.range();
-            range.start < start && range.end > start
-        }) {
-            return None;
-        }
-        let regions = model
-            .regions
-            .as_slice()
-            .iter()
-            .filter(|region| {
-                region.range().start >= start
-                    // Empty readonly nodes at the boundary belong to the host
-                    // prefix. Retaining them would make user undo depend on a
-                    // submitted node that acceptance is allowed to remove.
-                    && !(region.range().start == start
-                        && region.range().is_empty()
-                        && region.policy() == EditPolicy::Readonly)
-                    && matches!(
-                        region.policy(),
-                        EditPolicy::Editable | EditPolicy::Atomic | EditPolicy::Readonly
-                    )
-            })
-            .map(|region| {
-                let range = region.range();
-                DocumentRegion::new(
-                    region.id().clone(),
-                    range.start - start..range.end - start,
-                    region.policy(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut end = 0;
-        for region in &regions {
-            let range = region.range();
-            if range.start != end {
-                return None;
-            }
-            end = range.end;
-        }
-        (!regions.is_empty() && end == model.text.len() - start).then(|| Self {
-            text: model.text.slice(start..model.text.len()).to_string(),
-            regions,
-        })
     }
 }
 
@@ -806,6 +756,8 @@ struct DocumentModel<I> {
     anchored_blocks: Vec<AnchoredBlock<I>>,
     styles: DocumentStyles,
     resolved_styles: ResolvedDocumentStyles,
+    anchored_indices: HashMap<I, usize>,
+    anchored_nodes: HashMap<I, Vec<usize>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -967,8 +919,68 @@ impl<I: Eq> DocumentLayoutItem<I> {
 }
 
 impl<I: Clone + Eq + Hash> DocumentModel<I> {
+    pub(super) fn set_anchored_blocks(&mut self, blocks: Vec<AnchoredBlock<I>>) {
+        self.anchored_blocks = blocks;
+        self.anchored_indices.clear();
+        self.anchored_nodes.clear();
+        self.index_anchored_blocks(0);
+    }
+
+    fn index_anchored_blocks(&mut self, start: usize) {
+        for (ix, block) in self.anchored_blocks.iter().enumerate().skip(start) {
+            self.anchored_indices.insert(block.id().clone(), ix);
+            self.anchored_nodes
+                .entry(block.position().node_id().clone())
+                .or_default()
+                .push(ix);
+        }
+    }
+
+    fn splice_anchored_blocks(&mut self, nodes: &[I], replacement: Vec<AnchoredBlock<I>>) {
+        let mut removed = nodes
+            .iter()
+            .flat_map(|id| self.anchored_nodes.get(id).into_iter().flatten().copied())
+            .collect::<Vec<_>>();
+        removed.sort_unstable();
+        if let Some(&start) = removed.first() {
+            let mut affected = HashSet::new();
+            for block in &self.anchored_blocks[start..] {
+                self.anchored_indices.remove(block.id());
+                affected.insert(block.position().node_id());
+            }
+            for id in affected {
+                if let Some(indices) = self.anchored_nodes.get_mut(id) {
+                    indices.retain(|ix| *ix < start);
+                    if indices.is_empty() {
+                        self.anchored_nodes.remove(id);
+                    }
+                }
+            }
+            let mut removed = removed.into_iter().peekable();
+            let mut ix = start;
+            // extract_if compacts the affected suffix once, preserving order.
+            self.anchored_blocks
+                .extract_if(start.., |_| {
+                    #[cfg(test)]
+                    structure::tests::record(|work| work.compacted_anchors += 1);
+                    let remove = removed.next_if_eq(&ix).is_some();
+                    ix += 1;
+                    remove
+                })
+                .for_each(drop);
+            self.index_anchored_blocks(start);
+        }
+        let start = self.anchored_blocks.len();
+        self.anchored_blocks.extend(replacement);
+        self.index_anchored_blocks(start);
+    }
+}
+
+impl<I: Clone + Eq + Hash> DocumentModel<I> {
     fn new(text: impl Into<String>, regions: Vec<DocumentRegion<I>>) -> Result<Self, RegionError> {
         let text = Rope::from(text.into());
+        #[cfg(test)]
+        structure::tests::record(|work| work.source_bytes += text.len());
         let regions = DocumentRegions::new(regions, text.len())?;
         validate_region_boundaries(&regions, &text)?;
         let initial_region = regions
@@ -1000,6 +1012,8 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             anchored_blocks: Vec::new(),
             styles: DocumentStyles::default(),
             resolved_styles: ResolvedDocumentStyles::default(),
+            anchored_indices: HashMap::new(),
+            anchored_nodes: HashMap::new(),
         })
     }
 
@@ -1070,7 +1084,7 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         self.projection_map = projection_map;
         self.projection = projection;
         self.blocks = blocks;
-        self.anchored_blocks = anchored_blocks;
+        self.set_anchored_blocks(anchored_blocks);
         self.styles = styles;
         self.resolved_styles = resolved_styles;
         Ok(())
@@ -1183,10 +1197,24 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             .zip(nodes.clone())
             .map(|(region, ix)| (region.id(), ix))
             .collect();
-        let mut anchored: Vec<_> = self
-            .anchored_blocks
-            .iter()
-            .filter(|block| all || region_ix.contains_key(block.position().node_id()))
+        let mut indices = if all {
+            (0..self.anchored_blocks.len()).collect::<Vec<_>>()
+        } else {
+            regions[nodes.clone()]
+                .iter()
+                .flat_map(|region| {
+                    self.anchored_nodes
+                        .get(region.id())
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                })
+                .collect()
+        };
+        indices.sort_unstable();
+        let mut anchored: Vec<_> = indices
+            .into_iter()
+            .map(|ix| &self.anchored_blocks[ix])
             .map(|block| {
                 let (source, display) = anchored_display_offset(
                     block,
@@ -1255,6 +1283,13 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
         items: &mut impl ItemSink<I>,
     ) {
         let regions = self.regions.as_slice();
+        #[cfg(test)]
+        structure::tests::record(|work| {
+            work.layout_bytes += regions[nodes.clone()]
+                .iter()
+                .map(|region| region.range().len())
+                .sum::<usize>()
+        });
         let display_text = self.display_text();
         let (mut source_cursor, mut display_cursor) = match regions.get(nodes.start) {
             Some(region) if nodes.start > 0 => {
@@ -2117,9 +2152,8 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
             if let Some(id) = &record.node_id {
                 if let Some(region) = self
                     .regions
-                    .as_slice()
-                    .iter()
-                    .find(|region| region.id() == id)
+                    .index(id)
+                    .map(|ix| &self.regions.as_slice()[ix])
                 {
                     let range = region.range();
                     record.offset = record.offset.clamp(range.start, range.end);
@@ -2149,7 +2183,7 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
                 .iter()
                 .take_while(|region| region.range().start <= record.offset)
                 .find(|region| region.id() == id)
-                .or_else(|| regions.as_slice().iter().find(|region| region.id() == id));
+                .or_else(|| regions.index(id).map(|ix| &regions.as_slice()[ix]));
             match region {
                 Some(region) => {
                     let range = region.range();
@@ -2168,10 +2202,7 @@ impl<I: Clone + Eq + Hash> DocumentModel<I> {
     }
 
     fn region_index(&self, id: &I) -> Option<usize> {
-        self.regions
-            .as_slice()
-            .iter()
-            .position(|region| region.id() == id)
+        self.regions.index(id)
     }
 
     fn capture_selection_in_region(
@@ -3091,8 +3122,25 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// Invalidates measurements after the host changes a node's custom renderer geometry.
     /// With text rows, layout resolves the node's frames and block heights again.
     pub fn remeasure_node(&mut self, id: &I, cx: &mut Context<Self>) -> bool {
+        let source = match self.region(id) {
+            Some(region) => region.range(),
+            None => {
+                let Some(&ix) = self.model.anchored_indices.get(id) else {
+                    return false;
+                };
+                let Ok(offset) = self
+                    .model
+                    .resolve_position(self.model.anchored_blocks[ix].position())
+                else {
+                    return false;
+                };
+                offset..offset
+            }
+        };
+        let items =
+            self.items_around_source(source.start).start..self.items_around_source(source.end).end;
         if self.text_rows.is_some() {
-            let cleared = self.clear_row_geometry(|node| node == Some(id));
+            let cleared = self.clear_row_geometry_in(items, |node| node == Some(id));
             if cleared {
                 cx.notify();
             }
@@ -3100,7 +3148,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         }
         let indices: Vec<_> = self
             .layout_items
-            .iter()
+            .range(items.clone())
             .enumerate()
             .filter_map(|(ix, item)| {
                 let owner = match item {
@@ -3109,7 +3157,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     | DocumentLayoutItem::AnchoredBlock { id, .. } => Some(id),
                     DocumentLayoutItem::Trailer => None,
                 };
-                (owner == Some(id)).then_some(ix)
+                (owner == Some(id)).then_some(items.start + ix)
             })
             .collect();
         if indices.is_empty() {
@@ -3248,7 +3296,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 reowned.push(ix);
             }
         }
-        host::forget_touched_geometry(
+        splice::forget_touched_geometry(
             &self
                 .layout_items
                 .range(prefix..old_end)
@@ -3359,190 +3407,6 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) -> EditDecision<I> {
         self.commit_transaction(transaction, None, Some(cursor), cx)
-    }
-
-    /// Replace a consumer-owned suffix as one user edit. Its inverse stays in
-    /// the same stack as text edits; the consumer supplies current presentation
-    /// when replay is requested, so host-owned history is never snapshotted.
-    pub fn apply_structure_transaction(
-        &mut self,
-        snapshot: DocumentSnapshot<I>,
-        start: usize,
-        cx: &mut Context<Self>,
-    ) -> Result<(), StructureError> {
-        let selection_before = self.selected_positions().ok();
-        let (next, before, after, selection_after) =
-            self.prepare_structure(snapshot, start, None, None)?;
-        self.undo.record(
-            UndoRecord {
-                sequence: 0,
-                kind: UndoKind::Structure { before, after },
-                selection_before,
-                selection_after: selection_after.clone(),
-            },
-            EditOrigin::User,
-        );
-        self.commit_structure(next, start, selection_after, EditOrigin::User, cx);
-        Ok(())
-    }
-
-    /// Complete the top pending structure replay only after its full next
-    /// presentation has been validated. Failure leaves both stacks unchanged.
-    pub fn apply_structure_replay(
-        &mut self,
-        snapshot: DocumentSnapshot<I>,
-        start: usize,
-        undo: bool,
-        cx: &mut Context<Self>,
-    ) -> Result<(), StructureError> {
-        let record = if undo {
-            self.undo.undo.last()
-        } else {
-            self.undo.redo.last()
-        };
-        let Some(UndoRecord {
-            kind: UndoKind::Structure { before, after },
-            ..
-        }) = record
-        else {
-            return Err(StructureError::StaleReplay);
-        };
-        let (current, target) = if undo {
-            (after, before)
-        } else {
-            (before, after)
-        };
-        let (next, _, _, selection) =
-            self.prepare_structure(snapshot, start, Some(current), Some(target))?;
-        let (source_stack, target_stack, origin) = if undo {
-            (&mut self.undo.undo, &mut self.undo.redo, EditOrigin::Undo)
-        } else {
-            (&mut self.undo.redo, &mut self.undo.undo, EditOrigin::Redo)
-        };
-        let record = source_stack
-            .pop()
-            .expect("validated replay record is present");
-        target_stack.push(record);
-        self.undo.break_coalescing();
-        self.commit_structure(next, start, selection, origin, cx);
-        Ok(())
-    }
-
-    /// IDs referenced by reversible suffix edits, for consumer-owned object
-    /// snapshots which should be discarded when undo records are evicted.
-    pub fn retained_structure_ids(&self) -> Vec<I> {
-        self.undo
-            .undo
-            .iter()
-            .chain(&self.undo.redo)
-            .filter_map(|record| match &record.kind {
-                UndoKind::Structure { before, after } => {
-                    Some(before.regions.iter().chain(&after.regions))
-                }
-                UndoKind::Text { .. } => None,
-            })
-            .flatten()
-            .map(|region| region.id().clone())
-            .collect()
-    }
-
-    fn prepare_structure(
-        &self,
-        snapshot: DocumentSnapshot<I>,
-        start: usize,
-        expected_current: Option<&DocumentStructure<I>>,
-        expected_target: Option<&DocumentStructure<I>>,
-    ) -> Result<
-        (
-            DocumentModel<I>,
-            DocumentStructure<I>,
-            DocumentStructure<I>,
-            Option<(DocumentPosition<I>, DocumentPosition<I>)>,
-        ),
-        StructureError,
-    > {
-        if self.model.marked.is_some() {
-            return Err(StructureError::MarkedText);
-        }
-        self.validate_inline_layout(&snapshot.blocks)
-            .map_err(StructureError::Presentation)?;
-        let before =
-            DocumentStructure::suffix(&self.model, start).ok_or(StructureError::InvalidBoundary)?;
-        if expected_current.is_some_and(|expected| expected != &before) {
-            return Err(StructureError::StaleReplay);
-        }
-        let DocumentSnapshot {
-            text,
-            regions,
-            projection,
-            blocks,
-            anchored_blocks,
-            styles,
-            selection,
-        } = snapshot;
-        if text
-            .get(..start)
-            .is_none_or(|prefix| self.model.text.slice(..start) != prefix)
-        {
-            return Err(StructureError::PrefixChanged);
-        }
-        let mut next = DocumentModel::new(text, regions)
-            .map_err(|error| StructureError::Presentation(PresentationError::Regions(error)))?;
-        if self
-            .model
-            .regions
-            .as_slice()
-            .iter()
-            .filter(|region| region.range().start < start)
-            .ne(next
-                .regions
-                .as_slice()
-                .iter()
-                .filter(|region| region.range().start < start))
-        {
-            return Err(StructureError::PrefixChanged);
-        }
-        next.set_rich_presentation_with_anchors(projection, blocks, anchored_blocks, styles)
-            .map_err(StructureError::Presentation)?;
-        let after =
-            DocumentStructure::suffix(&next, start).ok_or(StructureError::InvalidBoundary)?;
-        if expected_target.is_some_and(|expected| expected != &after) {
-            return Err(StructureError::StaleReplay);
-        }
-        let selection = selection.or_else(|| self.selected_positions().ok());
-        if let Some((anchor, head)) = &selection {
-            for position in [anchor, head] {
-                next.resolve_position(position).map_err(|error| {
-                    StructureError::Presentation(PresentationError::Position(error))
-                })?;
-            }
-        }
-        next.revision = self.model.revision.next();
-        Ok((next, before, after, selection))
-    }
-
-    fn commit_structure(
-        &mut self,
-        mut next: DocumentModel<I>,
-        start: usize,
-        selection: Option<(DocumentPosition<I>, DocumentPosition<I>)>,
-        origin: EditOrigin,
-        cx: &mut Context<Self>,
-    ) {
-        self.settle_list_scroll();
-        let first_item = self.layout_item_for_source(start);
-        next.anchors = self.model.anchors.clone();
-        next.selection = self.model.selection;
-        next.anchors
-            .apply_edit(&(start..self.model.text.len()), next.text.len() - start);
-        next.reconcile_anchor_nodes();
-        if let Some((anchor, head)) = selection {
-            next.replace_selection_positions(anchor, head)
-                .expect("validated structure selection resolves");
-        }
-        self.model = next;
-        self.reconcile_layout_items_from(first_item);
-        self.finish_user_edit(origin, cx);
     }
 
     fn commit_user_transaction(
@@ -4004,7 +3868,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.model.projection = next_projection;
         self.model.projection_map = next_projection_map;
         self.model.blocks = next_blocks;
-        self.model.anchored_blocks = next_anchored;
+        self.model.set_anchored_blocks(next_anchored);
         self.model.styles = next_styles;
         self.model.resolved_styles = next_resolved_styles;
         self.model.revision = self.model.revision.next();
@@ -6107,30 +5971,6 @@ mod tests {
             ],
         )
         .unwrap()
-    }
-
-    #[test]
-    fn structure_suffix_does_not_retain_an_empty_readonly_prefix() {
-        // A send freezes its trailing empty text and creates a new draft at
-        // the same offset. Only the latter belongs to subsequent user undo.
-        let before = DocumentModel::new(
-            "sent",
-            vec![
-                DocumentRegion::new("sent", 0..4, EditPolicy::Readonly),
-                DocumentRegion::new("sent-tail", 4..4, EditPolicy::Readonly),
-                DocumentRegion::new("draft", 4..4, EditPolicy::Editable),
-            ],
-        )
-        .unwrap();
-        let accepted = DocumentModel::new(
-            "",
-            vec![DocumentRegion::new("draft", 0..0, EditPolicy::Editable)],
-        )
-        .unwrap();
-        assert_eq!(
-            DocumentStructure::suffix(&before, 4),
-            DocumentStructure::suffix(&accepted, 0)
-        );
     }
 
     #[gpui::test]

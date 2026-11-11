@@ -1,7 +1,7 @@
 use super::*;
 use crate::document::{Affinity, TextEdit};
 use ropey::Rope;
-use std::{ops::Range, sync::Arc};
+use std::ops::Range;
 
 #[test]
 fn after_affinity_skips_all_hidden_objects_at_a_text_boundary() {
@@ -177,17 +177,6 @@ fn partition_from_any_hint_matches_partition_point() {
             }
         }
     }
-}
-
-#[test]
-fn shared_display_text_is_reused_until_an_edit() {
-    let source = Rope::from("one\ntwo");
-    let mut map = ProjectionMap::new(&source, &DocumentProjection::identity(source.len()));
-    let shared = map.shared_display_text();
-    assert!(Arc::ptr_eq(&shared, &map.shared_display_text()));
-    map.replace_identity(4..7, "three");
-    assert_eq!(&*map.shared_display_text(), "one\nthree");
-    assert_eq!(&*shared, "one\ntwo");
 }
 
 #[test]

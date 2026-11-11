@@ -1,4 +1,10 @@
-use std::{collections::HashSet, error::Error, fmt, hash::Hash, ops::Range};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    fmt,
+    hash::{DefaultHasher, Hash, Hasher},
+    ops::Range,
+};
 
 /// Mutation policy for one source range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -39,6 +45,9 @@ impl<I> DocumentRegion<I> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DocumentRegions<I> {
     regions: Vec<DocumentRegion<I>>,
+    // Buckets retain indices, not copies of the consumer's IDs. Equality is
+    // always checked in the bucket, including when distinct IDs hash alike.
+    indices: HashMap<u64, Vec<usize>>,
 }
 
 impl<I: Eq + Hash> DocumentRegions<I> {
@@ -75,8 +84,64 @@ impl<I: Eq + Hash> DocumentRegions<I> {
             }
         }
 
-        Ok(Self { regions })
+        let mut result = Self {
+            regions,
+            indices: HashMap::new(),
+        };
+        result.index_from(0);
+        Ok(result)
     }
+
+    pub(super) fn index(&self, id: &I) -> Option<usize> {
+        self.indices
+            .get(&id_hash(id))?
+            .iter()
+            .copied()
+            .find(|&ix| self.regions[ix].id() == id)
+    }
+
+    fn index_from(&mut self, start: usize) {
+        for (ix, region) in self.regions.iter().enumerate().skip(start) {
+            self.indices
+                .entry(id_hash(region.id()))
+                .or_default()
+                .push(ix);
+        }
+    }
+
+    pub(super) fn splice(
+        &mut self,
+        range: Range<usize>,
+        mut replacement: Self,
+        start: usize,
+        delta: isize,
+    ) {
+        for region in &self.regions[range.start..] {
+            let hash = id_hash(region.id());
+            if let Some(bucket) = self.indices.get_mut(&hash) {
+                bucket.retain(|ix| *ix < range.start);
+                if bucket.is_empty() {
+                    self.indices.remove(&hash);
+                }
+            }
+        }
+        for region in &mut replacement.regions {
+            region.range = region.range.start + start..region.range.end + start;
+        }
+        for region in &mut self.regions[range.end..] {
+            region.range = region.range.start.checked_add_signed(delta).unwrap()
+                ..region.range.end.checked_add_signed(delta).unwrap();
+        }
+        let first = range.start;
+        self.regions.splice(range, replacement.regions);
+        self.index_from(first);
+    }
+}
+
+fn id_hash(id: &impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl<I> DocumentRegions<I> {
@@ -99,21 +164,8 @@ impl<I> DocumentRegions<I> {
         }
     }
 
-    pub(super) fn splice(
-        &mut self,
-        range: Range<usize>,
-        mut replacement: Self,
-        start: usize,
-        delta: isize,
-    ) {
-        for region in &mut replacement.regions {
-            region.range = region.range.start + start..region.range.end + start;
-        }
-        for region in &mut self.regions[range.end..] {
-            region.range = region.range.start.checked_add_signed(delta).unwrap()
-                ..region.range.end.checked_add_signed(delta).unwrap();
-        }
-        self.regions.splice(range, replacement.regions);
+    pub(super) fn set_policy(&mut self, index: usize, policy: EditPolicy) {
+        self.regions[index].policy = policy;
     }
 }
 
@@ -212,5 +264,46 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, RegionError::DuplicateId { index: 1 });
+    }
+
+    #[test]
+    fn identity_index_checks_collisions_and_follows_splices() {
+        use std::hash::{Hash, Hasher};
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct Id(u8);
+        impl Hash for Id {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                0u8.hash(state);
+            }
+        }
+        let mut regions = DocumentRegions::new(
+            (0..4)
+                .map(|ix| {
+                    DocumentRegion::new(Id(ix), ix as usize..ix as usize + 1, EditPolicy::Readonly)
+                })
+                .collect(),
+            4,
+        )
+        .unwrap();
+        let replacement = DocumentRegions::new(
+            vec![
+                DocumentRegion::new(Id(9), 0..1, EditPolicy::Readonly),
+                DocumentRegion::new(Id(8), 1..2, EditPolicy::Readonly),
+            ],
+            2,
+        )
+        .unwrap();
+        regions.splice(1..2, replacement, 1, 1);
+        assert_eq!(regions.index(&Id(1)), None);
+        for (ix, id) in [0, 9, 8, 2, 3].into_iter().enumerate() {
+            assert_eq!(regions.index(&Id(id)), Some(ix));
+            assert_eq!(regions.as_slice()[ix].range(), ix..ix + 1);
+        }
+        regions.splice(2..5, DocumentRegions::new(Vec::new(), 0).unwrap(), 2, -3);
+        assert_eq!(regions.index(&Id(0)), Some(0));
+        assert_eq!(regions.index(&Id(9)), Some(1));
+        assert_eq!(regions.index(&Id(8)), None);
+        assert_eq!(regions.index(&Id(3)), None);
     }
 }

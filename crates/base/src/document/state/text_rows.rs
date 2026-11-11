@@ -795,7 +795,7 @@ impl LineSpec {
     /// The retained row cache is installed only after the whole batch returns.
     fn wrap_batch(
         specs: &[Self],
-        text: Arc<str>,
+        text: &str,
         wrappers: &mut [LineWrapperHandle],
     ) -> Vec<WrappedLine> {
         let mut completed: HashMap<u64, usize> = HashMap::new();
@@ -817,7 +817,7 @@ impl LineSpec {
                     input: prior.input.clone(),
                 }
             } else {
-                spec.wrap(text.clone(), wrappers)
+                spec.wrap(text, wrappers)
             };
             completed.insert(spec.key, lines.len());
             lines.push(line);
@@ -825,34 +825,20 @@ impl LineSpec {
         lines
     }
 
-    fn wrap(&self, text: Arc<str>, wrappers: &mut [LineWrapperHandle]) -> WrappedLine {
-        let mut work = Wrap::new(
-            &text[self.range.clone()],
-            &self.runs,
-            self.widths,
-            self.previous.clone(),
-        )
-        .with_objects(self.objects.clone());
+    fn wrap(&self, text: &str, wrappers: &mut [LineWrapperHandle]) -> WrappedLine {
+        #[cfg(test)]
+        super::structure::tests::record(|work| work.wrap_bytes += self.range.len());
+        let text: Arc<str> = text[self.range.clone()].into();
+        let mut work = Wrap::new(&text, &self.runs, self.widths, self.previous.clone())
+            .with_objects(self.objects.clone());
         let cancel = AtomicBool::new(false);
-        while !work.step(
-            &text[self.range.clone()],
-            &self.runs,
-            wrappers,
-            REWRAP_IN_FRAME_BYTES,
-            &cancel,
-        ) {}
+        while !work.step(&text, &self.runs, wrappers, REWRAP_IN_FRAME_BYTES, &cancel) {}
         self.result(text, work.finish())
     }
 
     fn result(&self, text: Arc<str>, starts: Breaks) -> WrappedLine {
-        // A cached line must not pin the whole document revision. A single
-        // huge source line can share the input directly; other lines retain
-        // only their own immutable text.
-        let text: Arc<str> = if self.range == (0..text.len()) {
-            text
-        } else {
-            text[self.range.clone()].into()
-        };
+        // Each job owns only its line; neither scheduling nor retaining its
+        // result copies or pins the unchanged document prefix.
         let range = 0..text.len();
         WrappedLine {
             item: self.item,
@@ -1066,9 +1052,24 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             return false;
         };
         state.invalidate();
+        let cleared = self.clear_row_geometry_in(0..self.layout_items.len(), owned);
+        self.text_rows.as_mut().unwrap().resolve |= cleared;
+        cleared
+    }
+
+    pub(super) fn clear_row_geometry_in(
+        &mut self,
+        items: Range<usize>,
+        owned: impl Fn(Option<&I>) -> bool,
+    ) -> bool {
+        if self.text_rows.is_none() {
+            return false;
+        }
+        #[cfg(test)]
+        super::structure::tests::record(|work| work.remeasured_rows += items.len());
         let mut cleared = false;
-        let mut ix = 0;
-        while ix < self.layout_items.len() {
+        let mut ix = items.start;
+        while ix < items.end {
             match &self.layout_items[ix] {
                 item @ DocumentLayoutItem::Text { node_id, line, .. } => {
                     if owned(node_id.as_ref()) {
@@ -1104,17 +1105,18 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             }
         }
         let state = self.text_rows.as_mut().unwrap();
-        state.resolve |= cleared;
-        state.check |= cleared;
-        state.scan_all |= cleared;
-        cleared
-    }
-
-    /// Some items dropped their frames; the next prepare resolves them.
-    pub(super) fn resolve_dropped_frames(&mut self) {
-        if let Some(state) = self.text_rows.as_mut() {
-            state.resolve = true;
+        if cleared {
+            // A running publication can carry an old host frame. Cancel it
+            // before it publishes; an idle document needs only this window.
+            if state.pending.is_some() || state.ready.is_some() || state.publishing.is_some() {
+                state.invalidate();
+            }
+            state.dirty = Some(match state.dirty.take() {
+                Some(dirty) => dirty.start.min(items.start)..dirty.end.max(items.end),
+                None => items,
+            });
         }
+        cleared
     }
 
     /// Layout items were added or replaced; layout resolves and wraps them.
@@ -2013,7 +2015,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     line_key,
                     presentation,
                     node_id,
-                    layout: Derived(Some(Layout::Text { frame: item_frame, wrap: wrapped })),
+                    layout:
+                        Derived(Some(Layout::Text {
+                            frame: item_frame,
+                            wrap: wrapped,
+                        })),
                     ..
                 } = item
                 else {
@@ -2150,8 +2156,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .map(|line| self.line_spec(line, &mut fonts))
                 .collect();
             let mut wrappers = fonts.wrappers(cx);
-            let text = self.model.projection_map.shared_display_text();
-            let lines = LineSpec::wrap_batch(&specs, text, &mut wrappers);
+            let lines = LineSpec::wrap_batch(&specs, self.model.display_text(), &mut wrappers);
             let (now_settled, now_outdated) = self.take_wrapped(generation, lines);
             settled.extend(now_settled);
             outdated.extend(now_outdated);
@@ -2171,7 +2176,13 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             let specs: Vec<_> = later
                 .iter()
                 .take(BACKGROUND_LINES_PER_WRAP)
-                .map(|line| self.line_spec(line, &mut fonts))
+                .map(|line| {
+                    let spec = self.line_spec(line, &mut fonts);
+                    #[cfg(test)]
+                    super::structure::tests::record(|work| work.wrap_bytes += spec.range.len());
+                    let text: Arc<str> = self.model.display_text()[spec.range.clone()].into();
+                    (spec, text)
+                })
                 .collect();
             let wrappers = fonts.wrappers(cx);
             (specs, wrappers)
@@ -2197,41 +2208,29 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let Some((specs, mut wrappers)) = background else {
             return;
         };
-        let text = self.model.projection_map.shared_display_text();
         let request = state.request;
         let cancel = state.cancel.clone();
         let task = cx.spawn(async move |this, cx| {
             let (sender, receiver) = smol::channel::bounded(2);
             let worker = cx.background_spawn(async move {
                 let mut lines = Vec::new();
-                for spec in specs {
+                for (spec, text) in specs {
                     if cancel.load(Ordering::Relaxed) {
                         return;
                     }
-                    let mut work = Wrap::new(
-                        &text[spec.range.clone()],
-                        &spec.runs,
-                        spec.widths,
-                        spec.previous.clone(),
-                    )
-                    .with_objects(spec.objects.clone());
+                    let mut work = Wrap::new(&text, &spec.runs, spec.widths, spec.previous.clone())
+                        .with_objects(spec.objects.clone());
                     loop {
                         if cancel.load(Ordering::Relaxed) {
                             return;
                         }
-                        if work.step(
-                            &text[spec.range.clone()],
-                            &spec.runs,
-                            &mut wrappers,
-                            16 * 1024,
-                            &cancel,
-                        ) {
+                        if work.step(&text, &spec.runs, &mut wrappers, 16 * 1024, &cancel) {
                             break;
                         }
                         smol::future::yield_now().await;
                     }
                     let starts = work.finish();
-                    lines.push(spec.result(text.clone(), starts));
+                    lines.push(spec.result(text, starts));
                     if (spec.priority || lines.len() == 64)
                         && sender.send(std::mem::take(&mut lines)).await.is_err()
                     {
@@ -2784,7 +2783,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 line,
                 line_key,
                 node_id,
-                layout: Derived(Some(Layout::Text { frame: published_frame, .. })),
+                layout:
+                    Derived(Some(Layout::Text {
+                        frame: published_frame,
+                        ..
+                    })),
                 ..
             } = &self.layout_items[rows.start]
             else {
@@ -2833,18 +2836,13 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                         line_key,
                     )
                 };
-                if let DocumentLayoutItem::Text {
-                    layout,
-                    ..
-                } = &mut item
-                {
+                if let DocumentLayoutItem::Text { layout, .. } = &mut item {
                     layout.0 = Some(Layout::Text {
                         frame,
                         wrap: Some(wrap),
                     });
                 }
-                heights
-                    .push(Some(frame.row_height(&range, &line, item.presentation())));
+                heights.push(Some(frame.row_height(&range, &line, item.presentation())));
                 items.push(item);
             }
             budget -= count;
@@ -3128,9 +3126,9 @@ mod tests {
                 })
                 .collect();
             let mut wrappers = FontTable::new(window).wrappers(cx);
-            let actual = LineSpec::wrap_batch(&specs, text.clone(), &mut wrappers);
+            let actual = LineSpec::wrap_batch(&specs, &text, &mut wrappers);
             for (spec, actual) in specs.iter().zip(&actual) {
-                let expected = spec.wrap(text.clone(), &mut wrappers);
+                let expected = spec.wrap(&text, &mut wrappers);
                 assert_eq!(
                     actual.starts.starts().collect::<Vec<_>>(),
                     expected.starts.starts().collect::<Vec<_>>()
@@ -3517,7 +3515,9 @@ mod tests {
                 let widths = match &doc.layout_items[0] {
                     DocumentLayoutItem::Text { layout, .. } => layout
                         .0
-                        .as_ref().unwrap().frame()
+                        .as_ref()
+                        .unwrap()
+                        .frame()
                         .widths(doc.text_rows.as_ref().unwrap().width.unwrap()),
                     _ => unreachable!(),
                 };
@@ -3754,11 +3754,12 @@ mod tests {
                         line,
                         layout,
                         ..
-                    } => layout.0.as_ref().expect("every row is prepared").frame().row_height(
-                        display,
-                        line,
-                        item.presentation(),
-                    ),
+                    } => layout
+                        .0
+                        .as_ref()
+                        .expect("every row is prepared")
+                        .frame()
+                        .row_height(display, line, item.presentation()),
                     DocumentLayoutItem::Block { id, height, .. } => match height.0 {
                         BlockGeometry::Declared(height) => height,
                         BlockGeometry::Measured => {
@@ -3936,9 +3937,9 @@ mod tests {
                     .layout_items
                     .iter()
                     .find_map(|item| match item {
-                        DocumentLayoutItem::Text { display, layout, .. }
-                            if &document.display_text()[display.clone()] == text =>
-                        {
+                        DocumentLayoutItem::Text {
+                            display, layout, ..
+                        } if &document.display_text()[display.clone()] == text => {
                             layout.0.as_ref().map(|layout| layout.frame().line_height)
                         }
                         _ => None,

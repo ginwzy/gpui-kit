@@ -1,6 +1,6 @@
 use std::{hash::Hash, ops::Range};
 
-use super::{DocumentLayoutItem, DocumentState, host::forget_touched_geometry};
+use super::{DocumentLayoutItem, DocumentState, splice::forget_touched_geometry};
 
 impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// Lays out again the nodes around editable node `target` after an edit
