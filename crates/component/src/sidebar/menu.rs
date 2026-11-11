@@ -94,6 +94,7 @@ impl Styled for SidebarMenu {
 pub struct SidebarMenuItem {
     icon: Option<Icon>,
     label: SharedString,
+    tooltip: Option<SharedString>,
     label_style: StyleRefinement,
     style: StyleRefinement,
     handler: Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
@@ -114,6 +115,7 @@ impl SidebarMenuItem {
         Self {
             icon: None,
             label: label.into(),
+            tooltip: None,
             label_style: StyleRefinement::default(),
             style: StyleRefinement::default(),
             handler: Rc::new(|_, _, _| {}),
@@ -138,6 +140,13 @@ impl SidebarMenuItem {
     /// Set the style for the label
     pub fn label_style(mut self, style: StyleRefinement) -> Self {
         self.label_style = style;
+        self
+    }
+
+    /// Show additional context through the window's managed tooltip overlay.
+    /// Collapsed icon items continue to show their label.
+    pub fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
+        self.tooltip = Some(tooltip.into());
         self
     }
 
@@ -254,7 +263,7 @@ impl SidebarItem for SidebarMenuItem {
         let click_to_open = self.click_to_open;
         let click_to_toggle = self.click_to_toggle;
         let default_open = self.default_open;
-        let collapsed_tooltip = self.collapsed_tooltip();
+        let tooltip = self.collapsed_tooltip().or(self.tooltip.clone());
         let id = id.into();
         let is_submenu = self.is_submenu();
         let open_state = if is_submenu {
@@ -375,10 +384,15 @@ impl SidebarItem for SidebarMenuItem {
                         })
                     })
                     .map(|this| {
-                        if let Some(tooltip) = collapsed_tooltip {
-                            this.managed_tooltip_at(Placement::Right, move |window, cx| {
+                        if let Some(tooltip) = tooltip {
+                            let build = move |window: &mut Window, cx: &mut App| {
                                 Tooltip::new(tooltip.clone()).build(window, cx)
-                            })
+                            };
+                            if is_collapsed {
+                                this.managed_tooltip_at(Placement::Right, build)
+                            } else {
+                                this.managed_tooltip(build)
+                            }
                         } else {
                             this
                         }
