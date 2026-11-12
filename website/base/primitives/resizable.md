@@ -36,6 +36,16 @@ Panel sizes live in resizable state; dragging handles updates adjacent panels su
 
 Keep controlled state on the parent render type or in a GPUI entity. Update it in callbacks and call `cx.notify()`; do not recreate persistent entities during every render.
 
+For a sidebar whose preferred width must survive container resizing, opt into
+`ResizablePanelGroup::controlled()`. In this mode, each panel's `.size(...)`
+is the current caller-owned preference; panels without a size flex into the
+remaining space. `size_range` clamps only the rendered size. Dragging previews a
+new split, then `on_resize` reports the measured sizes on release. Adopt the
+relevant sizes in the owner and notify it; automatic layout and external value
+changes do not invoke this callback. While dragging, `ResizableState::is_resizing()`
+lets the owner distinguish the preview from its saved preference. Without
+`controlled()`, the existing retained, proportional split behavior is unchanged.
+
 ## Complete Rust example
 
 The complete implementation used by the runnable showcase is embedded directly from Rust source:

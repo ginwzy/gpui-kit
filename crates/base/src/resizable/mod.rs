@@ -36,6 +36,7 @@ pub struct ResizableState {
     panels: Vec<ResizablePanelState>,
     sizes: Vec<Pixels>,
     resizing_panel_ix: Option<usize>,
+    controlled: bool,
     bounds: Bounds<Pixels>,
 }
 
@@ -46,6 +47,7 @@ impl Default for ResizableState {
             panels: vec![],
             sizes: vec![],
             resizing_panel_ix: None,
+            controlled: false,
             bounds: Bounds::default(),
         }
     }
@@ -55,6 +57,11 @@ impl ResizableState {
     /// Get the size of the panels.
     pub fn sizes(&self) -> &Vec<Pixels> {
         &self.sizes
+    }
+
+    /// Whether a divider drag is currently previewing a new split.
+    pub fn is_resizing(&self) -> bool {
+        self.resizing_panel_ix.is_some()
     }
 
     /// Programmatically resize the panel at `ix` to `size`, redistributing
@@ -205,10 +212,12 @@ impl ResizableState {
         cx: &mut Context<Self>,
     ) {
         let size = bounds.size.along(self.axis);
-        // This check is only necessary to stop the very first panel from resizing on its own
-        // it needs to be passed when the panel is freshly created so we get the initial size,
-        // but its also fine when it sometimes passes later.
-        if self.sizes[panel_ix].as_f32() == PANEL_MIN_SIZE.as_f32() {
+        // Uncontrolled groups seed their retained split once. Controlled
+        // groups publish each measurement without changing the preferred size.
+        if self.controlled {
+            // Measurements describe this frame, never the caller's preference.
+            self.sizes[panel_ix] = size;
+        } else if self.sizes[panel_ix].as_f32() == PANEL_MIN_SIZE.as_f32() {
             self.sizes[panel_ix] = size;
             self.panels[panel_ix].size = Some(size);
         }
@@ -351,7 +360,7 @@ impl ResizableState {
     ///
     /// When the container size changes, the panels should take up the same percentage as they did before.
     fn adjust_to_container_size(&mut self, cx: &mut Context<Self>) {
-        if self.container_size().is_zero() {
+        if self.controlled || self.container_size().is_zero() {
             return;
         }
 
@@ -396,6 +405,8 @@ pub(crate) struct ResizablePanelState {
 
 #[cfg(test)]
 mod tests {
+    mod controlled;
+
     use std::{cell::Cell, rc::Rc};
 
     use gpui::{

@@ -33,6 +33,7 @@ pub struct ResizablePanelGroup {
     state: Option<Entity<ResizableState>>,
     axis: Axis,
     size: Option<Pixels>,
+    controlled: bool,
     children: Vec<ResizablePanel>,
     on_resize: Rc<dyn Fn(&Entity<ResizableState>, &mut Window, &mut App)>,
     handle_appearance: Option<ResizeHandleRenderer>,
@@ -47,6 +48,7 @@ impl ResizablePanelGroup {
             children: vec![],
             state: None,
             size: None,
+            controlled: false,
             on_resize: Rc::new(|_, _, _| {}),
             handle_appearance: None,
         }
@@ -66,6 +68,18 @@ impl ResizablePanelGroup {
     /// If not provided, it will handle its own state internally.
     pub fn with_state(mut self, state: &Entity<ResizableState>) -> Self {
         self.state = Some(state.clone());
+        self
+    }
+
+    /// Use the caller's panel sizes on every render instead of retaining a
+    /// proportional split. Panels without a `size` receive the remaining space.
+    ///
+    /// While dragging, the group previews the requested split. On release,
+    /// `on_resize` reports the measured sizes; the caller must adopt the new
+    /// preferred sizes and render again. External updates and layout clamping
+    /// do not invoke that callback. Hidden panels retain the caller's preference.
+    pub fn controlled(mut self) -> Self {
+        self.controlled = true;
         self
     }
 
@@ -149,6 +163,12 @@ impl RenderOnce for ResizablePanelGroup {
         let panels_count = self.children.len();
         state.update(cx, |state, cx| {
             state.sync_panels_count(self.axis, panels_count, cx);
+            state.controlled = self.controlled;
+            if self.controlled && !state.is_resizing() {
+                for (panel, child) in state.panels.iter_mut().zip(&self.children) {
+                    panel.size = child.initial_size;
+                }
+            }
         });
 
         container
@@ -271,7 +291,8 @@ impl ResizablePanel {
         self
     }
 
-    /// Set the initial size of the panel.
+    /// Set the initial size of the panel, or its current preferred size when
+    /// the parent group uses [`ResizablePanelGroup::controlled`].
     pub fn size(mut self, size: impl Into<Pixels>) -> Self {
         self.initial_size = Some(size.into());
         self
@@ -312,6 +333,7 @@ impl RenderOnce for ResizablePanel {
             .panels
             .get(self.panel_ix)
             .expect("BUG: The `index` of ResizablePanel should be one of in `state`.");
+        let controlled = state.read(cx).controlled;
         let size_range = self.size_range.clone();
 
         div()
@@ -339,10 +361,11 @@ impl RenderOnce for ResizablePanel {
             // 3. initial_size is Some and size is Some, use `size`.
             .when(self.initial_size.is_none(), |this| this.flex_shrink_1())
             .when_some(self.initial_size, |this, initial_size| {
-                // The `self.size` is None, that mean the initial size for the panel,
-                // so we need set `flex_shrink_0` To let it keep the initial size.
+                // In a controlled group, a supplied size stays fixed while the
+                // unsized siblings absorb the remaining space. During a drag,
+                // panel_state supplies the preview until the owner commits it.
                 this.when(
-                    panel_state.size.is_none() && !initial_size.is_zero(),
+                    (controlled || panel_state.size.is_none()) && !initial_size.is_zero(),
                     |this| this.flex_none(),
                 )
                 .flex_basis(initial_size)
