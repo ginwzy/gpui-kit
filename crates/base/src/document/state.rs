@@ -66,7 +66,7 @@ mod style_tests;
 pub use inline_objects::StructureReplacement;
 pub(super) use text_rows::RowFrame;
 pub use text_rows::{TextFrame, TextRows};
-pub use viewport::ScrollHold;
+pub use viewport::{Scroll, ScrollDirection, ScrollHold};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentEditRejection {
@@ -249,8 +249,12 @@ pub enum DocumentEvent<I> {
     StopFollowingRequested {
         pin_id: I,
     },
-    /// The user moved the viewport with the wheel or scrollbar.
-    ViewportScrolled,
+    /// A conditional rejoin passed its first layout without moving the viewport.
+    FollowingResumed {
+        pin_id: I,
+    },
+    /// One user input and its resolved viewport, usable once for a conditional rejoin.
+    ViewportScrolled(Scroll),
     /// A layout placed another row at the viewport top, whether the user
     /// scrolled, a reveal or pin moved it, or the content above it changed.
     /// Read it with [`DocumentState::viewport_top`].
@@ -2669,7 +2673,7 @@ pub struct DocumentState<I> {
     trailer_height: Option<Pixels>,
     viewport: viewport::Viewport<I>,
     scroll_handler_installed: bool,
-    scrollbar_input_pending: Rc<Cell<bool>>,
+    scrollbar_input: Rc<Cell<viewport::ScrollbarInput>>,
     block_renderer: Option<BlockRenderer<I>>,
     text_renderer: Option<TextRenderer<I>>,
     text_frame_resolver: Option<TextFrameResolver<I>>,
@@ -2702,7 +2706,7 @@ type TextRenderer<I> =
 #[derive(Clone)]
 struct DocumentScrollbarHandle {
     list: ListState,
-    input_pending: Rc<Cell<bool>>,
+    input: Rc<Cell<viewport::ScrollbarInput>>,
 }
 
 impl ScrollbarHandle for DocumentScrollbarHandle {
@@ -2715,8 +2719,15 @@ impl ScrollbarHandle for DocumentScrollbarHandle {
     }
 
     fn set_offset(&self, offset: Point<Pixels>) {
-        self.input_pending.set(true);
+        let before = self.offset();
         ScrollbarHandle::set_offset(&self.list, offset);
+        let mut input = self.input.get();
+        input.moved(
+            before.y - offset.y,
+            before.y - self.offset().y,
+            self.list.is_scrollbar_dragging(),
+        );
+        self.input.set(input);
     }
 
     fn content_size(&self) -> gpui::Size<Pixels> {
@@ -2724,12 +2735,24 @@ impl ScrollbarHandle for DocumentScrollbarHandle {
     }
 
     fn start_drag(&self) {
-        self.input_pending.set(true);
+        let mut input = self.input.get();
+        input.start();
+        self.input.set(input);
         self.list.scrollbar_drag_started();
     }
 
     fn end_drag(&self) {
         self.list.scrollbar_drag_ended();
+        let mut input = self.input.get();
+        input.end();
+        self.input.set(input);
+    }
+
+    fn cancel_drag(&self) {
+        self.list.scrollbar_drag_ended();
+        let mut input = self.input.get();
+        input.cancel();
+        self.input.set(input);
     }
 }
 
@@ -2779,7 +2802,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             trailer_height: None,
             viewport: viewport::Viewport::default(),
             scroll_handler_installed: false,
-            scrollbar_input_pending: Rc::default(),
+            scrollbar_input: Rc::default(),
             block_renderer: None,
             text_renderer: None,
             text_frame_resolver: None,
@@ -2864,7 +2887,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.undo = DocumentUndoManager::default();
         self.preferred_x = None;
         self.reset_viewport();
-        self.scrollbar_input_pending.set(false);
+        self.scrollbar_input
+            .set(viewport::ScrollbarInput::default());
         self.text_layouts.clear();
         self.block_layouts.clear();
         self.trailer_layout = None;
@@ -5838,7 +5862,12 @@ impl<I: Clone + Eq + Hash + 'static> Render for DocumentState<I> {
                 let Some(entity) = weak.upgrade() else {
                     return;
                 };
-                entity.update(cx, |state, cx| state.list_scrolled(cx));
+                let input = Scroll::wheel(event);
+                if input.direction().is_none() && input.phase() != Some(gpui::TouchPhase::Cancelled)
+                {
+                    return;
+                }
+                entity.update(cx, |state, cx| state.list_scrolled(input, cx));
             });
         }
         let list_entity = entity.clone();
@@ -5852,7 +5881,7 @@ impl<I: Clone + Eq + Hash + 'static> Render for DocumentState<I> {
         let interaction_entity = entity.clone();
         let scrollbar = Scrollbar::vertical(&DocumentScrollbarHandle {
             list: self.list_state.clone(),
-            input_pending: self.scrollbar_input_pending.clone(),
+            input: self.scrollbar_input.clone(),
         });
         let interaction_layer = gpui::div()
             .absolute()
@@ -6808,7 +6837,9 @@ mod tests {
                         cx,
                     )
                     .unwrap();
-                document.scrollbar_input_pending.set(true);
+                let mut input = viewport::ScrollbarInput::default();
+                input.start();
+                document.scrollbar_input.set(input);
                 document
                     .reset(
                         DocumentSnapshot::new(
@@ -8377,7 +8408,7 @@ mod tests {
             events
                 .borrow()
                 .iter()
-                .any(|event| matches!(event, DocumentEvent::ViewportScrolled))
+                .any(|event| matches!(event, DocumentEvent::ViewportScrolled(_)))
         );
     }
 

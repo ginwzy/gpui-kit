@@ -79,6 +79,10 @@ pub trait ScrollbarHandle: 'static {
     fn start_drag(&self) {}
     /// Called when end dragging the scrollbar thumb.
     fn end_drag(&self) {}
+    /// Called when a drag is cancelled; cleanup defaults to normal release.
+    fn cancel_drag(&self) {
+        self.end_drag();
+    }
 }
 
 impl ScrollbarHandle for ScrollHandle {
@@ -1689,7 +1693,11 @@ impl Element for Scrollbar {
                                 ));
                             }
                             if matches!(event.phase, TouchPhase::Ended | TouchPhase::Cancelled) {
-                                scroll_handle.end_drag();
+                                if event.phase == TouchPhase::Cancelled {
+                                    scroll_handle.cancel_drag();
+                                } else {
+                                    scroll_handle.end_drag();
+                                }
                                 state.set(state.get().with_unset_drag_pos(Instant::now()));
                             }
                             window.prevent_default();

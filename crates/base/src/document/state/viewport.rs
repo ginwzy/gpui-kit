@@ -4,7 +4,9 @@
 //! scrolling, following, reveals and the scroll range in that order.
 use std::{hash::Hash, ops::RangeInclusive, rc::Rc};
 
-use gpui::{Context, ListGeometry, ListOffset, ListState, Pixels, Window, px};
+use gpui::{
+    Context, ListGeometry, ListOffset, ListScrollEvent, ListState, Pixels, TouchPhase, Window, px,
+};
 
 use super::{
     Affinity, AnchorBias, DocumentAnchor, DocumentEvent, DocumentLayoutItem, DocumentPosition,
@@ -13,6 +15,131 @@ use super::{
 
 /// Pin moves at most this far in one layout are applied directly.
 const PIN_EASE_SNAP: Pixels = px(24.);
+
+/// Movement in document order, independent of the input device's delta convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollDirection {
+    Backward,
+    Forward,
+}
+
+impl ScrollDirection {
+    fn of(delta: Pixels) -> Option<Self> {
+        // Pixels orders -0.0 below +0.0; numeric zero is not backward input.
+        let delta = delta.as_f32();
+        if delta > 0. {
+            Some(Self::Forward)
+        } else if delta < 0. {
+            Some(Self::Backward)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    entity: gpui::EntityId,
+    input: u64,
+    layout: u64,
+    revision: super::DocumentRevision,
+}
+
+/// One consumed input, published after its viewport has been resolved. Its
+/// private identity lets a host rejoin a pin only from this input's result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scroll {
+    stamp: Option<Stamp>,
+    direction: Option<ScrollDirection>,
+    movement: Option<ScrollDirection>,
+    phase: Option<TouchPhase>,
+    dragging: bool,
+}
+
+impl Scroll {
+    fn new(
+        direction: Option<ScrollDirection>,
+        movement: Option<ScrollDirection>,
+        phase: Option<TouchPhase>,
+        dragging: bool,
+    ) -> Self {
+        Self {
+            stamp: None,
+            direction,
+            movement,
+            phase,
+            dragging,
+        }
+    }
+
+    pub(super) fn wheel(event: &ListScrollEvent) -> Self {
+        Self::new(
+            ScrollDirection::of(-event.input.delta.pixel_delta(px(20.)).y),
+            ScrollDirection::of(event.scroll_delta),
+            Some(event.input.touch_phase),
+            false,
+        )
+    }
+
+    pub fn direction(&self) -> Option<ScrollDirection> {
+        self.direction
+    }
+    pub fn movement(&self) -> Option<ScrollDirection> {
+        self.movement
+    }
+    pub fn phase(&self) -> Option<TouchPhase> {
+        self.phase
+    }
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+}
+
+/// Scrollbar callbacks cannot borrow DocumentState. Retain only input facts;
+/// ListState remains the sole owner of its offset and drag state.
+#[derive(Clone, Copy, Default)]
+pub(super) struct ScrollbarInput {
+    pending: Option<Scroll>,
+    direction: Option<ScrollDirection>,
+}
+
+impl ScrollbarInput {
+    pub(super) fn start(&mut self) {
+        self.direction = None;
+        self.pending = Some(Scroll::new(None, None, Some(TouchPhase::Started), true));
+    }
+
+    pub(super) fn moved(&mut self, requested: Pixels, applied: Pixels, dragging: bool) {
+        let direction = ScrollDirection::of(requested);
+        if direction.is_some() {
+            self.direction = direction;
+        }
+        self.pending = Some(Scroll::new(
+            direction,
+            ScrollDirection::of(applied),
+            Some(TouchPhase::Moved),
+            dragging,
+        ));
+    }
+
+    pub(super) fn end(&mut self) {
+        self.pending = Some(Scroll::new(
+            self.direction.take(),
+            None,
+            Some(TouchPhase::Ended),
+            false,
+        ));
+    }
+
+    pub(super) fn cancel(&mut self) {
+        self.direction = None;
+        self.pending = Some(Scroll::new(None, None, Some(TouchPhase::Cancelled), false));
+    }
+
+    fn take(&mut self) -> Option<Scroll> {
+        self.pending.take()
+    }
+}
 
 pub(super) struct Viewport<I> {
     /// The viewport top sits `delta` below the top of the row that owns `anchor`.
@@ -27,6 +154,11 @@ pub(super) struct Viewport<I> {
     reported_top: Option<usize>,
     /// Scrolling asked for in pixels since the last layout.
     scroll: Pixels,
+    /// The latest input is eligible only in the layout that resolved it.
+    input: Option<Scroll>,
+    published_input: Option<Scroll>,
+    input_epoch: u64,
+    layout_epoch: u64,
     pub(super) pin: Option<ScrollPin<I>>,
     pub(super) reveal: Option<Reveal>,
     pub(super) limit: Option<DocumentPosition<I>>,
@@ -43,6 +175,10 @@ impl<I> Default for Viewport<I> {
             painted_stale: false,
             reported_top: None,
             scroll: Pixels::ZERO,
+            input: None,
+            published_input: None,
+            input_epoch: 0,
+            layout_epoch: 0,
             pin: None,
             reveal: None,
             limit: None,
@@ -77,6 +213,9 @@ pub(super) struct ScrollPin<I> {
     /// Scrolls only forward: an anchor above its hold stays where it is while
     /// it remains in the viewport.
     forward: bool,
+    /// A conditional rejoin is checked once more in its first layout, so a
+    /// host refresh cannot turn it into an unconditional positioning request.
+    rejoin: Option<u64>,
 }
 
 /// Content after a pin's anchor that should end `clearance` above the viewport
@@ -189,6 +328,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     pub(super) fn reset_viewport(&mut self) {
         let viewport = std::mem::take(&mut self.viewport);
         self.viewport.limit = viewport.limit;
+        self.viewport.input_epoch = viewport.input_epoch.wrapping_add(1);
+        self.viewport.layout_epoch = viewport.layout_epoch;
     }
 
     /// Makes a scroll the list made itself since the last layout (wheel,
@@ -279,17 +420,22 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .map_err(ScrollPinError::InvalidPosition)?;
         // Re-pinning the same target follows its growth; moving an existing
         // pin elsewhere eases there unless the platform asks for reduced motion.
-        let easing = match self.viewport.pin.take() {
+        let (easing, rejoin) = match self.viewport.pin.take() {
             Some(previous) => {
+                let rejoin = if previous.id == pin_id {
+                    previous.rejoin
+                } else {
+                    None
+                };
                 let moved = previous.viewport_fraction != viewport_fraction
                     || self
                         .model
                         .position_for_anchor(previous.anchor)
                         .map_or(true, |previous| previous.node_id() != position.node_id());
                 self.remove_scroll_pin_anchors(&previous);
-                (previous.easing || moved) && !cx.reduce_motion()
+                ((previous.easing || moved) && !cx.reduce_motion(), rejoin)
             }
-            None => false,
+            None => (false, None),
         };
         let anchor = self.anchor_for(offset, position);
         self.viewport.pin = Some(ScrollPin {
@@ -300,6 +446,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             settling: false,
             trail: None,
             forward,
+            rejoin,
         });
         cx.notify();
         Ok(())
@@ -350,6 +497,51 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) -> Result<(), ScrollPinError> {
         self.place_scroll_pin_above(pin_id, position, trailing, clearance, fractions, true, cx)
+    }
+
+    /// Rejoins following from one forward user input without positioning the
+    /// viewport. A later input, inspection, or layout rejects an old result.
+    /// The first layout rechecks the no-movement condition, then consumes it;
+    /// a failed request is released through StopFollowingRequested.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rejoin_scroll_forward_above(
+        &mut self,
+        input: &Scroll,
+        pin_id: I,
+        position: &DocumentPosition<I>,
+        trailing: &DocumentPosition<I>,
+        clearance: Pixels,
+        fractions: RangeInclusive<f32>,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, ScrollPinError> {
+        let Some(stamp) = input.stamp else {
+            return Ok(false);
+        };
+        if self.viewport.published_input.as_ref() != Some(input)
+            || stamp.entity != cx.entity_id()
+            || stamp.input != self.viewport.input_epoch
+            || stamp.layout != self.viewport.layout_epoch
+            || stamp.revision != self.revision()
+            || input.direction != Some(ScrollDirection::Forward)
+            || input.movement == Some(ScrollDirection::Backward)
+            || input.dragging
+            || input.phase == Some(TouchPhase::Cancelled)
+            || self.viewport.reveal.is_some()
+        {
+            return Ok(false);
+        }
+        self.viewport.published_input = None;
+        let Some(hold) = self.scroll_hold(position, trailing, clearance, fractions.clone()) else {
+            return Ok(false);
+        };
+        if !hold.is_in_view() || hold.offset() > 0. {
+            return Ok(false);
+        }
+        self.pin_scroll_forward_above(pin_id, position, trailing, clearance, fractions, cx)?;
+        let pin = self.viewport.pin.as_mut().expect("pin was just set");
+        pin.easing = false;
+        pin.rejoin = Some(stamp.input);
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -409,7 +601,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let top = list.item_top(scroll_top.item_ix)? + scroll_top.offset_in_item;
         Some(ScrollHold {
             fraction,
-            offset: (target - top) / height - fraction,
+            offset: (target - height * fraction - top) / height,
             in_view: in_view(target, line, top),
         })
     }
@@ -438,11 +630,15 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .viewport
             .pin
             .as_ref()
-            .is_none_or(|pin| &pin.id != pin_id)
+            .is_some_and(|pin| &pin.id != pin_id)
         {
             return false;
         }
-        let pin = self.viewport.pin.take().expect("scroll pin was present");
+        self.invalidate_scroll_input();
+        self.scrollbar_input.set(ScrollbarInput::default());
+        let Some(pin) = self.viewport.pin.take() else {
+            return false;
+        };
         self.remove_scroll_pin_anchors(&pin);
         cx.notify();
         true
@@ -538,7 +734,19 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.model.position_for_anchor(top.anchor).ok()
     }
 
+    fn invalidate_scroll_input(&mut self) {
+        self.viewport.input_epoch = self.viewport.input_epoch.wrapping_add(1);
+        self.viewport.input = None;
+        self.viewport.published_input = None;
+    }
+
     pub(super) fn stop_following(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_scroll_input();
+        self.scrollbar_input.set(ScrollbarInput::default());
+        self.release_following(cx);
+    }
+
+    fn release_following(&mut self, cx: &mut Context<Self>) {
         let Some(pin) = self.viewport.pin.take() else {
             return;
         };
@@ -547,8 +755,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         cx.notify();
     }
 
-    /// The user scrolled the list: reveals and following give way.
-    pub(super) fn list_scrolled(&mut self, cx: &mut Context<Self>) {
+    /// The user scrolled the list: reveals and following give way. Publish
+    /// the input only after layout has resolved the viewport it produced.
+    pub(super) fn list_scrolled(&mut self, input: Scroll, cx: &mut Context<Self>) {
         let wrapping = self.is_laying_out_text();
         if matches!(self.viewport.reveal, Some(Reveal::Caret))
             || matches!(
@@ -558,8 +767,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         {
             self.set_reveal(None);
         }
-        self.stop_following(cx);
-        cx.emit(DocumentEvent::ViewportScrolled);
+        self.invalidate_scroll_input();
+        self.release_following(cx);
+        self.viewport.input = Some(input);
     }
 
     /// The scroll top of this layout: every item is measured, none laid out.
@@ -571,13 +781,26 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     ) -> Option<ListOffset> {
         let height = geometry.viewport_height();
         if height <= Pixels::ZERO {
+            self.invalidate_scroll_input();
+            if self
+                .viewport
+                .pin
+                .as_ref()
+                .is_some_and(|pin| pin.rejoin.is_some())
+            {
+                self.release_following(cx);
+            }
             self.text_layouts.clear();
             self.block_layouts.clear();
             self.trailer_layout = None;
             return None;
         }
-        if self.scrollbar_input_pending.replace(false) {
-            self.list_scrolled(cx);
+        self.viewport.layout_epoch = self.viewport.layout_epoch.wrapping_add(1);
+        self.viewport.published_input = None;
+        let mut scrollbar = self.scrollbar_input.get();
+        if let Some(input) = scrollbar.take() {
+            self.scrollbar_input.set(scrollbar);
+            self.list_scrolled(input, cx);
         }
         let list_top = geometry.scroll_top();
         let list_moved = self
@@ -601,7 +824,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .unwrap_or(list_y)
         };
         top += std::mem::take(&mut self.viewport.scroll);
-        top = self.follow_in_layout(geometry, top, painted_valid, window);
+        top = self.follow_in_layout(geometry, top, painted_valid, window, cx);
         top = self.reveal_in_layout(geometry, top, painted_valid, cx);
         top = self.fit_scroll_range(geometry, top);
         self.anchor_viewport_top(geometry, top);
@@ -616,6 +839,16 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.trailer_layout = None;
         let offset = geometry.offset_for_y(top);
         self.viewport.resolved = Some(offset);
+        if let Some(mut input) = self.viewport.input.take() {
+            input.stamp = Some(Stamp {
+                entity: cx.entity_id(),
+                input: self.viewport.input_epoch,
+                layout: self.viewport.layout_epoch,
+                revision: self.revision(),
+            });
+            self.viewport.published_input = Some(input);
+            cx.emit(DocumentEvent::ViewportScrolled(input));
+        }
         Some(offset)
     }
 
@@ -626,6 +859,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         top: Pixels,
         painted: bool,
         window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Pixels {
         let Some(pin) = self.viewport.pin.as_ref() else {
             return top;
@@ -637,6 +871,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .ok()
             .and_then(|target| self.content_line(geometry, &target, painted));
         let Some((target, line)) = target else {
+            if pin.rejoin.is_some() {
+                self.release_following(cx);
+            }
             return top;
         };
         let fraction = match &pin.trail {
@@ -658,6 +895,21 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             None => pin.viewport_fraction,
         };
         let mut delta = target - height * fraction - top;
+        if let Some(epoch) = pin.rejoin {
+            if epoch != self.viewport.input_epoch
+                || delta > Pixels::ZERO
+                || !in_view(target, line, top)
+            {
+                self.release_following(cx);
+                return top;
+            }
+            let pin = self.viewport.pin.as_mut().expect("pin is present");
+            pin.rejoin = None;
+            cx.emit(DocumentEvent::FollowingResumed {
+                pin_id: pin.id.clone(),
+            });
+        }
+        let pin = self.viewport.pin.as_ref().expect("pin is present");
         // A forward pin leaves an anchor above its hold, unless it left the viewport.
         if pin.forward && delta < Pixels::ZERO && in_view(target, line, top) {
             delta = Pixels::ZERO;
@@ -974,6 +1226,8 @@ fn same_offset(left: ListOffset, right: ListOffset) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod scroll;
+
     use gpui::{
         AppContext as _, Context, Entity, IntoElement, ListOffset, ParentElement as _, Render,
         Styled as _, TestAppContext, VisualTestContext, Window, div, px, size,
