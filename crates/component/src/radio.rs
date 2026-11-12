@@ -2,15 +2,15 @@ use std::rc::Rc;
 
 use crate::ThemeStyled as _;
 use crate::{
-    ActiveTheme, AxisExt, Sizable, Size, StyledExt, checkbox::checkbox_check_icon, h_flex,
-    text::Text, tooltip::ComponentTooltip, v_flex,
+    ActiveTheme, AxisExt, Sizable, Size, StyledExt, h_flex, text::Text, tooltip::ComponentTooltip,
+    v_flex,
 };
 use gpui::{
     AnyElement, App, Axis, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce,
     SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Window, div,
     prelude::FluentBuilder, relative, rems,
 };
-use gpui_base::{Radio as BaseRadio, RadioGroup as BaseRadioGroup};
+use gpui_base::{Radio as BaseRadio, RadioGroup as BaseRadioGroup, spring};
 
 /// A Radio element.
 ///
@@ -177,6 +177,18 @@ impl RenderOnce for Radio {
             .clone();
         let is_focused = focus_handle.is_focused(window);
         let disabled = self.disabled;
+        let dot_opacity = spring(
+            (self.id.clone(), "mark"),
+            if checked { 1. } else { 0. },
+            cx.theme().motion_tokens().spring_control,
+            window,
+            cx,
+        );
+        let dot_color = if disabled {
+            cx.theme().primary_foreground.opacity(0.5)
+        } else {
+            cx.theme().primary_foreground
+        };
         let accessibility_label = self
             .accessibility_label
             .clone()
@@ -226,7 +238,9 @@ impl RenderOnce for Radio {
             .refine_style(&self.style)
             .child(
                 div()
-                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .size(indicator_size)
                     // Center on the first 1.25em line, including when the label wraps.
                     .when(has_content, |this| this.mt(indicator_size * 0.125))
@@ -239,9 +253,13 @@ impl RenderOnce for Radio {
                         true if disabled => this.bg(bg),
                         true => this.bg(cx.theme().tokens.primary),
                     })
-                    .child(checkbox_check_icon(
-                        self.id, self.size, checked, disabled, window, cx,
-                    )),
+                    .child(
+                        div()
+                            .size(indicator_size * 0.5)
+                            .rounded_full_style(cx)
+                            .bg(dot_color)
+                            .opacity(dot_opacity),
+                    ),
             )
             .when(!self.children.is_empty() || self.label.is_some(), |this| {
                 this.child(
