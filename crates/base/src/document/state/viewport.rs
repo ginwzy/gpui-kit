@@ -143,7 +143,7 @@ impl ScrollbarInput {
 
 pub(super) struct Viewport<I> {
     /// The viewport top sits `delta` below the top of the row that owns `anchor`.
-    top: Option<TopAnchor>,
+    top: Option<TopAnchor<I>>,
     /// The list's scroll top as this document last left it: after the last
     /// layout, a splice, or settling a scroll. Another one means the list
     /// scrolled itself (wheel, scrollbar, a child's autoscroll, a direct write).
@@ -187,8 +187,10 @@ impl<I> Default for Viewport<I> {
     }
 }
 
-struct TopAnchor {
+struct TopAnchor<I> {
     anchor: DocumentAnchor,
+    /// An anchored block has visual identity but no source region of its own.
+    block: Option<I>,
     delta: Pixels,
 }
 
@@ -818,9 +820,21 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .top
                 .as_ref()
                 .and_then(|top| {
-                    let position = self.model.position_for_anchor(top.anchor).ok()?;
-                    let (ix, line_top, _) = self.scroll_line(&position)?;
-                    Some(geometry.item_top(ix)? + line_top + top.delta)
+                    let offset = self.model.anchors.resolve(top.anchor)?;
+                    let block = top.block.as_ref().and_then(|id| {
+                        self.items_around_source(offset).find(|ix| {
+                            matches!(&self.layout_items[*ix], DocumentLayoutItem::AnchoredBlock { id: block, .. } if block == id)
+                        })
+                    });
+                    let (ix, line_top, delta) = if let Some(ix) = block {
+                        (ix, Pixels::ZERO, top.delta.min(geometry.item_height(ix)?))
+                    } else {
+                        // Removed blocks fall back to their transformed source anchor.
+                        let position = self.model.position_for_anchor(top.anchor).ok()?;
+                        let (ix, line_top, _) = self.scroll_line(&position)?;
+                        (ix, line_top, if top.block.is_some() { Pixels::ZERO } else { top.delta })
+                    };
+                    Some(geometry.item_top(ix)? + line_top + delta)
                 })
                 .unwrap_or(list_y)
         };
@@ -1048,8 +1062,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.anchor_item(ix, top - item_top);
     }
 
-    /// Rows anchored to a position and the trailer have no source of their
-    /// own: the nearest text or block after `start`, else before it.
+    /// Only the trailer lacks a reading identity; use the nearest content row.
     fn anchorable_item(&self, start: usize) -> Option<usize> {
         let start = start.min(self.layout_items.len());
         (start..self.layout_items.len())
@@ -1057,7 +1070,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .find(|ix| {
                 matches!(
                     self.layout_items[*ix],
-                    DocumentLayoutItem::Text { .. } | DocumentLayoutItem::Block { .. }
+                    DocumentLayoutItem::Text { .. }
+                        | DocumentLayoutItem::Block { .. }
+                        | DocumentLayoutItem::AnchoredBlock { .. }
                 )
             })
     }
@@ -1072,7 +1087,15 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         // pushes it down, and replacing its text leaves the viewport where the
         // replacement starts.
         let anchor = self.model.anchors.create_for_content(offset);
-        self.viewport.top = Some(TopAnchor { anchor, delta });
+        let block = match &self.layout_items[ix] {
+            DocumentLayoutItem::AnchoredBlock { id, .. } => Some(id.clone()),
+            _ => None,
+        };
+        self.viewport.top = Some(TopAnchor {
+            anchor,
+            block,
+            delta,
+        });
     }
 
     /// Remembers where this layout places the items it renders, for text
@@ -1124,13 +1147,33 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .unwrap_or_else(|| match &self.layout_items[ix] {
                 DocumentLayoutItem::Text { source, .. }
                 | DocumentLayoutItem::Block { source, .. } => (source.start, delta),
-                _ => unreachable!("anchored items are text or blocks"),
+                DocumentLayoutItem::AnchoredBlock { source, .. } => (*source, delta),
+                DocumentLayoutItem::Trailer => unreachable!("the trailer has no reading identity"),
             })
     }
 
     fn position_item(&self, position: &DocumentPosition<I>) -> Option<usize> {
         self.block_item(position.node_id())
+            .or_else(|| self.hidden_block(position).map(|(ix, _)| ix))
             .or_else(|| self.text_item_for_position(position))
+    }
+
+    /// Revealing hidden source reveals its anchored replacement, not the next text row.
+    fn hidden_block(&self, position: &DocumentPosition<I>) -> Option<(usize, bool)> {
+        let offset = self.model.resolve_position(position).ok()?;
+        let before = position.affinity() == Affinity::Before;
+        let spans = self.model.projection.spans();
+        let span = spans.get(spans.partition_point(|span| {
+            span.source().end < offset || (!before && span.source().end == offset)
+        }))?;
+        let source = span.source();
+        let at_end = before && offset == source.end;
+        if !(source.contains(&offset) || at_end) || !span.replacement().is_empty() {
+            return None;
+        }
+        self.items_around_source(source.start).find(|ix| {
+            matches!(&self.layout_items[*ix], DocumentLayoutItem::AnchoredBlock { source: start, .. } if *start == source.start)
+        }).map(|ix| (ix, at_end))
     }
 
     /// Node `id`'s block item, found near its source.
@@ -1155,6 +1198,15 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             let height = geometry.item_height(ix)?;
             let len = self.region(position.node_id())?.range().len();
             return Some(if position.offset() == len && len > 0 {
+                (top + height, Pixels::ZERO)
+            } else {
+                (top, height)
+            });
+        }
+        if let Some((ix, at_end)) = self.hidden_block(position) {
+            let top = geometry.item_top(ix)?;
+            let height = geometry.item_height(ix)?;
+            return Some(if at_end {
                 (top + height, Pixels::ZERO)
             } else {
                 (top, height)
@@ -1227,6 +1279,7 @@ fn same_offset(left: ListOffset, right: ListOffset) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod blocks;
     mod scroll;
 
     use gpui::{
