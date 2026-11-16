@@ -350,7 +350,16 @@ impl Root {
                 cx.background_executor().timer(*ANIMATION_DURATION).await;
                 let _ = this.update_in(cx, |this, window, cx| {
                     let current_dialogs_count = this.active_dialogs.len();
-                    // Only restore focus if no new dialogs were opened during animation
+                    // Removal or a newer dialog may have revoked this return
+                    // target while the closing animation was still running.
+                    let still_pending = this
+                        .pending_focus_restore
+                        .as_ref()
+                        .and_then(|pending| pending.upgrade())
+                        .is_some_and(|pending| pending == handle);
+                    if !still_pending {
+                        return;
+                    }
                     if current_dialogs_count == dialogs_count {
                         window.focus(&handle, cx);
                     }
@@ -360,6 +369,47 @@ impl Root {
             .detach();
         }
         gpui_base::TextSelection::clear(window, cx);
+        cx.notify();
+    }
+
+    /// Remove a dialog whose owner disappeared, without returning focus to its
+    /// obsolete trigger. Later dialogs stay open and lose any return path into
+    /// the removed surface. `handle` is the window focus after `open_dialog`.
+    pub fn remove_dialog(
+        &mut self,
+        handle: &FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+    ) {
+        let Some(ix) = self
+            .active_dialogs
+            .iter()
+            .position(|dialog| dialog.focus_handle == *handle)
+        else {
+            return;
+        };
+        let removed = self.active_dialogs.remove(ix);
+        let return_targets = self.active_dialogs[ix..]
+            .iter_mut()
+            .map(|dialog| &mut dialog.previous_focused_handle)
+            .chain(std::iter::once(&mut self.pending_focus_restore));
+        for target in return_targets {
+            if target
+                .as_ref()
+                .and_then(|handle| handle.upgrade())
+                .is_some_and(|previous| {
+                    previous == removed.focus_handle
+                        || removed.focus_handle.contains(&previous, window)
+                })
+            {
+                *target = None;
+            }
+        }
+        if removed.focus_handle.is_focused(window)
+            || removed.focus_handle.contains_focused(window, cx)
+        {
+            window.blur(cx);
+        }
         cx.notify();
     }
 
@@ -615,6 +665,8 @@ impl Render for Root {
 
 #[cfg(test)]
 mod tests {
+    mod removal;
+
     use super::*;
     use gpui::TestAppContext;
 
