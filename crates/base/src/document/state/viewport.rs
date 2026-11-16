@@ -758,6 +758,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     /// The user scrolled the list: reveals and following give way. Publish
     /// the input only after layout has resolved the viewport it produced.
     pub(super) fn list_scrolled(&mut self, input: Scroll, cx: &mut Context<Self>) {
+        self.retain_drag_selection = false;
         let wrapping = self.is_laying_out_text();
         if matches!(self.viewport.reveal, Some(Reveal::Caret))
             || matches!(

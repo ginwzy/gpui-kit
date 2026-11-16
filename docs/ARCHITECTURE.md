@@ -262,6 +262,19 @@ Design-token records (`ColorTokens`, `RadiusTokens`, and the rest of
 converting them is tracked separately because every theme in `gpui-component`
 constructs them.
 
+## Continuous Documents
+
+`document::DocumentState` owns the source/display projection, tracked selection,
+IME, undo and the document's single viewport. Hosts replace readonly nodes through
+host splices; application renderers own the displayed content.
+
+A presentation-only splice keeps both tracked drag endpoints even when the
+pointer's old screen position now covers different source. This private state
+belongs to `document/state.rs` and `state/splice.rs`; actual pointer movement,
+wheel input and drag auto-scroll resume hit testing. Regressions in
+`state/splice/tests.rs` cover stationary endpoints, continued movement and active
+auto-scroll. Applications do not retain a second selection or restore it later.
+
 ## Input, Textarea, and Editor Architecture
 
 Text editing is intentionally deeper than the semantic elements, but callers do

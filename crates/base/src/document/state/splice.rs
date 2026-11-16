@@ -275,6 +275,12 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let old_text = self.model.text.slice(source.clone()).to_string();
         let new_text = candidate.text();
         let edit = fragment_edit(source.start, &old_text, &new_text);
+        // Re-hitting a stationary pointer after projection changes would select
+        // unrelated source now occupying its old screen position. Anchors already
+        // track both endpoints; real pointer/scroll input resumes hit testing.
+        self.retain_drag_selection |= edit.is_none()
+            && final_selection.is_none()
+            && self.auto_scroll.last_drag_position.is_some();
         let selection = self.model.capture_active_selection_in_editable_region();
         let marked = self.model.capture_marked_in_editable_region();
         let removed: Vec<_> = self.model.regions.as_slice()[nodes.clone()]
@@ -610,3 +616,6 @@ impl<'a, I: Clone + Eq + Hash> TouchedNodes<'a, I> {
         found
     }
 }
+
+#[cfg(test)]
+mod tests;

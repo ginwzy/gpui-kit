@@ -2664,6 +2664,8 @@ pub struct DocumentState<I> {
     last_bounds: Option<Bounds<Pixels>>,
     layout_style: Option<(gpui::TextStyle, Pixels)>,
     auto_scroll: AutoScroll,
+    /// Presentation-only splices retain tracked endpoints until pointer/scroll input.
+    retain_drag_selection: bool,
     /// Source range of the link under the pointer, and of the one pressed.
     hovered_link: Option<Range<usize>>,
     pressed_link: Option<Range<usize>>,
@@ -2794,6 +2796,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             last_bounds: None,
             layout_style: None,
             auto_scroll: AutoScroll::default(),
+            retain_drag_selection: false,
             hovered_link: None,
             pressed_link: None,
             undo: DocumentUndoManager::default(),
@@ -4792,6 +4795,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.retain_drag_selection = false;
         self.undo.break_coalescing();
         self.preferred_x = None;
         if self
@@ -4845,6 +4849,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.retain_drag_selection = false;
         if self.drag_table(event, cx) {
             return;
         }
@@ -4877,6 +4882,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             self.stop_following(cx);
         }
         self.auto_scroll.set(delta, cx, |delta, state, cx| {
+            state.retain_drag_selection = false;
             state.scroll_by(delta, cx);
             // Resolve the pointer again after prepaint supplies the newly
             // visible rows, not against the previous frame's text geometry.
@@ -4893,6 +4899,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         if event.button != gpui::MouseButton::Left {
             return;
         }
+        self.retain_drag_selection = false;
         if self.tables.end_drag() {
             cx.notify();
             return;
@@ -4909,6 +4916,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     }
 
     pub(super) fn extend_pointer_selection(&mut self, cx: &mut Context<Self>) {
+        if self.retain_drag_selection {
+            return;
+        }
         let Some(mut point) = self.auto_scroll.last_drag_position else {
             return;
         };
