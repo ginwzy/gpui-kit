@@ -22,15 +22,11 @@ fn removing_an_owned_dialog_preserves_newer_layers_without_stale_focus(cx: &mut 
         content.read(cx).0.clone().focus(window, cx);
         Root::new(content, window, cx)
     });
-    let first = cx.update(|window, cx| {
-        window.open_dialog(cx, |dialog, _, _| dialog.child("first"));
-        window.focused(cx).unwrap()
-    });
+    let first =
+        cx.update(|window, cx| window.open_dialog(cx, |dialog, _, _| dialog.child("first")));
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let second = cx.update(|window, cx| {
-        window.open_dialog(cx, |dialog, _, _| dialog.child("second"));
-        window.focused(cx).unwrap()
-    });
+    let second =
+        cx.update(|window, cx| window.open_dialog(cx, |dialog, _, _| dialog.child("second")));
     cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.update(|window, cx| {
         Root::update(window, cx, |root, window, cx| {
@@ -61,10 +57,8 @@ fn removing_a_dialog_cancels_pending_focus_restoration(cx: &mut TestAppContext) 
         let content = cx.new(|cx| Content(cx.focus_handle()));
         Root::new(content, window, cx)
     });
-    let first = cx.update(|window, cx| {
-        window.open_dialog(cx, |dialog, _, _| dialog.child("first"));
-        window.focused(cx).unwrap()
-    });
+    let first =
+        cx.update(|window, cx| window.open_dialog(cx, |dialog, _, _| dialog.child("first")));
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let replacement = cx.update(|window, cx| {
         window.open_dialog(cx, |dialog, _, _| dialog.child("second"));
@@ -72,8 +66,7 @@ fn removing_a_dialog_cancels_pending_focus_restoration(cx: &mut TestAppContext) 
             root.defer_close_dialog(window, cx);
             root.remove_dialog(&first, window, cx);
         });
-        window.open_dialog(cx, |dialog, _, _| dialog.child("replacement"));
-        window.focused(cx).unwrap()
+        window.open_dialog(cx, |dialog, _, _| dialog.child("replacement"))
     });
     cx.run_until_parked();
     cx.background_executor
@@ -90,8 +83,7 @@ fn removing_before_first_layout_does_not_keep_an_obsolete_focus(cx: &mut TestApp
         Root::new(content, window, cx)
     });
     cx.update(|window, cx| {
-        window.open_dialog(cx, |dialog, _, _| dialog.child("first"));
-        let focus = window.focused(cx).unwrap();
+        let focus = window.open_dialog(cx, |dialog, _, _| dialog.child("first"));
         Root::update(window, cx, |root, window, cx| {
             root.remove_dialog(&focus, window, cx)
         });

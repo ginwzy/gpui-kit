@@ -295,7 +295,13 @@ impl Root {
         )
     }
 
-    pub fn open_dialog<F>(&mut self, build: F, window: &mut Window, cx: &mut Context<'_, Root>)
+    /// Open a dialog and return its identity for targeted removal.
+    pub fn open_dialog<F>(
+        &mut self,
+        build: F,
+        window: &mut Window,
+        cx: &mut Context<'_, Root>,
+    ) -> FocusHandle
     where
         F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
     {
@@ -312,7 +318,7 @@ impl Root {
 
         let selection_scope = self.allocate_text_selection_scope();
         self.active_dialogs.push(ActiveDialog::new(
-            focus_handle,
+            focus_handle.clone(),
             previous_focused_handle,
             selection_scope,
             build,
@@ -321,6 +327,7 @@ impl Root {
         // selection so it cannot linger (or be copied) under the modal.
         gpui_base::TextSelection::clear(window, cx);
         cx.notify();
+        focus_handle
     }
 
     fn close_dialog_internal(&mut self) -> Option<FocusHandle> {
@@ -374,7 +381,7 @@ impl Root {
 
     /// Remove a dialog whose owner disappeared, without returning focus to its
     /// obsolete trigger. Later dialogs stay open and lose any return path into
-    /// the removed surface. `handle` is the window focus after `open_dialog`.
+    /// the removed surface. `handle` is the identity returned by `open_dialog`.
     pub fn remove_dialog(
         &mut self,
         handle: &FocusHandle,

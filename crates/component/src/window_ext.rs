@@ -5,7 +5,7 @@ use crate::{
     notification::Notification,
     sheet::Sheet,
 };
-use gpui::{App, ElementId, Entity, Window};
+use gpui::{App, ElementId, Entity, FocusHandle, Window};
 use std::rc::Rc;
 
 /// Extension trait for [`Window`] to add dialog, sheet .. functionality.
@@ -26,8 +26,8 @@ pub trait WindowExt: Sized {
     /// Closes the active Sheet.
     fn close_sheet(&mut self, cx: &mut App);
 
-    /// Opens a Dialog.
-    fn open_dialog<F>(&mut self, cx: &mut App, build: F)
+    /// Opens a Dialog and returns its identity for [`Root::remove_dialog`].
+    fn open_dialog<F>(&mut self, cx: &mut App, build: F) -> FocusHandle
     where
         F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static;
 
@@ -138,12 +138,12 @@ impl WindowExt for Window {
     }
 
     #[inline]
-    fn open_dialog<F>(&mut self, cx: &mut App, build: F)
+    fn open_dialog<F>(&mut self, cx: &mut App, build: F) -> FocusHandle
     where
         F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
     {
         Root::update(self, cx, move |root, window, cx| {
-            root.open_dialog(build, window, cx);
+            root.open_dialog(build, window, cx)
         })
     }
 
@@ -154,7 +154,7 @@ impl WindowExt for Window {
     {
         self.open_dialog(cx, move |_, window, cx| {
             build(AlertDialog::new(cx), window, cx).build_surface(window, cx)
-        })
+        });
     }
 
     #[inline]
