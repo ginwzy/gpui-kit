@@ -5315,6 +5315,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .is_some_and(|previous| previous.size.width != bounds.size.width);
         if style_changed || width_changed {
             self.preferred_x = None;
+            self.forget_trailing_hold();
         }
         if style_changed {
             self.list_state.remeasure_items(0..self.layout_items.len());

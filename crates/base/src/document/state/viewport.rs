@@ -211,7 +211,7 @@ pub(super) struct ScrollPin<I> {
     /// Released without an event once a layout has applied it.
     settling: bool,
     /// Holds the anchor lower, up to a fraction, while trailing content fits.
-    trail: Option<ScrollPinTrail>,
+    trail: Option<ScrollPinTrail<I>>,
     /// Scrolls only forward: an anchor above its hold stays where it is while
     /// it remains in the viewport.
     forward: bool,
@@ -222,10 +222,68 @@ pub(super) struct ScrollPin<I> {
 
 /// Content after a pin's anchor that should end `clearance` above the viewport
 /// bottom. The anchor sits between the pin's fraction and `max_fraction`.
-struct ScrollPinTrail {
+struct ScrollPinTrail<I> {
     anchor: DocumentAnchor,
     clearance: Pixels,
     max_fraction: f32,
+    held: Option<HeldTrail<I>>,
+}
+
+/// The trailing line's screen position after this attachment reached its hold.
+struct HeldTrail<I> {
+    position: DocumentPosition<I>,
+    height: Pixels,
+    scale: f32,
+    bottom: Pixels,
+}
+
+impl<I: Eq> ScrollPinTrail<I> {
+    fn compensate(
+        &self,
+        top: Pixels,
+        hold_top: Pixels,
+        position: &DocumentPosition<I>,
+        bottom: Pixels,
+        height: Pixels,
+        scale: f32,
+    ) -> (Pixels, Option<Pixels>) {
+        let Some(held) = self.held.as_ref().filter(|held| {
+            held.height == height && held.scale == scale && &held.position == position
+        }) else {
+            return (top, None);
+        };
+        // Restore the trailing screen position lost to reflow without
+        // scrolling back past the new hold.
+        (
+            top.min((bottom - held.bottom).max(hold_top)),
+            Some(held.bottom),
+        )
+    }
+
+    fn renew(
+        &mut self,
+        trailing: Option<(DocumentPosition<I>, Pixels)>,
+        previous_bottom: Option<Pixels>,
+        top: Pixels,
+        hold_top: Pixels,
+        height: Pixels,
+        scale: f32,
+    ) {
+        self.held = trailing.and_then(|(position, bottom)| {
+            let bottom = bottom - top;
+            let reached = (top - hold_top).abs() <= px(0.5);
+            let preserved =
+                previous_bottom.is_some_and(|previous| (bottom - previous).abs() <= px(0.5));
+            (bottom > Pixels::ZERO && bottom <= height && (reached || preserved)).then_some(
+                HeldTrail {
+                    position,
+                    height,
+                    scale,
+                    bottom,
+                },
+            )
+        });
+    }
 }
 
 /// Where a pin above trailing content would hold its position, as
@@ -347,6 +405,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         {
             return;
         }
+        self.forget_trailing_hold();
         self.viewport.resolved = Some(list_top);
         let Some(ix) = self.anchorable_item(list_top.item_ix) else {
             return;
@@ -404,8 +463,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         cx: &mut Context<Self>,
     ) -> Result<(), ScrollPinError> {
         self.place_scroll_pin(pin_id, position, viewport_fraction, false, cx)
+            .map(|_| ())
     }
 
+    /// Replaces a validated pin, returning the previous state with its anchors removed.
     fn place_scroll_pin(
         &mut self,
         pin_id: I,
@@ -413,7 +474,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         viewport_fraction: f32,
         forward: bool,
         cx: &mut Context<Self>,
-    ) -> Result<(), ScrollPinError> {
+    ) -> Result<Option<ScrollPin<I>>, ScrollPinError> {
         if !viewport_fraction.is_finite() || !(0.0..=1.0).contains(&viewport_fraction) {
             return Err(ScrollPinError::InvalidViewportFraction);
         }
@@ -422,7 +483,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             .map_err(ScrollPinError::InvalidPosition)?;
         // Re-pinning the same target follows its growth; moving an existing
         // pin elsewhere eases there unless the platform asks for reduced motion.
-        let (easing, rejoin) = match self.viewport.pin.take() {
+        let previous = self.viewport.pin.take();
+        let (easing, rejoin) = match previous.as_ref() {
             Some(previous) => {
                 let rejoin = if previous.id == pin_id {
                     previous.rejoin
@@ -434,7 +496,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                         .model
                         .position_for_anchor(previous.anchor)
                         .map_or(true, |previous| previous.node_id() != position.node_id());
-                self.remove_scroll_pin_anchors(&previous);
+                self.remove_scroll_pin_anchors(previous);
                 ((previous.easing || moved) && !cx.reduce_motion(), rejoin)
             }
             None => (false, None),
@@ -451,7 +513,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             rejoin,
         });
         cx.notify();
-        Ok(())
+        Ok(previous)
     }
 
     fn anchor_for(&mut self, offset: usize, position: &DocumentPosition<I>) -> DocumentAnchor {
@@ -486,9 +548,10 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.place_scroll_pin_above(pin_id, position, trailing, clearance, fractions, false, cx)
     }
 
-    /// Pins `position` like [`Self::pin_scroll_above`], but only scrolls
-    /// forward: while `position` is above its hold and in the viewport, the
-    /// viewport stays where it is, until growth carries `position` past the hold.
+    /// Pins `position` like [`Self::pin_scroll_above`], but only follows
+    /// forward while `position` stays in the viewport. Once held, a visible
+    /// `trailing` position stays put across upstream layout shrinkage when
+    /// possible, without scrolling back past the new hold.
     pub fn pin_scroll_forward_above(
         &mut self,
         pin_id: I,
@@ -564,13 +627,26 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let trailing_offset = self
             .resolve_position(trailing)
             .map_err(ScrollPinError::InvalidPosition)?;
-        self.place_scroll_pin(pin_id, position, min, forward, cx)?;
+        let previous = self.place_scroll_pin(pin_id, position, min, forward, cx)?;
+        let held = previous.and_then(|pin| {
+            let trail = pin.trail?;
+            if !forward
+                || self.pinned_scroll_id() != Some(&pin.id)
+                || pin.viewport_fraction != min
+                || trail.max_fraction != max
+                || trail.clearance != clearance
+            {
+                return None;
+            }
+            trail.held.filter(|held| &held.position == trailing)
+        });
         let anchor = self.anchor_for(trailing_offset, trailing);
         let pin = self.viewport.pin.as_mut().expect("pin was just set");
         pin.trail = Some(ScrollPinTrail {
             anchor,
             clearance,
             max_fraction: max,
+            held,
         });
         Ok(())
     }
@@ -775,6 +851,17 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.viewport.input = Some(input);
     }
 
+    pub(super) fn forget_trailing_hold(&mut self) {
+        if let Some(trail) = self
+            .viewport
+            .pin
+            .as_mut()
+            .and_then(|pin| pin.trail.as_mut())
+        {
+            trail.held = None;
+        }
+    }
+
     /// The scroll top of this layout: every item is measured, none laid out.
     fn resolve_viewport(
         &mut self,
@@ -784,6 +871,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     ) -> Option<ListOffset> {
         let height = geometry.viewport_height();
         if height <= Pixels::ZERO {
+            self.forget_trailing_hold();
             self.invalidate_scroll_input();
             if self
                 .viewport
@@ -838,10 +926,16 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 })
                 .unwrap_or(list_y)
         };
-        top += std::mem::take(&mut self.viewport.scroll);
-        top = self.follow_in_layout(geometry, top, painted_valid, window, cx);
-        top = self.reveal_in_layout(geometry, top, painted_valid, cx);
+        let scroll = std::mem::take(&mut self.viewport.scroll);
+        top += scroll;
+        let keep_trailing = !list_moved && scroll == Pixels::ZERO && self.viewport.reveal.is_none();
+        let followed =
+            self.follow_in_layout(geometry, top, painted_valid, keep_trailing, window, cx);
+        top = self.reveal_in_layout(geometry, followed, painted_valid, cx);
         top = self.fit_scroll_range(geometry, top);
+        if top != followed {
+            self.forget_trailing_hold();
+        }
         self.anchor_viewport_top(geometry, top);
         let placed = self.viewport_top_offset();
         if std::mem::replace(&mut self.viewport.reported_top, placed) != placed {
@@ -873,6 +967,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         geometry: &ListGeometry,
         top: Pixels,
         painted: bool,
+        keep_trailing: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Pixels {
@@ -888,28 +983,38 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let Some((target, line)) = target else {
             if pin.rejoin.is_some() {
                 self.release_following(cx);
+            } else {
+                self.forget_trailing_hold();
             }
             return top;
         };
+        let trailing = pin.trail.as_ref().and_then(|trail| {
+            let position = self.model.position_for_anchor(trail.anchor).ok()?;
+            let (y, line) = self.content_line(geometry, &position, painted)?;
+            Some((position, y + line))
+        });
         let fraction = match &pin.trail {
-            Some(trail) => {
-                let bottom = self
-                    .model
-                    .position_for_anchor(trail.anchor)
-                    .ok()
-                    .and_then(|trailing| self.content_line(geometry, &trailing, painted))
-                    .map(|(y, line)| y + line);
-                hold_fraction(
-                    target,
-                    bottom,
-                    trail.clearance,
-                    pin.viewport_fraction..=trail.max_fraction,
-                    height,
-                )
-            }
+            Some(trail) => hold_fraction(
+                target,
+                trailing.as_ref().map(|(_, bottom)| *bottom),
+                trail.clearance,
+                pin.viewport_fraction..=trail.max_fraction,
+                height,
+            ),
             None => pin.viewport_fraction,
         };
-        let mut delta = target - height * fraction - top;
+        let hold_top = target - height * fraction;
+        // A rejoin accepted below is not eligible until a later layout.
+        let trailing = trailing
+            .filter(|_| keep_trailing && pin.forward && !pin.settling && pin.rejoin.is_none());
+        let scale = window.scale_factor();
+        let (top, previous_bottom) = match (pin.trail.as_ref(), trailing.as_ref()) {
+            (Some(trail), Some((position, bottom))) => {
+                trail.compensate(top, hold_top, position, *bottom, height, scale)
+            }
+            _ => (top, None),
+        };
+        let mut delta = hold_top - top;
         if let Some(epoch) = pin.rejoin {
             if epoch != self.viewport.input_epoch
                 || delta > Pixels::ZERO
@@ -939,11 +1044,14 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 window.request_animation_frame();
             }
         }
+        let top = top + delta;
         if pin.settling {
             let pin = self.viewport.pin.take().expect("pin is present");
             self.remove_scroll_pin_anchors(&pin);
+        } else if let Some(trail) = &mut pin.trail {
+            trail.renew(trailing, previous_bottom, top, hold_top, height, scale);
         }
-        top + delta
+        top
     }
 
     /// Moves `top` the least that shows what a reveal asks for.
