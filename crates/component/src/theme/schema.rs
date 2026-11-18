@@ -637,9 +637,9 @@ pub struct ThemeConfigColors {
     #[serde(rename = "window.border")]
     pub window_border: Option<SharedString>,
 
-    /// Base blue color.
+    /// Base blue color; also the default for blue-derived tokens.
     #[serde(rename = "base.blue")]
-    blue: Option<String>,
+    pub blue: Option<String>,
     /// Base light blue color.
     #[serde(rename = "base.blue.light")]
     blue_light: Option<String>,
