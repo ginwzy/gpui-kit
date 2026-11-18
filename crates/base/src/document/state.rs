@@ -2675,6 +2675,7 @@ pub struct DocumentState<I> {
     trailer_height: Option<Pixels>,
     viewport: viewport::Viewport<I>,
     scroll_handler_installed: bool,
+    scrollbar_embedded: bool,
     scrollbar_input: Rc<Cell<viewport::ScrollbarInput>>,
     block_renderer: Option<BlockRenderer<I>>,
     text_renderer: Option<TextRenderer<I>>,
@@ -2805,6 +2806,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             trailer_height: None,
             viewport: viewport::Viewport::default(),
             scroll_handler_installed: false,
+            scrollbar_embedded: true,
             scrollbar_input: Rc::default(),
             block_renderer: None,
             text_renderer: None,
@@ -3104,6 +3106,25 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
 
     pub fn list_state(&self) -> ListState {
         self.list_state.clone()
+    }
+
+    /// Whether to draw the scrollbar inside the document. Disable this when
+    /// the host places the scrollbar explicitly using [`Self::scrollbar`].
+    pub fn set_scrollbar_embedded(&mut self, embedded: bool, cx: &mut Context<Self>) {
+        if self.scrollbar_embedded != embedded {
+            self.scrollbar_embedded = embedded;
+            cx.notify();
+        }
+    }
+
+    /// A scrollbar for this document's viewport, including its drag and follow
+    /// handling. A host may place it using [`Scrollbar::viewport_from_layout`]
+    /// in a container with the same height as the document viewport.
+    pub fn scrollbar(&self) -> Scrollbar {
+        Scrollbar::vertical(&DocumentScrollbarHandle {
+            list: self.list_state.clone(),
+            input: self.scrollbar_input.clone(),
+        })
     }
 
     /// Visible selection-head bounds in window coordinates, from the current
@@ -5889,10 +5910,6 @@ impl<I: Clone + Eq + Hash + 'static> Render for DocumentState<I> {
         .size_full()
         .into_any_element();
         let interaction_entity = entity.clone();
-        let scrollbar = Scrollbar::vertical(&DocumentScrollbarHandle {
-            list: self.list_state.clone(),
-            input: self.scrollbar_input.clone(),
-        });
         let interaction_layer = gpui::div()
             .absolute()
             .inset_0()
@@ -5946,7 +5963,7 @@ impl<I: Clone + Eq + Hash + 'static> Render for DocumentState<I> {
             .size_full()
             .child(interaction_layer)
             .child(DocumentElement::new(entity, content))
-            .child(scrollbar)
+            .children(self.scrollbar_embedded.then(|| self.scrollbar()))
     }
 }
 

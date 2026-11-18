@@ -829,6 +829,7 @@ pub struct Scrollbar {
     /// This is used to limit the update rate of the scrollbar when it is
     /// being dragged for some complex interactions for reducing CPU usage.
     max_fps: usize,
+    idle_thumb_opacity: f32,
     styles: ScrollbarStyles,
 }
 
@@ -848,6 +849,7 @@ impl Scrollbar {
             scroll_size: None,
             viewport_bounds: None,
             use_layout_bounds: false,
+            idle_thumb_opacity: 1.0,
             styles: ScrollbarStyles::default(),
         }
     }
@@ -930,6 +932,13 @@ impl Scrollbar {
         self
     }
 
+    /// Scale the resolved thumb color's opacity when the thumb is neither hovered
+    /// nor dragged. Hovering only the track keeps the thumb at this opacity.
+    pub fn idle_thumb_opacity(mut self, factor: f32) -> Self {
+        self.idle_thumb_opacity = factor;
+        self
+    }
+
     /// Set maximum frames per second for scrolling by drag. Default is 120 FPS.
     ///
     /// If you have very high CPU usage, consider reducing this value to improve performance.
@@ -945,6 +954,15 @@ impl Scrollbar {
     #[doc(hidden)]
     pub const fn width() -> Pixels {
         WIDTH
+    }
+
+    /// The width of the interactive track, including any theme or local override.
+    pub fn track_width(&self, cx: &App) -> Pixels {
+        self.styles
+            .track
+            .width
+            .or(cx.theme().scrollbar.styles().track.width)
+            .unwrap_or(WIDTH)
     }
 
     fn resolve_track(
@@ -1125,7 +1143,15 @@ impl Scrollbar {
                 THUMB_RADIUS,
             ),
         );
-        (thumb, track, border, width, inset, radius, min_length)
+        (
+            thumb.opacity(self.idle_thumb_opacity),
+            track,
+            border,
+            width,
+            inset,
+            radius,
+            min_length,
+        )
     }
 
     fn style_for_normal(
@@ -1152,7 +1178,15 @@ impl Scrollbar {
                 THUMB_RADIUS,
             ),
         );
-        (thumb, track, border, width, inset, radius, min_length)
+        (
+            thumb.opacity(self.idle_thumb_opacity),
+            track,
+            border,
+            width,
+            inset,
+            radius,
+            min_length,
+        )
     }
 }
 
@@ -1375,14 +1409,9 @@ impl Element for Scrollbar {
             .scroll_size
             .unwrap_or(self.scroll_handle.content_size());
 
+        let track_width = self.track_width(cx);
         for axis in self.axis.all().into_iter() {
             let is_vertical = axis.is_vertical();
-            let track_width = self
-                .styles
-                .track
-                .width
-                .or(cx.theme().scrollbar.styles().track.width)
-                .unwrap_or(WIDTH);
             let (scroll_area_size, container_size, scroll_position) = if is_vertical {
                 (
                     scroll_size.height,
@@ -2412,6 +2441,32 @@ mod tests {
             assert_eq!(track, theme_track);
             assert_eq!(width, px(7.));
             assert_eq!(cx.theme().scrollbar.styles().track.width, Some(px(13.)));
+        });
+    }
+
+    #[gpui::test]
+    fn idle_thumb_opacity_preserves_theme_interaction_colors(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let idle = gpui::hsla(0.2, 0.3, 0.4, 0.5);
+            let hover = gpui::hsla(0.3, 0.4, 0.5, 0.6);
+            let drag = gpui::hsla(0.4, 0.5, 0.6, 0.8);
+            crate::Theme::global_mut(cx).scrollbar = crate::ScrollbarTheme::new().with_styles(
+                ScrollbarStyles::default()
+                    .thumb(|style| style.bg(idle))
+                    .thumb_hover(|style| style.bg(hover))
+                    .thumb_active(|style| style.bg(drag)),
+            );
+
+            let handle = TestHandle::new(Size::default());
+            assert_eq!(Scrollbar::new(&handle).style_for_normal(cx).0, idle.into());
+            let scrollbar = Scrollbar::new(&handle).idle_thumb_opacity(0.7);
+            assert_eq!(scrollbar.style_for_normal(cx).0, idle.opacity(0.7).into());
+            assert_eq!(
+                scrollbar.style_for_hovered_bar(cx).0,
+                idle.opacity(0.7).into()
+            );
+            assert_eq!(scrollbar.style_for_hovered_thumb(cx).0, hover.into());
+            assert_eq!(scrollbar.style_for_active(cx).0, drag.into());
         });
     }
 
