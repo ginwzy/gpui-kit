@@ -314,7 +314,7 @@ impl SidebarItem for SidebarMenuItem {
                         })
                     })
                     .when(!is_collapsed, |this| {
-                        this.h_7()
+                        this.when(self.style.size.height.is_none(), |this| this.h_7())
                             .child(
                                 h_flex()
                                     .flex_1()
