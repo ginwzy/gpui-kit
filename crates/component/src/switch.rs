@@ -23,6 +23,7 @@ pub struct Switch {
     on_click: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
     size: Size,
     color: Option<Hsla>,
+    unchecked_color: Option<Hsla>,
     tooltip: ComponentTooltip,
 }
 
@@ -41,6 +42,7 @@ impl Switch {
             label_side: Side::Right,
             size: Size::Medium,
             color: None,
+            unchecked_color: None,
             tooltip: ComponentTooltip::default(),
         }
     }
@@ -97,6 +99,12 @@ impl Switch {
         self
     }
 
+    /// Set the track color when unchecked. Defaults to the theme's switch token.
+    pub fn unchecked_color(mut self, color: impl Into<Hsla>) -> Self {
+        self.unchecked_color = Some(color.into());
+        self
+    }
+
     /// Set tooltip text for the switch.
     pub fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
         self.tooltip.text = Some((tooltip.into(), None));
@@ -137,7 +145,10 @@ impl RenderOnce for Switch {
             .color
             .map(Background::from)
             .unwrap_or(cx.theme().tokens.primary.into());
-        let unchecked_bg: Background = cx.theme().tokens.switch.into();
+        let unchecked_bg = self
+            .unchecked_color
+            .map(Background::from)
+            .unwrap_or_else(|| cx.theme().tokens.switch.into());
         // GPUI's element opacity multiplies each primitive's alpha instead of
         // compositing the subtree as one group, so fading the whole control
         // would let the track show through the thumb. Fading the track alone
@@ -281,6 +292,47 @@ mod tests {
             ),
             "and must not change what is drawn"
         );
+    }
+
+    #[gpui::test]
+    fn unchecked_track_override_does_not_change_the_checked_or_default_track(
+        cx: &mut TestAppContext,
+    ) {
+        struct TrackHarness(Hsla);
+
+        impl Render for TrackHarness {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                crate::v_flex()
+                    .child(Switch::new("default"))
+                    .child(Switch::new("unchecked").unchecked_color(self.0))
+                    .child(Switch::new("checked").unchecked_color(self.0).checked(true))
+            }
+        }
+
+        cx.update(crate::init);
+        let color = Hsla::from(gpui::rgb(0x607080));
+        let (_, cx) = cx.add_window_view(|_, _| TrackHarness(color));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let size = gpui::size(px(36.), px(20.)).scale(window.scale_factor());
+            let mut tracks: Vec<_> = window
+                .painted_quads()
+                .into_iter()
+                .filter(|quad| quad.bounds.size == size)
+                .collect();
+            tracks.sort_by(|a, b| a.bounds.top().partial_cmp(&b.bounds.top()).unwrap());
+            assert_eq!(
+                tracks
+                    .iter()
+                    .map(|quad| quad.background)
+                    .collect::<Vec<_>>(),
+                [
+                    cx.theme().tokens.switch.into(),
+                    color.into(),
+                    cx.theme().tokens.primary.into(),
+                ]
+            );
+        });
     }
 
     struct SwitchHarness {
