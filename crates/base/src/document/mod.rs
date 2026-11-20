@@ -25,10 +25,11 @@ pub use position::{
 pub use projection::{DocumentProjection, ProjectionError, ProjectionMapping, ProjectionSpan};
 pub use region::{DocumentRegion, DocumentRegions, EditPolicy, RegionError};
 pub use state::{
-    DocumentEditRejection, DocumentEvent, DocumentSnapshot, DocumentState, DocumentStructure,
-    DocumentTextContext, HostTransactionError, PresentationError, RoutedEdit, Scroll,
-    ScrollDirection, ScrollHold, ScrollPinError, StructureError, StructureReplacement,
-    StructureReplay, TextFrame, TextRows, UndoCheckpoint,
+    BlockGeometry, BlockRows, BlockText, DocumentBlockContext, DocumentEditRejection,
+    DocumentEvent, DocumentSnapshot, DocumentState, DocumentStructure, DocumentTextContext,
+    HostTransactionError, PresentationError, RoutedEdit, Scroll, ScrollDirection, ScrollHold,
+    ScrollPinError, StructureError, StructureReplacement, StructureReplay, TextFrame, TextRows,
+    UndoCheckpoint,
 };
 pub use style::{
     DocumentInlineStyle, DocumentParagraphStyle, DocumentStyleError, DocumentStyles, TableRow,

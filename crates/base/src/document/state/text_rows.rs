@@ -28,7 +28,11 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use super::{Derived, DocumentLayoutItem, DocumentState, DocumentTextContext, row::Layout};
+use super::{
+    Derived, DocumentLayoutItem, DocumentState, DocumentTextContext,
+    block::{BlockAdvances, BlockGeometry, BlockRows, Declaration, WrappedBlock, wrap_block},
+    row::Layout,
+};
 use crate::document::DocumentRegion;
 
 pub(in crate::document) mod font_runs;
@@ -49,7 +53,7 @@ const MAX_ROW_BYTES: usize = 4096;
 const FIRST_WRAP_IN_FRAME_BYTES: usize = 256 * 1024;
 /// Lines in view, and after an invalidation lines near it, wrap within the
 /// frame up to this many bytes; the rest wrap in the background.
-const REWRAP_IN_FRAME_BYTES: usize = 32 * 1024;
+pub(super) const REWRAP_IN_FRAME_BYTES: usize = 32 * 1024;
 /// At most this many lines go to one background wrap. Preparing them reads
 /// the model on the UI thread; the rest go to the next wrap once it lands.
 const BACKGROUND_LINES_PER_WRAP: usize = 4096;
@@ -290,8 +294,8 @@ impl RowFrame {
 }
 
 /// A block's height in text rows.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(in crate::document) enum BlockGeometry {
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(in crate::document) enum BlockHeight {
     /// Layout has not asked the host yet.
     #[default]
     Unresolved,
@@ -299,13 +303,24 @@ pub(in crate::document) enum BlockGeometry {
     Measured,
     /// The host declared the block's height.
     Declared(Pixels),
+    /// The host declared text, wrapped for the block width it records.
+    Wrapped(Arc<WrappedBlock>),
 }
 
-impl BlockGeometry {
-    pub(in crate::document) fn height(self) -> Option<Pixels> {
+impl BlockHeight {
+    pub(in crate::document) fn height(&self) -> Option<Pixels> {
         match self {
-            Self::Declared(height) => Some(height),
+            Self::Declared(height) => Some(*height),
+            Self::Wrapped(wrapped) => Some(wrapped.height()),
             Self::Unresolved | Self::Measured => None,
+        }
+    }
+
+    /// The rows the block's renderer draws its declared text by.
+    pub(in crate::document) fn rows(&self) -> Option<&BlockRows> {
+        match self {
+            Self::Wrapped(wrapped) => Some(wrapped.rows()),
+            _ => None,
         }
     }
 }
@@ -554,6 +569,9 @@ pub(in crate::document) struct TextRowsState<I> {
     resize_pending: bool,
     /// Frames laid out since the width last changed.
     quiet_frames: u8,
+    /// Blocks that declare text may hold rows wrapped for another width.
+    blocks_stale: bool,
+    block_advances: BlockAdvances,
 }
 
 /// Unchanged extents relative to one cached line, composed directly from the
@@ -639,6 +657,8 @@ impl<I: Clone> TextRowsState<I> {
             nearby: true,
             resize_pending: false,
             quiet_frames: u8::MAX,
+            blocks_stale: false,
+            block_advances: BlockAdvances::default(),
         }
     }
 
@@ -691,6 +711,7 @@ impl<I: Clone> TextRowsState<I> {
     pub(in crate::document) fn is_wrapping(&self) -> bool {
         self.resolve
             || self.check
+            || self.blocks_stale
             || self.dirty.is_some()
             || self.pending.is_some()
             || self.ready.is_some()
@@ -1007,13 +1028,34 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
 
     /// Declares the height of blocks in text rows, or `None` for a block the
     /// list measures. Called during layout for blocks that are new or that
-    /// [`Self::remeasure_block`] invalidated.
+    /// [`Self::remeasure_block`] invalidated. A height is the same at every
+    /// width; [`Self::set_block_geometry_resolver`] can also declare text.
     pub fn set_block_height_resolver(
         &mut self,
         resolver: impl Fn(&I, &Window, &App) -> Option<AbsoluteLength> + 'static,
         cx: &mut Context<Self>,
     ) {
-        self.block_height_resolver = Some(std::rc::Rc::new(resolver));
+        self.set_block_geometry_resolver(
+            move |id, window, cx| match resolver(id, window, cx) {
+                Some(height) => BlockGeometry::fixed(height),
+                None => BlockGeometry::measured(),
+            },
+            cx,
+        );
+    }
+
+    /// Declares the geometry of blocks in text rows: a fixed height, text that
+    /// Base wraps to the block's width, or measurement by the list. Called
+    /// during layout for blocks that are new or that [`Self::remeasure_block`]
+    /// invalidated. Text is wrapped again when the width changes; the block's
+    /// renderer, given through [`Self::set_block_context_renderer`], draws the
+    /// rows its context carries and must not change the block's height.
+    pub fn set_block_geometry_resolver(
+        &mut self,
+        resolver: impl Fn(&I, &Window, &App) -> BlockGeometry + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.block_geometry_resolver = Some(std::rc::Rc::new(resolver));
         self.clear_row_geometry(|_| true);
         cx.notify();
     }
@@ -1092,7 +1134,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     self.layout_items.update(ix, |item| match item {
                         DocumentLayoutItem::Block { height, .. }
                         | DocumentLayoutItem::AnchoredBlock { height, .. } => {
-                            height.0 = BlockGeometry::Unresolved
+                            height.0 = BlockHeight::Unresolved
                         }
                         _ => unreachable!(),
                     });
@@ -1230,6 +1272,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             state.width = Some(bounds.size.width);
             state.check = true;
             state.scan_all = true;
+            state.blocks_stale = true;
         }
         // While the width keeps changing, only the view is checked: the rest
         // keeps its complete earlier wrap. A width change soon after another
@@ -1271,6 +1314,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         } else if let Some(dirty) = state.dirty.clone() {
             self.resolve_row_geometry(dirty, window, cx);
         }
+        self.rewrap_blocks(bounds, defer, window, cx);
         // Publication that starts this frame publishes its first batch at once.
         let publishing = self
             .text_rows
@@ -1488,17 +1532,14 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 }
                 DocumentLayoutItem::Block { id, height, .. }
                 | DocumentLayoutItem::AnchoredBlock { id, height, .. } => {
-                    if height.0 == BlockGeometry::Unresolved {
-                        let geometry = match self.block_height_resolver.clone() {
-                            Some(resolver) => match resolver(id, window, cx) {
-                                Some(height) => {
-                                    BlockGeometry::Declared(height.to_pixels(window.rem_size()))
-                                }
-                                None => BlockGeometry::Measured,
-                            },
-                            None => BlockGeometry::Measured,
-                        };
-                        blocks.push((ix, geometry));
+                    if height.0 == BlockHeight::Unresolved {
+                        let declaration = self
+                            .block_geometry_resolver
+                            .clone()
+                            .map_or(Declaration::Measured, |resolver| {
+                                resolver(id, window, cx).declaration()
+                            });
+                        blocks.push((ix, declaration));
                     }
                     ix += 1;
                 }
@@ -1627,8 +1668,25 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             });
             self.list_state.set_item_heights(start, heights);
         }
-        for (ix, geometry) in blocks {
+        let rem_size = window.rem_size();
+        for (ix, declaration) in blocks {
+            let geometry = match declaration {
+                Declaration::Measured => BlockHeight::Measured,
+                Declaration::Fixed(height) => BlockHeight::Declared(height.to_pixels(rem_size)),
+                Declaration::Text(text) => {
+                    let state = self.text_rows.as_mut().unwrap();
+                    let width = state.width.unwrap_or_default();
+                    BlockHeight::Wrapped(Arc::new(wrap_block(
+                        &text,
+                        width,
+                        &mut state.block_advances,
+                        window,
+                        cx,
+                    )))
+                }
+            };
             let at = moved(ix);
+            let height = geometry.height();
             self.layout_items.update(at, |item| {
                 if let DocumentLayoutItem::Block { height, .. }
                 | DocumentLayoutItem::AnchoredBlock { height, .. } = item
@@ -1636,7 +1694,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     height.0 = geometry;
                 }
             });
-            self.list_state.set_item_heights(at, [geometry.height()]);
+            self.list_state.set_item_heights(at, [height]);
         }
         if let Some(ix) = trailer {
             self.list_state
@@ -1947,6 +2005,94 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             end += 1;
         }
         start..end
+    }
+
+    /// Wraps declared block text again where its rows were wrapped for another
+    /// width. Blocks in view rewrap at once. The rest keep their earlier rows,
+    /// and the heights of those rows, while a drag keeps changing the width;
+    /// then they rewrap in order, a bounded number of bytes per frame.
+    fn rewrap_blocks(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        defer: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.text_rows.as_ref() else {
+            return;
+        };
+        let (Some(width), true) = (state.width, state.blocks_stale) else {
+            return;
+        };
+        let view = self.items_in_view(bounds);
+        let len = self.layout_items.len();
+        let ranges = if defer {
+            vec![view.clone()]
+        } else {
+            vec![view.clone(), 0..view.start, view.end..len]
+        };
+        let mut budget = REWRAP_IN_FRAME_BYTES;
+        let mut left = false;
+        let mut stale = Vec::new();
+        #[cfg(test)]
+        let mut beyond_view = 0;
+        for range in ranges {
+            for (offset, item) in self
+                .layout_items
+                .iter_from(range.start)
+                .take(range.len())
+                .enumerate()
+            {
+                let (DocumentLayoutItem::Block { height, .. }
+                | DocumentLayoutItem::AnchoredBlock { height, .. }) = item
+                else {
+                    continue;
+                };
+                let BlockHeight::Wrapped(wrapped) = &height.0 else {
+                    continue;
+                };
+                if wrapped.width() == width {
+                    continue;
+                }
+                let ix = range.start + offset;
+                let in_view = view.contains(&ix);
+                if in_view || budget > 0 {
+                    let bytes = wrapped.text().text().len();
+                    budget = budget.saturating_sub(bytes);
+                    #[cfg(test)]
+                    if !in_view {
+                        beyond_view += bytes;
+                    }
+                    stale.push((ix, wrapped.text().clone()));
+                } else {
+                    left = true;
+                }
+            }
+        }
+        for (ix, text) in stale {
+            let state = self.text_rows.as_mut().unwrap();
+            let wrapped = wrap_block(&text, width, &mut state.block_advances, window, cx);
+            let height = wrapped.height();
+            self.layout_items.update(ix, |item| {
+                if let DocumentLayoutItem::Block { height, .. }
+                | DocumentLayoutItem::AnchoredBlock { height, .. } = item
+                {
+                    height.0 = BlockHeight::Wrapped(Arc::new(wrapped));
+                }
+            });
+            self.list_state.set_item_heights(ix, [Some(height)]);
+        }
+        #[cfg(test)]
+        super::block::REWRAP_PASSES.with_borrow_mut(|passes| {
+            if let Some(passes) = passes {
+                passes.push(beyond_view);
+            }
+        });
+        let state = self.text_rows.as_mut().unwrap();
+        state.blocks_stale = defer || left;
+        if left {
+            cx.notify();
+        }
     }
 
     /// Wraps the lines whose rows are stale for this width and style: those in
@@ -3064,10 +3210,29 @@ fn wrap_line(
 /// printable ASCII every character is its own cluster, so the line is never
 /// wider than its length times the widest one. Half a pixel absorbs rounding
 /// in the wrap's running sum.
-fn fits_unwrapped(line: &str, ascii_advance: Pixels, width: Pixels) -> bool {
+pub(super) fn fits_unwrapped(line: &str, ascii_advance: Pixels, width: Pixels) -> bool {
     line.len() <= MAX_ROW_BYTES
         && ascii_advance * line.len() as f32 <= width - px(0.5)
         && line.bytes().all(|byte| (b' '..=b'~').contains(&byte))
+}
+
+/// Where the rows of `line` after its first start, wrapped in one font to
+/// `width` as a display line wraps.
+pub(super) fn wrap_block_line(
+    line: &str,
+    wrapper: &mut LineWrapperHandle,
+    width: Pixels,
+) -> Vec<usize> {
+    let mut wrap = Wrap::new(line, &[], (width, width), None);
+    let cancel = AtomicBool::new(false);
+    while !wrap.step(
+        line,
+        &[],
+        std::slice::from_mut(wrapper),
+        usize::MAX,
+        &cancel,
+    ) {}
+    wrap.finish().starts().map(|start| start as usize).collect()
 }
 
 /// How far `cluster` advances a row already `x` wide.
@@ -3760,13 +3925,14 @@ mod tests {
                         .expect("every row is prepared")
                         .frame()
                         .row_height(display, line, item.presentation()),
-                    DocumentLayoutItem::Block { id, height, .. } => match height.0 {
-                        BlockGeometry::Declared(height) => height,
-                        BlockGeometry::Measured => {
+                    DocumentLayoutItem::Block { id, height, .. } => match &height.0 {
+                        BlockHeight::Declared(height) => *height,
+                        BlockHeight::Wrapped(wrapped) => wrapped.height(),
+                        BlockHeight::Measured => {
                             assert_eq!(*id, "measured");
                             px(33.)
                         }
-                        BlockGeometry::Unresolved => panic!("block {id} is unresolved"),
+                        BlockHeight::Unresolved => panic!("block {id} is unresolved"),
                     },
                     _ => unreachable!(),
                 };

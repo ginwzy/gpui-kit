@@ -46,6 +46,7 @@ use super::{
 
 const DOCUMENT_INPUT_CONTEXT: &str = "Input";
 
+mod block;
 mod host;
 pub(super) mod inline_objects;
 mod inline_styles;
@@ -63,6 +64,7 @@ use layout_items::LayoutItems;
 #[cfg(test)]
 mod style_tests;
 
+pub use block::{BlockGeometry, BlockRows, BlockText, DocumentBlockContext};
 pub use inline_objects::StructureReplacement;
 pub(super) use text_rows::RowFrame;
 pub use text_rows::{TextFrame, TextRows};
@@ -841,12 +843,12 @@ enum DocumentLayoutItem<I> {
     Block {
         id: I,
         source: Range<usize>,
-        height: Derived<text_rows::BlockGeometry>,
+        height: Derived<text_rows::BlockHeight>,
     },
     AnchoredBlock {
         id: I,
         source: usize,
-        height: Derived<text_rows::BlockGeometry>,
+        height: Derived<text_rows::BlockHeight>,
     },
     Trailer,
 }
@@ -2680,7 +2682,7 @@ pub struct DocumentState<I> {
     block_renderer: Option<BlockRenderer<I>>,
     text_renderer: Option<TextRenderer<I>>,
     text_frame_resolver: Option<TextFrameResolver<I>>,
-    block_height_resolver: Option<BlockHeightResolver<I>>,
+    block_geometry_resolver: Option<BlockGeometryResolver<I>>,
     /// Display rows, when the host asked for them.
     text_rows: Option<text_rows::TextRowsState<I>>,
 }
@@ -2698,9 +2700,9 @@ struct BlockLayoutRecord {
     bounds: Bounds<Pixels>,
 }
 
-type BlockRenderer<I> = Rc<dyn Fn(&I, &mut Window, &mut App) -> AnyElement>;
+type BlockRenderer<I> = Rc<dyn Fn(DocumentBlockContext<I>, &mut Window, &mut App) -> AnyElement>;
 type TextFrameResolver<I> = Rc<dyn Fn(&DocumentTextContext<I>, &Window, &App) -> TextFrame>;
-type BlockHeightResolver<I> = Rc<dyn Fn(&I, &Window, &App) -> Option<gpui::AbsoluteLength>>;
+type BlockGeometryResolver<I> = Rc<dyn Fn(&I, &Window, &App) -> BlockGeometry>;
 type TextRenderer<I> =
     Rc<dyn Fn(DocumentTextContext<I>, AnyElement, &mut Window, &mut App) -> AnyElement>;
 
@@ -2811,7 +2813,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             block_renderer: None,
             text_renderer: None,
             text_frame_resolver: None,
-            block_height_resolver: None,
+            block_geometry_resolver: None,
             text_rows: None,
         })
     }
@@ -2839,6 +2841,20 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     pub fn set_block_renderer(
         &mut self,
         renderer: impl Fn(&I, &mut Window, &mut App) -> AnyElement + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_block_context_renderer(
+            move |context, window, cx| renderer(context.id(), window, cx),
+            cx,
+        );
+    }
+
+    /// Renders blocks from their context: the block's ID and, when its
+    /// geometry declares text, the rows Base wrapped that text to. Replaces
+    /// any renderer given through [`Self::set_block_renderer`].
+    pub fn set_block_context_renderer(
+        &mut self,
+        renderer: impl Fn(DocumentBlockContext<I>, &mut Window, &mut App) -> AnyElement + 'static,
         cx: &mut Context<Self>,
     ) {
         self.block_renderer = Some(Rc::new(renderer));
@@ -5453,6 +5469,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let mut hidden = false;
         #[cfg(debug_assertions)]
         let mut text_top = None;
+        #[cfg(debug_assertions)]
+        let mut block_height = None;
         let child = match self
             .layout_items
             .get(item_ix)
@@ -5604,7 +5622,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                             (
                                 range.clone(),
                                 self.block_renderer.as_ref().expect("inline renderer")(
-                                    block.id(),
+                                    DocumentBlockContext::new(block.id().clone(), None),
                                     window,
                                     cx,
                                 ),
@@ -5636,28 +5654,38 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     }
                 }
             }
-            DocumentLayoutItem::Block { id, source, .. } => {
+            DocumentLayoutItem::Block { id, source, height } => {
                 let renderer = self
                     .block_renderer
                     .as_ref()
                     .expect("validated inline blocks require a renderer");
+                #[cfg(debug_assertions)]
+                {
+                    block_height = height.0.height();
+                }
+                let context = DocumentBlockContext::new(id.clone(), height.0.rows().cloned());
                 DocumentChild::Block {
                     item_ix,
                     id: id.clone(),
                     source: source.clone(),
-                    element: renderer(id, window, cx),
+                    element: renderer(context, window, cx),
                 }
             }
-            DocumentLayoutItem::AnchoredBlock { id, source, .. } => {
+            DocumentLayoutItem::AnchoredBlock { id, source, height } => {
                 let renderer = self
                     .block_renderer
                     .as_ref()
                     .expect("validated anchored blocks require a renderer");
+                #[cfg(debug_assertions)]
+                {
+                    block_height = height.0.height();
+                }
+                let context = DocumentBlockContext::new(id.clone(), height.0.rows().cloned());
                 DocumentChild::Block {
                     item_ix,
                     id: id.clone(),
                     source: *source..*source,
-                    element: renderer(id, window, cx),
+                    element: renderer(context, window, cx),
                 }
             }
             DocumentLayoutItem::Trailer => DocumentChild::Trailer {
@@ -5675,6 +5703,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         #[cfg(debug_assertions)]
         if let Some(text_top) = text_top.filter(|_| !hidden) {
             return super::element::DocumentRowCheck::new(cx.entity(), item_ix, text_top, element)
+                .into_any_element();
+        }
+        #[cfg(debug_assertions)]
+        if let Some(height) = block_height {
+            return super::element::DocumentBlockCheck::new(item_ix, height, element)
                 .into_any_element();
         }
         if hidden {

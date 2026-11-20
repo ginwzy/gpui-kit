@@ -433,7 +433,7 @@ impl<I> DocumentLayoutItem<I> {
             (
                 Self::Block { height, .. } | Self::AnchoredBlock { height, .. },
                 Self::Block { height: old, .. } | Self::AnchoredBlock { height: old, .. },
-            ) => *height = *old,
+            ) => *height = old.clone(),
             _ => {}
         }
     }

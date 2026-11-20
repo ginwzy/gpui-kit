@@ -549,6 +549,92 @@ fn selection_quad_bounds(
     quads
 }
 
+/// Checks, in debug builds, that a block whose geometry was declared is drawn
+/// at the declared height. A renderer that adds space, or draws declared text
+/// otherwise than by its rows, would leave the list's geometry wrong.
+#[cfg(debug_assertions)]
+pub(super) struct DocumentBlockCheck {
+    item_ix: usize,
+    height: Pixels,
+    content: AnyElement,
+}
+
+#[cfg(debug_assertions)]
+impl DocumentBlockCheck {
+    pub(super) fn new(item_ix: usize, height: Pixels, content: AnyElement) -> Self {
+        Self {
+            item_ix,
+            height,
+            content,
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl IntoElement for DocumentBlockCheck {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Element for DocumentBlockCheck {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (self.content.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.content.prepaint(window, cx);
+        debug_assert!(
+            (bounds.size.height - self.height).abs() <= px(1.),
+            "block {} is drawn {:?} tall; its geometry declares {:?}",
+            self.item_ix,
+            bounds.size.height,
+            self.height,
+        );
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.content.paint(window, cx);
+    }
+}
+
 /// Checks, in debug builds, that the text renderer drew a text row within the
 /// frame its height was declared from: the text starts the frame's space below
 /// the row's top. A renderer that pads or wraps rows otherwise would leave the
