@@ -266,11 +266,10 @@ fn blocks_out_of_view_rewrap_within_a_budget_after_a_resize(cx: &mut TestAppCont
     let passes = REWRAP_PASSES.with_borrow_mut(|passes| passes.take().unwrap());
     let rewrapped: Vec<_> = passes.into_iter().filter(|bytes| *bytes > 0).collect();
     assert!(rewrapped.len() > 1, "{rewrapped:?}");
-    let text_len = text(15).text().len();
     assert!(
         rewrapped
             .iter()
-            .all(|bytes| *bytes <= super::super::text_rows::REWRAP_IN_FRAME_BYTES + text_len),
+            .all(|bytes| *bytes <= super::super::text_rows::REWRAP_IN_FRAME_BYTES),
         "{rewrapped:?}"
     );
     assert!(
@@ -280,6 +279,76 @@ fn blocks_out_of_view_rewrap_within_a_budget_after_a_resize(cx: &mut TestAppCont
                 && *height == px(4.) + rows.line_height() * rows.rows().len() as f32 + px(6.))
     );
     assert!(!document.read_with(&cx, |document, _| document.is_laying_out_text()));
+}
+
+#[gpui::test]
+fn oversized_body_keeps_its_published_height_until_the_latest_wrap_finishes(
+    cx: &mut TestAppContext,
+) {
+    let (document, mut cx) = document_view(cx);
+    let part = |s: String| BlockParagraph::new(s, font("Zed Mono"), px(11.), px(14.));
+    // Multiple frame-sized groups plus a single logical line bigger than a frame.
+    let mut parts = vec![part("short words on a hard line\n".repeat(240)); 12];
+    parts.push(part("a long line ".repeat(3000)));
+    let declaration = Arc::new(text(2).with_paragraphs(parts));
+    document.update(&mut cx, |doc, cx| {
+        let large = declaration.clone();
+        doc.set_block_geometry_resolver(
+            move |id, _, _| {
+                if *id == "large" {
+                    BlockGeometry(Declaration::Text(large.clone()))
+                } else {
+                    BlockGeometry::text(text(5))
+                }
+            },
+            cx,
+        );
+        doc.set_block_context_renderer(|context, _, _| render(&context), cx);
+    });
+    let mut ids = (0..80)
+        .map(|ix| &*Box::leak(format!("filler-{ix}").into_boxed_str()))
+        .collect::<Vec<_>>();
+    ids.push("large");
+    open(&document, &ids, &mut cx);
+    settle_at(&document, 800., &mut cx);
+    let last = |cx: &mut VisualTestContext| {
+        let (_, width, _, height) = wraps(&document, cx).pop().unwrap();
+        (width, height)
+    };
+    let old = last(&mut cx);
+    REWRAP_PASSES.with_borrow_mut(|passes| *passes = Some(Vec::new()));
+    cx.simulate_resize(size(px(400.), px(300.)));
+    draw(&mut cx);
+    assert_eq!(last(&mut cx), old);
+    cx.simulate_resize(size(px(220.), px(300.)));
+    let expected = cx.update(|window, cx| {
+        wrap_block(
+            &declaration,
+            px(220.),
+            &mut BlockAdvances::default(),
+            window,
+            cx,
+        )
+        .height()
+    });
+    for _ in 0..50 {
+        draw(&mut cx);
+        let actual = last(&mut cx);
+        if actual != old {
+            assert_eq!(actual, (px(220.), expected));
+            break;
+        }
+    }
+    assert_eq!(last(&mut cx), (px(220.), expected));
+    assert!(expected > old.1);
+    let passes = REWRAP_PASSES.with_borrow_mut(|passes| passes.take().unwrap());
+    assert!(passes.iter().filter(|b| **b > 0).count() >= 3, "{passes:?}");
+    assert!(
+        passes
+            .iter()
+            .all(|b| *b <= super::super::text_rows::REWRAP_IN_FRAME_BYTES),
+        "{passes:?}"
+    );
 }
 
 #[gpui::test]

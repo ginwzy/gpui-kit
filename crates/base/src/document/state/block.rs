@@ -11,7 +11,10 @@ mod tests;
 
 use std::{ops::Range, sync::Arc};
 
-use gpui::{AbsoluteLength, App, Font, LineIndent, Pixels, SharedString, Window, px};
+use gpui::{
+    AbsoluteLength, App, Font, LineIndent, Pixels, SharedString, TextRun, TextSystem, Window,
+    WindowTextSystem, px,
+};
 
 use super::text_rows::{TextFrame, fits_unwrapped, wrap_block_line};
 
@@ -135,15 +138,15 @@ impl BlockParagraph {
         &self,
         width: Pixels,
         advances: &mut BlockAdvances,
-        window: &Window,
-        cx: &App,
+        line: Pixels,
+        mut run: TextRun,
+        system: &WindowTextSystem,
     ) -> Pixels {
         let width = (width - self.inset).max(px(0.));
-        let line = window.pixel_snap(self.line);
-        let mut advance = advances.get(&self.font, self.size, cx);
+        let mut advance = advances.get(&self.font, self.size, system);
         for run in &self.runs {
             if run.font != self.font {
-                advance = advance.max(advances.get(&run.font, self.size, cx));
+                advance = advance.max(advances.get(&run.font, self.size, system));
             }
         }
         let mut count = 0usize;
@@ -153,15 +156,13 @@ impl BlockParagraph {
         }) {
             return self.min_height.max(line * count as f32);
         }
-        let mut run = window.text_style().to_run(self.text.len());
         run.font = self.font.clone();
         let runs = if self.runs.is_empty() {
             std::slice::from_ref(&run)
         } else {
             &self.runs
         };
-        window
-            .text_system()
+        system
             .shape_indented_text(
                 self.text.clone(),
                 self.size,
@@ -341,7 +342,7 @@ impl WrappedBlock {
 pub(in crate::document) struct BlockAdvances(Vec<(Font, Pixels, Pixels)>);
 
 impl BlockAdvances {
-    fn get(&mut self, font: &Font, size: Pixels, cx: &App) -> Pixels {
+    fn get(&mut self, font: &Font, size: Pixels, system: &Arc<TextSystem>) -> Pixels {
         if let Some((_, _, advance)) = self
             .0
             .iter()
@@ -349,13 +350,91 @@ impl BlockAdvances {
         {
             return *advance;
         }
-        let mut wrapper = cx.text_system().line_wrapper(font.clone(), size);
+        let mut wrapper = system.line_wrapper(font.clone(), size);
         let mut buffer = [0; 4];
         let advance = (b' '..=b'~').fold(Pixels::ZERO, |widest, byte| {
             widest.max(wrapper.cluster_width(char::from(byte).encode_utf8(&mut buffer)))
         });
         self.0.push((font.clone(), size, advance));
         advance
+    }
+}
+
+/// Keeps the header and accumulated native heights private until the whole
+/// declaration is ready. Its identity follows the declaration, not a list index.
+pub(super) struct BlockWork {
+    text: Arc<BlockText>,
+    width: Pixels,
+    header: Option<WrappedBlock>,
+    paragraph: usize,
+    body: Pixels,
+}
+
+impl BlockWork {
+    pub(super) fn new(text: Arc<BlockText>, width: Pixels) -> Self {
+        Self {
+            text,
+            width,
+            header: None,
+            paragraph: 0,
+            body: px(0.),
+        }
+    }
+
+    pub(super) fn matches(&self, text: &Arc<BlockText>, width: Pixels) -> bool {
+        self.width == width && Arc::ptr_eq(&self.text, text)
+    }
+
+    pub(super) fn next_bytes(&self) -> Option<usize> {
+        if self.header.is_none() {
+            return Some(self.text.text.len().max(1));
+        }
+        if self.text.frame.hidden() {
+            return None;
+        }
+        self.text
+            .paragraphs
+            .get(self.paragraph)
+            .map(|p| p.text.len().max(1))
+    }
+
+    pub(super) fn metrics(&self, window: &Window) -> (Pixels, Pixels, TextRun) {
+        let rem = window.rem_size();
+        let (line, len) = if self.header.is_none() {
+            (self.text.line_height.to_pixels(rem), self.text.text.len())
+        } else {
+            let p = &self.text.paragraphs[self.paragraph];
+            (p.line, p.text.len())
+        };
+        (
+            rem,
+            window.pixel_snap(line),
+            window.text_style().to_run(len),
+        )
+    }
+
+    pub(super) fn step(
+        &mut self,
+        (rem, line, run): (Pixels, Pixels, TextRun),
+        advances: &mut BlockAdvances,
+        system: &WindowTextSystem,
+    ) {
+        if self.header.is_none() {
+            self.header = Some(wrap_header(
+                &self.text, self.width, rem, line, advances, system,
+            ));
+        } else {
+            self.body += self.text.paragraphs[self.paragraph]
+                .height(self.width, advances, line, run, system);
+            self.paragraph += 1;
+        }
+    }
+
+    pub(super) fn finish(self) -> WrappedBlock {
+        debug_assert!(self.next_bytes().is_none());
+        let mut wrapped = self.header.expect("a finished block has a header");
+        wrapped.height += self.body;
+        wrapped
     }
 }
 
@@ -366,9 +445,44 @@ pub(in crate::document) fn wrap_block(
     width: Pixels,
     advances: &mut BlockAdvances,
     window: &Window,
-    cx: &App,
+    _cx: &App,
 ) -> WrappedBlock {
     let rem_size = window.rem_size();
+    let mut wrapped = wrap_header(
+        text,
+        width,
+        rem_size,
+        window.pixel_snap(text.line_height.to_pixels(rem_size)),
+        advances,
+        window.text_system(),
+    );
+    if !text.frame.hidden() {
+        let body = text
+            .paragraphs
+            .iter()
+            .map(|p| {
+                p.height(
+                    width,
+                    advances,
+                    window.pixel_snap(p.line),
+                    window.text_style().to_run(p.text.len()),
+                    window.text_system(),
+                )
+            })
+            .sum::<Pixels>();
+        wrapped.height += body;
+    }
+    wrapped
+}
+
+fn wrap_header(
+    text: &Arc<BlockText>,
+    width: Pixels,
+    rem_size: Pixels,
+    line_height: Pixels,
+    advances: &mut BlockAdvances,
+    system: &Arc<TextSystem>,
+) -> WrappedBlock {
     let frame = &text.frame;
     let available =
         (width - frame.inset_start().to_pixels(rem_size) - frame.inset_end().to_pixels(rem_size))
@@ -378,8 +492,7 @@ pub(in crate::document) fn wrap_block(
         .map_or(available, |max| max.to_pixels(rem_size).min(available));
     let font_size = text.font_size.to_pixels(rem_size);
     // The line height a text element lays out with, snapped to device pixels.
-    let line_height = window.pixel_snap(text.line_height.to_pixels(rem_size));
-    let advance = advances.get(&text.font, font_size, cx);
+    let advance = advances.get(&text.font, font_size, system);
     let mut wrapper = None;
     let mut rows = Vec::new();
     let mut start = 0;
@@ -387,8 +500,8 @@ pub(in crate::document) fn wrap_block(
         if fits_unwrapped(line, advance, row_width) {
             rows.push(start..start + line.len());
         } else {
-            let wrapper = wrapper
-                .get_or_insert_with(|| cx.text_system().line_wrapper(text.font.clone(), font_size));
+            let wrapper =
+                wrapper.get_or_insert_with(|| system.line_wrapper(text.font.clone(), font_size));
             let mut row = start;
             for next in wrap_block_line(line, wrapper, row_width) {
                 rows.push(row..start + next);
@@ -405,11 +518,6 @@ pub(in crate::document) fn wrap_block(
             (line_height * rows.len() as f32).max(text.min_height.to_pixels(rem_size));
         frame.space_before().to_pixels(rem_size)
             + rows_height
-            + text
-                .paragraphs
-                .iter()
-                .map(|p| p.height(width, advances, window, cx))
-                .sum::<Pixels>()
             + frame.space_after().to_pixels(rem_size)
     };
     WrappedBlock {

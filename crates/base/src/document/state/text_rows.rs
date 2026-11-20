@@ -30,7 +30,9 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 use super::{
     Derived, DocumentLayoutItem, DocumentState, DocumentTextContext,
-    block::{BlockAdvances, BlockGeometry, BlockRows, Declaration, WrappedBlock, wrap_block},
+    block::{
+        BlockAdvances, BlockGeometry, BlockRows, BlockWork, Declaration, WrappedBlock, wrap_block,
+    },
     row::Layout,
 };
 use crate::document::DocumentRegion;
@@ -572,6 +574,8 @@ pub(in crate::document) struct TextRowsState<I> {
     /// Blocks that declare text may hold rows wrapped for another width.
     blocks_stale: bool,
     block_advances: BlockAdvances,
+    partial_block: Option<BlockWork>,
+    block_worker: Option<Task<()>>,
 }
 
 /// Unchanged extents relative to one cached line, composed directly from the
@@ -617,6 +621,7 @@ impl<I: Clone> TextRowsState<I> {
     }
 
     fn invalidate(&mut self) {
+        self.partial_block = None;
         self.nearby = true;
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = Arc::new(AtomicBool::new(false));
@@ -659,6 +664,8 @@ impl<I: Clone> TextRowsState<I> {
             quiet_frames: u8::MAX,
             blocks_stale: false,
             block_advances: BlockAdvances::default(),
+            partial_block: None,
+            block_worker: None,
         }
     }
 
@@ -2034,6 +2041,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let mut budget = REWRAP_IN_FRAME_BYTES;
         let mut left = false;
         let mut stale = Vec::new();
+        let mut large = None;
         #[cfg(test)]
         let mut beyond_view = 0;
         for range in ranges {
@@ -2056,22 +2064,88 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 }
                 let ix = range.start + offset;
                 let in_view = view.contains(&ix);
-                if in_view || budget > 0 {
-                    let bytes = wrapped.text().wrap_bytes();
+                let bytes = wrapped.text().wrap_bytes();
+                if in_view || bytes <= budget {
                     budget = budget.saturating_sub(bytes);
                     #[cfg(test)]
                     if !in_view {
                         beyond_view += bytes;
                     }
                     stale.push((ix, wrapped.text().clone()));
+                } else if bytes > REWRAP_IN_FRAME_BYTES && large.is_none() {
+                    large = Some((ix, wrapped.text().clone()));
                 } else {
                     left = true;
                 }
             }
         }
+        let mut partial_result = None;
+        if let Some((ix, text)) = large {
+            let state = self.text_rows.as_mut().unwrap();
+            if state.block_worker.is_none() {
+                let mut work = state
+                    .partial_block
+                    .take()
+                    .filter(|job| job.matches(&text, width))
+                    .unwrap_or_else(|| BlockWork::new(text, width));
+                loop {
+                    let Some(bytes) = work.next_bytes() else {
+                        partial_result = Some((ix, work.finish()));
+                        break;
+                    };
+                    let metrics = work.metrics(window);
+                    if bytes > REWRAP_IN_FRAME_BYTES {
+                        // Native shaping can require an entire line's context. Keep
+                        // its cache off the window and allow only one such part in flight.
+                        let request = state.request;
+                        let system = cx.text_system().clone();
+                        state.block_worker = Some(cx.spawn(async move |this, cx| {
+                            let work = cx
+                                .background_spawn(async move {
+                                    work.step(
+                                        metrics,
+                                        &mut BlockAdvances::default(),
+                                        &gpui::WindowTextSystem::new(system),
+                                    );
+                                    work
+                                })
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                if let Some(state) = &mut this.text_rows {
+                                    state.block_worker = None;
+                                    if state.request == request && state.blocks_stale {
+                                        state.partial_block = Some(work);
+                                    }
+                                    cx.notify();
+                                }
+                            });
+                        }));
+                        break;
+                    }
+                    if bytes > budget {
+                        state.partial_block = Some(work);
+                        left = true;
+                        break;
+                    }
+                    budget -= bytes;
+                    #[cfg(test)]
+                    {
+                        beyond_view += bytes;
+                    }
+                    work.step(metrics, &mut state.block_advances, window.text_system());
+                }
+            }
+        } else {
+            self.text_rows.as_mut().unwrap().partial_block = None;
+        }
+        let mut wrapped_blocks =
+            Vec::with_capacity(stale.len() + usize::from(partial_result.is_some()));
         for (ix, text) in stale {
             let state = self.text_rows.as_mut().unwrap();
             let wrapped = wrap_block(&text, width, &mut state.block_advances, window, cx);
+            wrapped_blocks.push((ix, wrapped));
+        }
+        for (ix, wrapped) in wrapped_blocks.into_iter().chain(partial_result) {
             let height = wrapped.height();
             self.layout_items.update(ix, |item| {
                 if let DocumentLayoutItem::Block { height, .. }
@@ -2089,8 +2163,8 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             }
         });
         let state = self.text_rows.as_mut().unwrap();
-        state.blocks_stale = defer || left;
-        if left {
+        state.blocks_stale = defer || left || state.block_worker.is_some();
+        if left && state.block_worker.is_none() {
             cx.notify();
         }
     }
