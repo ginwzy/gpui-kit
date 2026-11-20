@@ -11,7 +11,7 @@ mod tests;
 
 use std::{ops::Range, sync::Arc};
 
-use gpui::{AbsoluteLength, App, Font, Pixels, SharedString, Window, px};
+use gpui::{AbsoluteLength, App, Font, LineIndent, Pixels, SharedString, Window, px};
 
 use super::text_rows::{TextFrame, fits_unwrapped, wrap_block_line};
 
@@ -67,6 +67,117 @@ pub struct BlockText {
     line_height: AbsoluteLength,
     frame: TextFrame,
     min_height: AbsoluteLength,
+    paragraphs: Vec<BlockParagraph>,
+}
+
+/// A native text element below the block's title. It keeps its own painting
+/// and hit testing; only its wrapped height is needed by the list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlockParagraph {
+    text: SharedString,
+    font: Font,
+    size: Pixels,
+    line: Pixels,
+    inset: Pixels,
+    indent: Pixels,
+    min_height: Pixels,
+    runs: Vec<gpui::TextRun>,
+}
+
+impl BlockParagraph {
+    pub fn new(text: impl Into<SharedString>, font: Font, size: Pixels, line: Pixels) -> Self {
+        Self {
+            text: text.into(),
+            font,
+            size,
+            line,
+            inset: px(0.),
+            indent: px(0.),
+            min_height: px(0.),
+            runs: Vec::new(),
+        }
+    }
+
+    /// A `StyledText` paragraph. Shaping keeps its run boundaries and fonts,
+    /// including changes of weight or style within a line.
+    pub fn styled(
+        text: SharedString,
+        style: &gpui::TextStyle,
+        size: Pixels,
+        line: Pixels,
+        highlights: Vec<(Range<usize>, gpui::HighlightStyle)>,
+    ) -> Self {
+        let mut part = Self::new(text, style.font(), size, line);
+        if !highlights.is_empty() {
+            part.runs = crate::text::highlighted_runs(part.text.len(), style, highlights);
+        }
+        part
+    }
+
+    /// Space outside the text element, including any leading sibling.
+    pub fn with_inset(mut self, inset: Pixels) -> Self {
+        self.inset = inset;
+        self
+    }
+
+    /// A uniform line indent *inside* the text element (for example a gutter).
+    pub fn with_indent(mut self, indent: Pixels) -> Self {
+        self.indent = indent;
+        self
+    }
+
+    pub fn with_min_height(mut self, height: Pixels) -> Self {
+        self.min_height = height;
+        self
+    }
+
+    fn height(
+        &self,
+        width: Pixels,
+        advances: &mut BlockAdvances,
+        window: &Window,
+        cx: &App,
+    ) -> Pixels {
+        let width = (width - self.inset).max(px(0.));
+        let line = window.pixel_snap(self.line);
+        let mut advance = advances.get(&self.font, self.size, cx);
+        for run in &self.runs {
+            if run.font != self.font {
+                advance = advance.max(advances.get(&run.font, self.size, cx));
+            }
+        }
+        let mut count = 0usize;
+        if self.text.split('\n').all(|text| {
+            count += 1;
+            fits_unwrapped(text, advance, width - self.indent)
+        }) {
+            return self.min_height.max(line * count as f32);
+        }
+        let mut run = window.text_style().to_run(self.text.len());
+        run.font = self.font.clone();
+        let runs = if self.runs.is_empty() {
+            std::slice::from_ref(&run)
+        } else {
+            &self.runs
+        };
+        window
+            .text_system()
+            .shape_indented_text(
+                self.text.clone(),
+                self.size,
+                runs,
+                Some(width),
+                None,
+                LineIndent::uniform(self.indent),
+            )
+            .map_or(self.min_height, |lines| {
+                lines
+                    .iter()
+                    .map(|text| text.size(line).height)
+                    .sum::<Pixels>()
+                    .max(self.min_height)
+            })
+    }
 }
 
 impl BlockText {
@@ -83,6 +194,7 @@ impl BlockText {
             line_height: line_height.into(),
             frame: TextFrame::new(),
             min_height: px(0.).into(),
+            paragraphs: Vec::new(),
         }
     }
 
@@ -118,6 +230,15 @@ impl BlockText {
 
     pub fn frame(&self) -> &TextFrame {
         &self.frame
+    }
+
+    pub fn with_paragraphs(mut self, paragraphs: Vec<BlockParagraph>) -> Self {
+        self.paragraphs = paragraphs;
+        self
+    }
+
+    pub(super) fn wrap_bytes(&self) -> usize {
+        self.text.len() + self.paragraphs.iter().map(|p| p.text.len()).sum::<usize>()
     }
 
     pub fn min_height(&self) -> AbsoluteLength {
@@ -284,6 +405,11 @@ pub(in crate::document) fn wrap_block(
             (line_height * rows.len() as f32).max(text.min_height.to_pixels(rem_size));
         frame.space_before().to_pixels(rem_size)
             + rows_height
+            + text
+                .paragraphs
+                .iter()
+                .map(|p| p.height(width, advances, window, cx))
+                .sum::<Pixels>()
             + frame.space_after().to_pixels(rem_size)
     };
     WrappedBlock {

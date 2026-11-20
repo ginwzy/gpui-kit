@@ -29,6 +29,18 @@ pub(crate) fn init(cx: &mut App) {
     state::init(cx);
 }
 
+pub(crate) fn highlighted_runs(
+    len: usize,
+    style: &gpui::TextStyle,
+    highlights: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)>,
+) -> Vec<gpui::TextRun> {
+    let highlights = highlights
+        .into_iter()
+        .map(|(range, h)| (range, h.into()))
+        .collect::<Vec<_>>();
+    inline::text_runs(len, style, &highlights)
+}
+
 /// Create a new markdown text view with code location as id.
 #[track_caller]
 pub fn markdown(source: impl Into<SharedString>) -> TextView {

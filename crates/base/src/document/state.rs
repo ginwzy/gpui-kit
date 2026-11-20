@@ -64,7 +64,7 @@ use layout_items::LayoutItems;
 #[cfg(test)]
 mod style_tests;
 
-pub use block::{BlockGeometry, BlockRows, BlockText, DocumentBlockContext};
+pub use block::{BlockGeometry, BlockParagraph, BlockRows, BlockText, DocumentBlockContext};
 pub use inline_objects::StructureReplacement;
 pub(super) use text_rows::RowFrame;
 pub use text_rows::{TextFrame, TextRows};

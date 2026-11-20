@@ -283,6 +283,76 @@ fn blocks_out_of_view_rewrap_within_a_budget_after_a_resize(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn native_paragraph_height_tracks_wrapped_styled_text_without_changing_title_rows(
+    cx: &mut TestAppContext,
+) {
+    use gpui::{FontWeight, HighlightStyle, StyledText};
+    let (document, mut cx) = document_view(cx);
+    let sample = "wide 汉🙂 words with a gutter\n\nmore words here ".repeat(4);
+    let highlights = || {
+        vec![(
+            0..4,
+            HighlightStyle {
+                font_weight: Some(FontWeight::BOLD),
+                ..Default::default()
+            },
+        )]
+    };
+    document.update(&mut cx, |doc, cx| {
+        let source = sample.clone();
+        doc.set_block_geometry_resolver(
+            move |_, window, _| {
+                let style = window.text_style();
+                let body = BlockParagraph::styled(
+                    source.clone().into(),
+                    &style,
+                    px(15.),
+                    px(20.),
+                    highlights(),
+                )
+                .with_inset(px(16.))
+                .with_indent(px(22.));
+                let title = text(1).with_paragraphs(vec![body]);
+                assert_eq!(title.wrap_bytes(), title.text().len() + source.len());
+                BlockGeometry::text(title)
+            },
+            cx,
+        );
+        doc.set_block_context_renderer(
+            move |context, _, _| {
+                div()
+                    .child(render(&context))
+                    .child(
+                        div()
+                            .pl(px(16.))
+                            .text_size(px(15.))
+                            .line_height(px(20.))
+                            .child(
+                                StyledText::new(sample.clone())
+                                    .with_highlights(highlights())
+                                    .with_line_indent(gpui::LineIndent::uniform(px(22.))),
+                            ),
+                    )
+                    .into_any_element()
+            },
+            cx,
+        );
+    });
+    open(&document, &["paragraph"], &mut cx);
+    let measured = document.read_with(&cx, |doc, _| doc.list_state().measurement().items);
+    settle_at(&document, 800., &mut cx);
+    let wide = wraps(&document, &mut cx).remove(0);
+    settle_at(&document, 210., &mut cx);
+    let narrow = wraps(&document, &mut cx).remove(0);
+    assert_eq!(wide.2.rows(), narrow.2.rows());
+    assert!(narrow.3 > wide.3);
+    assert_eq!(
+        document.read_with(&cx, |doc, _| doc.list_state().measurement().items),
+        measured
+    );
+}
+
+#[gpui::test]
 fn a_drag_rewraps_only_the_view_until_the_width_holds(cx: &mut TestAppContext) {
     let (document, mut cx) = document_view(cx);
     let ids: Vec<&'static str> = (0..80)

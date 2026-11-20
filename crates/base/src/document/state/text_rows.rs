@@ -2057,7 +2057,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 let ix = range.start + offset;
                 let in_view = view.contains(&ix);
                 if in_view || budget > 0 {
-                    let bytes = wrapped.text().text().len();
+                    let bytes = wrapped.text().wrap_bytes();
                     budget = budget.saturating_sub(bytes);
                     #[cfg(test)]
                     if !in_view {
