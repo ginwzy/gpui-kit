@@ -306,6 +306,9 @@ thread_local! {
     /// took beyond the view.
     pub(in crate::document) static REWRAP_PASSES: std::cell::RefCell<Option<Vec<usize>>> =
         const { std::cell::RefCell::new(None) };
+    /// While set, wrapping a block larger than one frame's budget in a
+    /// single call fails the test.
+    pub(super) static TRACK_LARGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Declared text wrapped for one block width.
@@ -447,6 +450,11 @@ pub(in crate::document) fn wrap_block(
     window: &Window,
     _cx: &App,
 ) -> WrappedBlock {
+    #[cfg(test)]
+    assert!(
+        !TRACK_LARGE.get() || text.wrap_bytes() <= super::text_rows::REWRAP_IN_FRAME_BYTES,
+        "oversized block wrapped synchronously"
+    );
     let rem_size = window.rem_size();
     let mut wrapped = wrap_header(
         text,

@@ -5668,7 +5668,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     item_ix,
                     id: id.clone(),
                     source: source.clone(),
-                    element: renderer(context, window, cx),
+                    element: self.clip_retained_block(renderer(context, window, cx), &height.0),
                 }
             }
             DocumentLayoutItem::AnchoredBlock { id, source, height } => {
@@ -5685,7 +5685,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                     item_ix,
                     id: id.clone(),
                     source: *source..*source,
-                    element: renderer(context, window, cx),
+                    element: self.clip_retained_block(renderer(context, window, cx), &height.0),
                 }
             }
             DocumentLayoutItem::Trailer => DocumentChild::Trailer {
@@ -5719,6 +5719,22 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 .into_any_element();
         }
         element
+    }
+
+    fn clip_retained_block(
+        &self,
+        element: AnyElement,
+        height: &text_rows::BlockHeight,
+    ) -> AnyElement {
+        if let Some(width) = self.retained_block_width(height) {
+            div()
+                .w_full()
+                .overflow_hidden()
+                .child(div().w(width).flex_none().child(element))
+                .into_any_element()
+        } else {
+            element
+        }
     }
 }
 

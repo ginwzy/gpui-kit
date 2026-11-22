@@ -31,7 +31,8 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use super::{
     Derived, DocumentLayoutItem, DocumentState, DocumentTextContext,
     block::{
-        BlockAdvances, BlockGeometry, BlockRows, BlockWork, Declaration, WrappedBlock, wrap_block,
+        BlockAdvances, BlockGeometry, BlockRows, BlockText, BlockWork, Declaration, WrappedBlock,
+        wrap_block,
     },
     row::Layout,
 };
@@ -325,6 +326,13 @@ impl BlockHeight {
             _ => None,
         }
     }
+
+    fn text_to_wrap(&self, width: Pixels) -> Option<&Arc<BlockText>> {
+        match self {
+            Self::Wrapped(wrapped) if wrapped.width() != width => Some(wrapped.text()),
+            _ => None,
+        }
+    }
 }
 
 /// What a line was wrapped for: the advances of a base style generation, and
@@ -575,6 +583,7 @@ pub(in crate::document) struct TextRowsState<I> {
     blocks_stale: bool,
     block_advances: BlockAdvances,
     partial_block: Option<BlockWork>,
+    landing_block: Option<usize>,
     block_worker: Option<Task<()>>,
 }
 
@@ -622,6 +631,7 @@ impl<I: Clone> TextRowsState<I> {
 
     fn invalidate(&mut self) {
         self.partial_block = None;
+        self.landing_block = None;
         self.nearby = true;
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = Arc::new(AtomicBool::new(false));
@@ -665,6 +675,7 @@ impl<I: Clone> TextRowsState<I> {
             blocks_stale: false,
             block_advances: BlockAdvances::default(),
             partial_block: None,
+            landing_block: None,
             block_worker: None,
         }
     }
@@ -2014,6 +2025,77 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         start..end
     }
 
+    pub(super) fn has_stale_blocks(&self) -> bool {
+        self.text_rows
+            .as_ref()
+            .is_some_and(|state| state.blocks_stale)
+    }
+
+    /// A reveal or scroll can land outside the neighborhood prepared before the list
+    /// measured its items. Walk from that target using the *new* heights so
+    /// shrinking blocks do not leave part of the destination unprepared.
+    pub(super) fn prepare_block_landing(
+        &mut self,
+        target: usize,
+        above: Pixels,
+        below: Pixels,
+        geometry: &mut gpui::ListGeometry,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(state) = self.text_rows.as_mut().filter(|s| s.blocks_stale) else {
+            return true;
+        };
+        let Some(width) = state.width else {
+            return true;
+        };
+        let len = self.layout_items.len();
+        let mut prepare = |ix: usize| {
+            if let DocumentLayoutItem::Block { height, .. }
+            | DocumentLayoutItem::AnchoredBlock { height, .. } = &self.layout_items[ix]
+                && let Some(text) = height.0.text_to_wrap(width)
+            {
+                if text.wrap_bytes() > REWRAP_IN_FRAME_BYTES {
+                    state.landing_block = Some(ix);
+                    if state.block_worker.is_none() {
+                        cx.notify();
+                    }
+                    return None;
+                }
+                let wrapped = wrap_block(text, width, &mut state.block_advances, window, cx);
+                let h = wrapped.height();
+                self.layout_items.update(ix, |item| {
+                    if let DocumentLayoutItem::Block { height, .. }
+                    | DocumentLayoutItem::AnchoredBlock { height, .. } = item
+                    {
+                        height.0 = BlockHeight::Wrapped(Arc::new(wrapped));
+                    }
+                });
+                geometry.set_item_height(ix, h);
+                Some(h)
+            } else {
+                Some(geometry.item_height(ix).unwrap_or_default())
+            }
+        };
+        let mut remaining = above;
+        for ix in (0..target).rev() {
+            if remaining <= Pixels::ZERO {
+                break;
+            }
+            let Some(h) = prepare(ix) else { return false };
+            remaining -= h;
+        }
+        let mut remaining = below;
+        for ix in target..len {
+            if remaining <= Pixels::ZERO {
+                break;
+            }
+            let Some(h) = prepare(ix) else { return false };
+            remaining -= h;
+        }
+        true
+    }
+
     /// Wraps declared block text again where its rows were wrapped for another
     /// width. Blocks in view rewrap at once. The rest keep their earlier rows,
     /// and the heights of those rows, while a drag keeps changing the width;
@@ -2041,7 +2123,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let mut budget = REWRAP_IN_FRAME_BYTES;
         let mut left = false;
         let mut stale = Vec::new();
-        let mut large = None;
+        let mut large = self.pending_landing(width);
         #[cfg(test)]
         let mut beyond_view = 0;
         for range in ranges {
@@ -2056,88 +2138,42 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 else {
                     continue;
                 };
-                let BlockHeight::Wrapped(wrapped) = &height.0 else {
+                let Some(text) = height.0.text_to_wrap(width) else {
                     continue;
                 };
-                if wrapped.width() == width {
-                    continue;
-                }
                 let ix = range.start + offset;
                 let in_view = view.contains(&ix);
-                let bytes = wrapped.text().wrap_bytes();
-                if in_view || bytes <= budget {
+                let bytes = text.wrap_bytes();
+                if bytes <= REWRAP_IN_FRAME_BYTES && (in_view || bytes <= budget) {
                     budget = budget.saturating_sub(bytes);
                     #[cfg(test)]
                     if !in_view {
                         beyond_view += bytes;
                     }
-                    stale.push((ix, wrapped.text().clone()));
-                } else if bytes > REWRAP_IN_FRAME_BYTES && large.is_none() {
-                    large = Some((ix, wrapped.text().clone()));
+                    stale.push((ix, text.clone()));
+                } else if bytes > REWRAP_IN_FRAME_BYTES
+                    && large.as_ref().is_none_or(|(i, _)| *i == ix)
+                {
+                    large = Some((ix, text.clone()));
                 } else {
                     left = true;
                 }
             }
         }
-        let mut partial_result = None;
-        if let Some((ix, text)) = large {
-            let state = self.text_rows.as_mut().unwrap();
-            if state.block_worker.is_none() {
-                let mut work = state
-                    .partial_block
-                    .take()
-                    .filter(|job| job.matches(&text, width))
-                    .unwrap_or_else(|| BlockWork::new(text, width));
-                loop {
-                    let Some(bytes) = work.next_bytes() else {
-                        partial_result = Some((ix, work.finish()));
-                        break;
-                    };
-                    let metrics = work.metrics(window);
-                    if bytes > REWRAP_IN_FRAME_BYTES {
-                        // Native shaping can require an entire line's context. Keep
-                        // its cache off the window and allow only one such part in flight.
-                        let request = state.request;
-                        let system = cx.text_system().clone();
-                        state.block_worker = Some(cx.spawn(async move |this, cx| {
-                            let work = cx
-                                .background_spawn(async move {
-                                    work.step(
-                                        metrics,
-                                        &mut BlockAdvances::default(),
-                                        &gpui::WindowTextSystem::new(system),
-                                    );
-                                    work
-                                })
-                                .await;
-                            let _ = this.update(cx, |this, cx| {
-                                if let Some(state) = &mut this.text_rows {
-                                    state.block_worker = None;
-                                    if state.request == request && state.blocks_stale {
-                                        state.partial_block = Some(work);
-                                    }
-                                    cx.notify();
-                                }
-                            });
-                        }));
-                        break;
-                    }
-                    if bytes > budget {
-                        state.partial_block = Some(work);
-                        left = true;
-                        break;
-                    }
-                    budget -= bytes;
-                    #[cfg(test)]
-                    {
-                        beyond_view += bytes;
-                    }
-                    work.step(metrics, &mut state.block_advances, window.text_system());
-                }
+        let partial_result = if let Some((ix, text)) = large {
+            #[cfg(test)]
+            let before = budget;
+            let result = self.advance_large_block(text, width, &mut budget, window, cx);
+            #[cfg(test)]
+            {
+                beyond_view += before - budget;
             }
+            left |= result.is_none();
+            result.map(|wrapped| (ix, wrapped))
         } else {
             self.text_rows.as_mut().unwrap().partial_block = None;
-        }
+            None
+        };
         let mut wrapped_blocks =
             Vec::with_capacity(stale.len() + usize::from(partial_result.is_some()));
         for (ix, text) in stale {
@@ -2167,6 +2203,90 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         if left && state.block_worker.is_none() {
             cx.notify();
         }
+    }
+
+    fn pending_landing(&self, width: Pixels) -> Option<(usize, Arc<BlockText>)> {
+        let ix = self.text_rows.as_ref()?.landing_block?;
+        let (DocumentLayoutItem::Block { height, .. }
+        | DocumentLayoutItem::AnchoredBlock { height, .. }) = self.layout_items.get(ix)?
+        else {
+            return None;
+        };
+        Some((ix, height.0.text_to_wrap(width)?.clone()))
+    }
+
+    /// Keep a previously visible, oversized card's native body at the same
+    /// width as its published header and height until the new pair is ready.
+    pub(super) fn retained_block_width(&self, height: &BlockHeight) -> Option<Pixels> {
+        let width = self.text_rows.as_ref()?.width?;
+        match height {
+            BlockHeight::Wrapped(w)
+                if w.width() != width && w.text().wrap_bytes() > REWRAP_IN_FRAME_BYTES =>
+            {
+                Some(w.width())
+            }
+            _ => None,
+        }
+    }
+
+    fn advance_large_block(
+        &mut self,
+        text: Arc<BlockText>,
+        width: Pixels,
+        budget: &mut usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<WrappedBlock> {
+        let state = self.text_rows.as_mut()?;
+        if state.block_worker.is_some() {
+            return None;
+        }
+        let mut work = state
+            .partial_block
+            .take()
+            .filter(|job| job.matches(&text, width))
+            .unwrap_or_else(|| BlockWork::new(text, width));
+        while let Some(bytes) = work.next_bytes() {
+            let metrics = work.metrics(window);
+            if bytes > REWRAP_IN_FRAME_BYTES {
+                let cancel = state.cancel.clone();
+                let request = state.request;
+                let system = cx.text_system().clone();
+                state.block_worker = Some(cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move {
+                            if cancel.load(Ordering::Relaxed) {
+                                return None;
+                            }
+                            work.step(
+                                metrics,
+                                &mut BlockAdvances::default(),
+                                &gpui::WindowTextSystem::new(system),
+                            );
+                            Some(work)
+                        })
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(state) = &mut this.text_rows {
+                            state.block_worker = None;
+                            if request == state.request && state.blocks_stale {
+                                state.partial_block = result;
+                            }
+                            cx.notify();
+                        }
+                    });
+                }));
+                return None;
+            }
+            if bytes > *budget {
+                state.partial_block = Some(work);
+                return None;
+            }
+            *budget -= bytes;
+            work.step(metrics, &mut state.block_advances, window.text_system());
+        }
+        state.landing_block = None;
+        Some(work.finish())
     }
 
     /// Wraps the lines whose rows are stale for this width and style: those in
