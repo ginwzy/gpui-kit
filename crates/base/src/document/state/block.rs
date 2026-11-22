@@ -16,7 +16,7 @@ use gpui::{
     WindowTextSystem, px,
 };
 
-use super::text_rows::{TextFrame, fits_unwrapped, wrap_block_line};
+use super::text_rows::{BlockHeight, TextFrame, fits_unwrapped, wrap_block_line};
 
 /// How tall a block is in text rows, as its host declares it through
 /// [`DocumentState::set_block_geometry_resolver`](super::DocumentState::set_block_geometry_resolver).
@@ -306,6 +306,8 @@ thread_local! {
     /// took beyond the view.
     pub(in crate::document) static REWRAP_PASSES: std::cell::RefCell<Option<Vec<usize>>> =
         const { std::cell::RefCell::new(None) };
+    pub(super) static TRACK_LARGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static COLD_WRAP_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Declared text wrapped for one block width.
@@ -316,6 +318,28 @@ pub(in crate::document) struct WrappedBlock {
     /// The width of the block, not of its rows.
     width: Pixels,
     height: Pixels,
+}
+
+/// EXPERIMENT switches, read once from the environment.
+pub(in crate::document) struct Experiment {
+    pub(in crate::document) idle: bool,
+    /// Offscreen rewrap stops once a frame has spent this long on it.
+    pub(in crate::document) rewrap_budget: Option<std::time::Duration>,
+    /// Blocks resolve to an estimate; only those in view wrap at once.
+    pub(in crate::document) estimate: bool,
+    pub(in crate::document) defer_declarations: bool,
+}
+
+pub(in crate::document) fn experiment() -> &'static Experiment {
+    static EXPERIMENT: std::sync::OnceLock<Experiment> = std::sync::OnceLock::new();
+    EXPERIMENT.get_or_init(|| Experiment {
+        idle: std::env::var_os("JIAN_REWRAP_IDLE").is_some(),
+        rewrap_budget: std::env::var("JIAN_REWRAP_MS")
+            .ok()
+            .map(|ms| std::time::Duration::from_secs_f64(ms.parse::<f64>().unwrap() / 1000.)),
+        estimate: std::env::var("JIAN_ESTIMATE_BLOCKS").is_ok(),
+        defer_declarations: std::env::var("JIAN_ESTIMATE_BLOCKS").as_deref() == Ok("deferred"),
+    })
 }
 
 impl WrappedBlock {
@@ -447,6 +471,11 @@ pub(in crate::document) fn wrap_block(
     window: &Window,
     _cx: &App,
 ) -> WrappedBlock {
+    #[cfg(test)]
+    COLD_WRAP_BYTES.set(COLD_WRAP_BYTES.get() + text.wrap_bytes());
+    #[cfg(test)]
+    assert!(!TRACK_LARGE.get() || text.wrap_bytes() <= super::text_rows::REWRAP_IN_FRAME_BYTES,
+        "oversized block wrapped synchronously");
     let rem_size = window.rem_size();
     let mut wrapped = wrap_header(
         text,
@@ -531,4 +560,59 @@ fn wrap_header(
         width,
         height,
     }
+}
+
+/// EXPERIMENT: a block's height from its line lengths and the font's ASCII
+/// advance, without shaping or publishing drawable rows.
+pub(in crate::document) fn estimate_block(
+    text: Arc<BlockText>,
+    width: Pixels,
+    advances: &mut BlockAdvances,
+    window: &Window,
+) -> BlockHeight {
+    /// Average advance as a share of the widest printable ASCII advance.
+    const AVERAGE: f32 = 0.6;
+    fn rows(text: &str, advance: Pixels, width: Pixels) -> usize {
+        text.split('\n')
+            .map(|line| {
+                let len = line.len() as f32 * f32::from(advance) * AVERAGE;
+                let width = f32::from(width);
+                if width <= 0. {
+                    1
+                } else {
+                    ((len / width).ceil() as usize).max(1)
+                }
+            })
+            .sum()
+    }
+    let rem_size = window.rem_size();
+    let system = window.text_system();
+    let frame = &text.frame;
+    let available =
+        (width - frame.inset_start().to_pixels(rem_size) - frame.inset_end().to_pixels(rem_size))
+            .max(px(0.));
+    let row_width = frame
+        .max_width()
+        .map_or(available, |max| max.to_pixels(rem_size).min(available));
+    let font_size = text.font_size.to_pixels(rem_size);
+    let line_height = window.pixel_snap(text.line_height.to_pixels(rem_size));
+    let advance = advances.get(&text.font, font_size, system);
+    let height = if frame.hidden() {
+        px(0.)
+    } else {
+        let header = (line_height * rows(&text.text, advance, row_width) as f32)
+            .max(text.min_height.to_pixels(rem_size));
+        let body = text
+            .paragraphs
+            .iter()
+            .map(|p| {
+                let advance = advances.get(&p.font, p.size, system);
+                let width = (width - p.inset - p.indent).max(px(0.));
+                (window.pixel_snap(p.line) * rows(&p.text, advance, width) as f32)
+                    .max(p.min_height)
+            })
+            .sum::<Pixels>();
+        frame.space_before().to_pixels(rem_size) + header + frame.space_after().to_pixels(rem_size) + body
+    };
+    BlockHeight::Estimated { text, height }
 }

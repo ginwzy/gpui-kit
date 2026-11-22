@@ -16,10 +16,21 @@ use crate::document::{
 
 const OBJECT: &str = "\u{fffc}";
 
+mod cold;
+
 /// Blocks `ids`, in order, each an object hidden from the text, then a draft.
 fn open(
     document: &Entity<DocumentState<&'static str>>,
     ids: &[&'static str],
+    cx: &mut VisualTestContext,
+) {
+    open_at(document, ids, None, cx);
+}
+
+fn open_at(
+    document: &Entity<DocumentState<&'static str>>,
+    ids: &[&'static str],
+    target: Option<&'static str>,
     cx: &mut VisualTestContext,
 ) {
     let source = format!("{}draft", OBJECT.repeat(ids.len()));
@@ -48,6 +59,10 @@ fn open(
                 cx,
             )
             .unwrap();
+        if let Some(target) = target {
+            use crate::document::{Affinity, DocumentPosition};
+            document.reveal_position_at_top(&DocumentPosition::new(target, 0, Affinity::After), cx).unwrap();
+        }
     });
 }
 
@@ -139,6 +154,81 @@ fn wraps(
             })
             .collect()
     })
+}
+
+#[gpui::test]
+#[ignore = "isolated cold-layout measurement; run with and without JIAN_ESTIMATE_BLOCKS=1"]
+fn cold_document_first_render_scale(cx: &mut TestAppContext) {
+    use std::cell::Cell;
+    use std::time::Instant;
+    let mut first_wraps = Vec::new();
+    let mut first_declarations = Vec::new();
+    for n in [100, 1000] {
+        let (doc, mut view) = document_view(cx);
+        view.simulate_resize(size(px(450.), px(300.)));
+        draw(&mut view);
+        let ids = (0..n).map(|i| &*Box::leak(format!("row-{i}").into_boxed_str())).collect::<Vec<_>>();
+        let declaration = Arc::new(text(20));
+        let expected = view.update(|window,cx| wrap_block(&declaration, px(450.), &mut BlockAdvances::default(), window,cx));
+        let requests = Rc::new(Cell::new(0usize));
+        let first = Rc::new(Cell::new(None));
+        let measured = Rc::new(Cell::new(0usize));
+        doc.update(&mut view, |doc,cx| {
+            let count = requests.clone();
+            doc.set_block_geometry_resolver(move |_,_,_| {count.set(count.get()+1);BlockGeometry(Declaration::Text(declaration.clone()))},cx);
+            let first=first.clone(); let measured=measured.clone();
+            let requests = requests.clone();
+            doc.set_block_context_renderer(move |c,_,_| {
+                if first.get().is_none() {first.set(Some((Instant::now(),requests.get()))); measured.set(COLD_WRAP_BYTES.get());}
+                render(&c)
+            },cx);
+        });
+        COLD_WRAP_BYTES.set(0);
+        let begin=Instant::now();
+        open(&doc,&ids,&mut view);
+        for _ in 0..200 {
+            draw(&mut view);
+            if first.get().is_some() && !doc.read_with(&view,|doc,_|doc.is_laying_out_text()) { break; }
+        }
+        let final_rows=wraps(&doc,&mut view);
+        assert_eq!(final_rows.len(),n);
+        assert!(final_rows.iter().all(|(_,w,r,h)| *w==px(450.) && r.rows()==expected.rows().rows() && *h==expected.height()));
+        let (at, declarations) = first.get().unwrap();
+        first_wraps.push(measured.get());
+        first_declarations.push(declarations);
+        assert_eq!(requests.get(), n, "each block resolves exactly once");
+        eprintln!("cold n={n} first_declarations={declarations} first_wrap_bytes={} open_to_first_us={}",measured.get(),(at-begin).as_micros());
+    }
+    if experiment().estimate && experiment().idle && experiment().rewrap_budget.is_some() {
+        assert_eq!(first_wraps[0],first_wraps[1]);
+        if experiment().defer_declarations {
+            assert_eq!(first_declarations[0], first_declarations[1]);
+            assert!(first_declarations[0] < 100);
+        }
+    }
+}
+
+#[gpui::test]
+fn estimated_height_does_not_publish_unwrapped_rows(cx: &mut TestAppContext) {
+    let (_, mut cx) = document_view(cx);
+    cx.update(|window, cx| {
+        let text = Arc::new(text(12));
+        let width = px(90.);
+        let mut advances = BlockAdvances::default();
+        let pending = estimate_block(text.clone(), width, &mut advances, window);
+        assert!(pending.height().unwrap() > px(0.));
+        assert!(pending.rows().is_none(), "an estimate exposed drawable rows");
+
+        let ready = BlockHeight::Wrapped(Arc::new(wrap_block(
+            &text, width, &mut advances, window, cx,
+        )));
+        let rows = ready.rows().unwrap();
+        assert!(rows.rows().len() > 1);
+        assert_eq!(
+            ready.height(),
+            Some(rows.line_height() * rows.rows().len() as f32 + px(10.))
+        );
+    });
 }
 
 #[gpui::test]
@@ -241,6 +331,229 @@ fn a_line_break_starts_a_row_and_fixed_blocks_keep_their_height(cx: &mut TestApp
     assert_eq!(rows, ["one", "", "three"]);
 }
 
+fn open_calls(document: &Entity<DocumentState<&'static str>>, cx: &mut VisualTestContext) -> Rc<RefCell<Vec<(&'static str, Pixels)>>> {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let ids: Vec<&'static str> = (0..300)
+        .map(|ix| &*Box::leak(format!("call-{ix}").into_boxed_str()))
+        .collect();
+    document.update(cx, |doc, cx| {
+        doc.set_block_geometry_resolver(|_, _, _| BlockGeometry::text(text(20)), cx);
+        doc.set_block_context_renderer({
+            let seen = seen.clone();
+            move |context, _, _| {
+                seen.borrow_mut().push((*context.id(), context.rows().unwrap().width()));
+                render(&context)
+            }
+        }, cx);
+    });
+    open(document, &ids, cx);
+    settle_at(document, 900., cx);
+    seen
+}
+
+#[gpui::test]
+fn revealing_a_distant_block_during_resize_paints_current_rows_on_arrival(cx: &mut TestAppContext) {
+    use crate::document::{Affinity, DocumentPosition};
+    let (document, mut cx) = document_view(cx);
+    let seen = open_calls(&document, &mut cx);
+    seen.borrow_mut().clear();
+    cx.simulate_resize(size(px(260.), px(300.)));
+    document.update(&mut cx, |doc, cx| {
+        doc.reveal_position_at_top(&DocumentPosition::new("call-280", 0, Affinity::After), cx).unwrap();
+    });
+    draw(&mut cx);
+    for target in ["call-280", "call-281"] {
+        let seen = seen.borrow();
+        let first = seen.iter().find(|(id, _)| *id == target);
+        assert_eq!(first, Some(&(target, px(240.))), "first layout of {target}");
+    }
+}
+
+#[gpui::test]
+fn cold_reveal_places_first_frame_before_the_first_wheel(cx: &mut TestAppContext) {
+    use crate::document::{Affinity, DocumentPosition};
+    use gpui::{ScrollDelta, ScrollWheelEvent, point};
+
+    let (doc, mut cx) = document_view(cx);
+    cx.simulate_resize(size(px(450.), px(300.)));
+    draw(&mut cx);
+    let mut ids: Vec<_> = (0..120)
+        .map(|i| &*Box::leak(format!("prior-{i}").into_boxed_str()))
+        .collect();
+    ids.extend(["previous", "restored"]);
+    ids.extend((0..20).map(|i| &*Box::leak(format!("later-{i}").into_boxed_str())));
+    doc.update(&mut cx, |doc, cx| {
+        doc.set_block_geometry_resolver(|_, _, _| BlockGeometry::text(text(20)), cx);
+        doc.set_block_context_renderer(|context, _, _| render(&context), cx);
+    });
+    open(&doc, &ids, &mut cx);
+    doc.update(&mut cx, |doc, cx| {
+        doc.reveal_position_at_top(&DocumentPosition::new("restored", 0, Affinity::After), cx).unwrap();
+    });
+    cx.update(|window, cx| { window.refresh(); let _ = window.draw(cx); });
+    let top = |cx: &VisualTestContext| doc.read_with(cx, |doc, _| {
+        (*doc.viewport_top().unwrap().node_id(), doc.list_state.logical_scroll_top().offset_in_item)
+    });
+    assert_eq!(top(&cx), ("restored", px(0.)), "first frame");
+    let previous_height = cx.update(|window, cx| {
+        wrap_block(&Arc::new(text(20)), px(450.), &mut BlockAdvances::default(), window, cx).height()
+    });
+    cx.simulate_event(ScrollWheelEvent {
+        position: point(px(225.), px(150.)),
+        delta: ScrollDelta::Pixels(point(px(0.), px(7.))),
+        ..Default::default()
+    });
+    let expected = ("previous", previous_height - px(7.));
+    assert_eq!(top(&cx), expected, "one wheel");
+    settle_at(&doc, 450., &mut cx);
+    assert_eq!(top(&cx), expected, "settled");
+}
+
+#[gpui::test]
+fn reverse_scroll_during_resize_paints_current_rows_on_arrival(cx: &mut TestAppContext) {
+    use crate::document::{Affinity, DocumentPosition};
+    let (document, mut cx) = document_view(cx);
+    let seen = open_calls(&document, &mut cx);
+    document.update(&mut cx, |doc, cx| {
+        doc.reveal_position_at_top(&DocumentPosition::new("call-280", 0, Affinity::After), cx).unwrap();
+    });
+    draw(&mut cx);
+    let distance = document.read_with(&cx, |doc, _| {
+        let list = &doc.list_state;
+        let y = |id| {
+            let ix = doc.layout_items.iter().position(|item| matches!(item, DocumentLayoutItem::Block { id: b, .. } if *b == id)).unwrap();
+            list.item_top(ix).unwrap()
+        };
+        y("call-185") - y("call-280") + px(7.)
+    });
+    seen.borrow_mut().clear();
+    cx.simulate_resize(size(px(260.), px(300.)));
+    document.update(&mut cx, |doc, cx| doc.scroll_by(distance, cx));
+    draw(&mut cx);
+    let landed = document.read_with(&cx, |doc, _| *doc.viewport_top().unwrap().node_id());
+    assert_ne!(landed, "call-280");
+    let top = document.read_with(&cx, |doc, _| doc.list_state.logical_scroll_top());
+    {
+        let observed = seen.borrow();
+        let first = observed.iter().position(|(id, _)| *id == landed).unwrap();
+        assert!(observed.len() > first + 1, "expected a neighboring card in view");
+        assert!(observed[first..].iter().all(|(_, width)| *width == px(240.)),
+            "first layout at reverse scroll landing: {:?}", &observed[first..]);
+    }
+    settle_at(&document, 260., &mut cx);
+    document.read_with(&cx, |doc, _| {
+        let settled = doc.list_state.logical_scroll_top();
+        assert_eq!(settled.item_ix, top.item_ix);
+        assert_eq!(settled.offset_in_item, top.offset_in_item);
+    });
+}
+
+#[gpui::test]
+fn a_scrollbar_drag_onto_an_unwrapped_oversized_block_lands_where_it_was_released(
+    cx: &mut TestAppContext,
+) {
+    use super::super::DocumentScrollbarHandle;
+    use crate::ScrollbarHandle;
+    use gpui::point;
+
+    let (document, mut cx) = document_view(cx);
+    // One logical line larger than a frame's budget rewraps in the background.
+    let large = Arc::new(text(2).with_paragraphs(vec![BlockParagraph::new(
+        "a long line ".repeat(3000),
+        font("Zed Mono"),
+        px(11.),
+        px(14.),
+    )]));
+    let heights = cx.update(|window, cx| {
+        [800., 400.]
+            .map(|w| wrap_block(&large, px(w), &mut BlockAdvances::default(), window, cx).height())
+    });
+    document.update(&mut cx, |doc, cx| {
+        let declaration = large.clone();
+        // The other blocks fit one line at both widths, so they keep their heights.
+        doc.set_block_geometry_resolver(
+            move |id, _, _| match *id {
+                "large" => BlockGeometry(Declaration::Text(declaration.clone())),
+                _ => BlockGeometry::text(text(2)),
+            },
+            cx,
+        );
+        doc.set_block_context_renderer(
+            move |context, _, _| {
+                if *context.id() != "large" {
+                    return render(&context);
+                }
+                let wide = context.rows().unwrap().width() == px(780.);
+                div().h(heights[usize::from(!wide)]).into_any_element()
+            },
+            cx,
+        );
+    });
+    let filler = |ix: usize| &*Box::leak(format!("filler-{ix}").into_boxed_str());
+    let mut ids = (0..80).map(filler).collect::<Vec<_>>();
+    ids.push("large");
+    ids.extend((80..100).map(filler));
+    open(&document, &ids, &mut cx);
+    settle_at(&document, 800., &mut cx);
+    let large_top = document.read_with(&cx, |doc, _| {
+        let ix = doc
+            .layout_items
+            .iter()
+            .position(|item| matches!(item, DocumentLayoutItem::Block { id, .. } if *id == "large"))
+            .unwrap();
+        doc.list_state.item_top(ix).unwrap()
+    });
+    let frame = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        })
+    };
+    // Frames without running tasks keep the oversized rewrap in flight.
+    cx.simulate_resize(size(px(400.), px(300.)));
+    frame(&mut cx);
+    let large_width = |cx: &mut VisualTestContext| {
+        wraps(&document, cx)
+            .into_iter()
+            .find(|(id, ..)| *id == "large")
+            .map(|(_, width, ..)| width)
+    };
+    assert_eq!(
+        large_width(&mut cx),
+        Some(px(800.)),
+        "rewrap still in flight"
+    );
+
+    let handle = document.read_with(&cx, |doc, _| DocumentScrollbarHandle {
+        list: doc.list_state(),
+        input: doc.scrollbar_input.clone(),
+    });
+    // Each position puts the oversized block in the destination viewport.
+    handle.start_drag();
+    handle.set_offset(point(px(0.), px(80.) - large_top));
+    frame(&mut cx);
+    let waited = document.read_with(&cx, |doc, _| doc.list_state.logical_scroll_top());
+    assert_eq!(
+        waited.item_ix, 0,
+        "the landing waits for the oversized block"
+    );
+    handle.set_offset(point(px(0.), px(60.) - large_top));
+    frame(&mut cx);
+    // On release the scrollbar places the list where the pointer is once more.
+    handle.set_offset(point(px(0.), px(60.) - large_top));
+    let released = document.read_with(&cx, |doc, _| doc.list_state.logical_scroll_top());
+    handle.end_drag();
+
+    settle_at(&document, 400., &mut cx);
+    document.read_with(&cx, |doc, _| {
+        let settled = doc.list_state.logical_scroll_top();
+        assert_eq!(
+            (settled.item_ix, settled.offset_in_item),
+            (released.item_ix, released.offset_in_item)
+        );
+    });
+}
+
 #[gpui::test]
 fn blocks_out_of_view_rewrap_within_a_budget_after_a_resize(cx: &mut TestAppContext) {
     let (document, mut cx) = document_view(cx);
@@ -291,6 +604,9 @@ fn oversized_body_keeps_its_published_height_until_the_latest_wrap_finishes(
     let mut parts = vec![part("short words on a hard line\n".repeat(240)); 12];
     parts.push(part("a long line ".repeat(3000)));
     let declaration = Arc::new(text(2).with_paragraphs(parts));
+    let heights = cx.update(|window, cx| [800., 400., 220.].map(|w| {
+        wrap_block(&declaration, px(w), &mut BlockAdvances::default(), window, cx).height()
+    }));
     document.update(&mut cx, |doc, cx| {
         let large = declaration.clone();
         doc.set_block_geometry_resolver(
@@ -303,7 +619,12 @@ fn oversized_body_keeps_its_published_height_until_the_latest_wrap_finishes(
             },
             cx,
         );
-        doc.set_block_context_renderer(|context, _, _| render(&context), cx);
+        doc.set_block_context_renderer(move |context, _, _| {
+            if *context.id() != "large" { return render(&context); }
+            let width = context.rows().unwrap().width();
+            let ix = [780., 380., 200.].iter().position(|w| px(*w) == width).unwrap();
+            div().h(heights[ix]).into_any_element()
+        }, cx);
     });
     let mut ids = (0..80)
         .map(|ix| &*Box::leak(format!("filler-{ix}").into_boxed_str()))
@@ -319,30 +640,41 @@ fn oversized_body_keeps_its_published_height_until_the_latest_wrap_finishes(
     REWRAP_PASSES.with_borrow_mut(|passes| *passes = Some(Vec::new()));
     cx.simulate_resize(size(px(400.), px(300.)));
     draw(&mut cx);
-    assert_eq!(last(&mut cx), old);
+    let intermediate = last(&mut cx);
+    if experiment().rewrap_budget.is_none() { assert_eq!(intermediate, old); }
+    // Change width again and reveal the oversized body before its previous
+    // layout completes. No synchronous full wrap may bypass the worker.
+    use crate::document::{Affinity, DocumentPosition};
+    let expected = heights[2];
+    TRACK_LARGE.set(true);
     cx.simulate_resize(size(px(220.), px(300.)));
-    let expected = cx.update(|window, cx| {
-        wrap_block(
-            &declaration,
-            px(220.),
-            &mut BlockAdvances::default(),
-            window,
-            cx,
-        )
-        .height()
+    document.update(&mut cx, |doc, cx| {
+        doc.reveal_position_at_top(&DocumentPosition::new("large", 0, Affinity::After), cx).unwrap();
     });
     for _ in 0..50 {
         draw(&mut cx);
         let actual = last(&mut cx);
-        if actual != old {
+        if actual != intermediate {
             assert_eq!(actual, (px(220.), expected));
             break;
         }
     }
     assert_eq!(last(&mut cx), (px(220.), expected));
+    draw(&mut cx);
+    assert_eq!(document.read_with(&cx, |doc, _| *doc.viewport_top().unwrap().node_id()), "large");
+    // Now the same block is visible, with no reveal to drive the next wrap.
+    cx.simulate_resize(size(px(400.), px(300.)));
+    for _ in 0..50 {
+        draw(&mut cx);
+        if last(&mut cx) == (px(400.), heights[1]) { break; }
+    }
+    assert_eq!(last(&mut cx), (px(400.), heights[1]));
+    TRACK_LARGE.set(false);
     assert!(expected > old.1);
     let passes = REWRAP_PASSES.with_borrow_mut(|passes| passes.take().unwrap());
-    assert!(passes.iter().filter(|b| **b > 0).count() >= 3, "{passes:?}");
+    if experiment().rewrap_budget.is_none() {
+        assert!(passes.iter().filter(|b| **b > 0).count() >= 3, "{passes:?}");
+    }
     assert!(
         passes
             .iter()

@@ -148,12 +148,16 @@ pub(super) struct Viewport<I> {
     /// layout, a splice, or settling a scroll. Another one means the list
     /// scrolled itself (wheel, scrollbar, a child's autoscroll, a direct write).
     resolved: Option<ListOffset>,
+    opening_wheel: Option<gpui::PendingListWheel>,
     /// A splice since the last paint renumbered the items it recorded.
     painted_stale: bool,
     /// The top offset the last `ViewportTopChanged` reported.
     reported_top: Option<usize>,
     /// Scrolling asked for in pixels since the last layout.
     scroll: Pixels,
+    /// Scrolling a landing still being laid out consumed, relative to
+    /// `resolved`, where that layout left the list.
+    unpublished: Pixels,
     /// The latest input is eligible only in the layout that resolved it.
     input: Option<Scroll>,
     published_input: Option<Scroll>,
@@ -172,9 +176,11 @@ impl<I> Default for Viewport<I> {
         Self {
             top: None,
             resolved: None,
+            opening_wheel: None,
             painted_stale: false,
             reported_top: None,
             scroll: Pixels::ZERO,
+            unpublished: Pixels::ZERO,
             input: None,
             published_input: None,
             input_epoch: 0,
@@ -779,6 +785,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     }
 
     pub(super) fn set_reveal(&mut self, reveal: Option<Reveal>) {
+        self.viewport.opening_wheel = None;
         if let Some(anchor) = std::mem::replace(&mut self.viewport.reveal, reveal)
             .as_ref()
             .and_then(Reveal::anchor)
@@ -889,9 +896,23 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.viewport.layout_epoch = self.viewport.layout_epoch.wrapping_add(1);
         self.viewport.published_input = None;
         let mut scrollbar = self.scrollbar_input.get();
-        if let Some(input) = scrollbar.take() {
+        let by_scrollbar = if let Some(input) = scrollbar.take() {
             self.scrollbar_input.set(scrollbar);
             self.list_scrolled(input, cx);
+            true
+        } else {
+            false
+        };
+        let landing_ready = self.reveal_item().is_none_or(|(ix, at_top)| {
+            let above = if at_top { Pixels::ZERO } else { height };
+            self.prepare_block_landing(ix, above, height, geometry, window, cx)
+        });
+        if !landing_ready && self.viewport.resolved.is_none() {
+            geometry.wait_for_position(self.viewport.opening_wheel.get_or_insert_with(Default::default));
+            return None;
+        }
+        if let Some(wheel) = self.viewport.opening_wheel.take() {
+            geometry.position_ready(wheel);
         }
         let list_top = geometry.scroll_top();
         let list_moved = self
@@ -926,13 +947,52 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 })
                 .unwrap_or(list_y)
         };
-        let scroll = std::mem::take(&mut self.viewport.scroll);
+        // Wheel packets resume from where a waiting landing left the list, so
+        // they add to what it kept. The scrollbar places the list outright, and
+        // that position already includes what the landing kept.
+        let unpublished = std::mem::take(&mut self.viewport.unpublished);
+        let scroll = std::mem::take(&mut self.viewport.scroll)
+            + if list_moved && by_scrollbar {
+                Pixels::ZERO
+            } else {
+                unpublished
+            };
         top += scroll;
         let keep_trailing = !list_moved && scroll == Pixels::ZERO && self.viewport.reveal.is_none();
         let followed =
             self.follow_in_layout(geometry, top, painted_valid, keep_trailing, window, cx);
-        top = self.reveal_in_layout(geometry, followed, painted_valid, cx);
+        top = if landing_ready { self.reveal_in_layout(geometry, followed, painted_valid, cx) } else { followed };
         top = self.fit_scroll_range(geometry, top);
+        if (scroll != Pixels::ZERO || list_moved)
+            && self.viewport.pin.is_none()
+            && self.viewport.reveal.is_none()
+            && let Some(previous) = self.viewport.resolved
+            && self.has_stale_blocks()
+        {
+            // The input is in pixels, but the landing must stay on the same
+            // item while its old height is replaced. Include the clipped part
+            // of the first item when filling the destination viewport.
+            loop {
+                let landing = geometry.offset_for_y(top);
+                if !self.prepare_block_landing(
+                    landing.item_ix, Pixels::ZERO, height + landing.offset_in_item,
+                    geometry, window, cx,
+                ) {
+                    // A deferred declaration or oversized block needs another
+                    // layout. Keep the consumed input unpublished until then.
+                    self.viewport.unpublished = top - geometry.y_for_offset(&previous);
+                    return Some(previous);
+                }
+                let item_height = geometry.item_height(landing.item_ix).unwrap_or_default();
+                let y = geometry.y_for_offset(&ListOffset {
+                    offset_in_item: landing.offset_in_item.min(item_height),
+                    ..landing
+                });
+                top = self.fit_scroll_range(geometry, y);
+                if top >= y { break; }
+                // The document end shrank and clamped the view further up.
+            }
+        }
         if top != followed {
             self.forget_trailing_hold();
         }
@@ -1052,6 +1112,13 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             trail.renew(trailing, previous_bottom, top, hold_top, height, scale);
         }
         top
+    }
+
+    pub(super) fn reveal_item(&self) -> Option<(usize, bool)> {
+        let reveal = self.viewport.reveal.as_ref()?;
+        let anchor = reveal.anchor().unwrap_or_else(|| self.model.selection.head());
+        let position = self.model.position_for_anchor(anchor).ok()?;
+        Some((self.position_item(&position)?, matches!(reveal, Reveal::Top(_))))
     }
 
     /// Moves `top` the least that shows what a reveal asks for.

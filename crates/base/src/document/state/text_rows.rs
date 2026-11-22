@@ -31,7 +31,8 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use super::{
     Derived, DocumentLayoutItem, DocumentState, DocumentTextContext,
     block::{
-        BlockAdvances, BlockGeometry, BlockRows, BlockWork, Declaration, WrappedBlock, wrap_block,
+        BlockAdvances, BlockGeometry, BlockRows, BlockText, BlockWork, Declaration, WrappedBlock, estimate_block,
+        experiment, wrap_block,
     },
     row::Layout,
 };
@@ -301,10 +302,14 @@ pub(in crate::document) enum BlockHeight {
     /// Layout has not asked the host yet.
     #[default]
     Unresolved,
+    /// Cold-layout experiment: scroll space only; the host has not been asked.
+    Deferred(Pixels),
     /// The list measures the block.
     Measured,
     /// The host declared the block's height.
     Declared(Pixels),
+    /// Space reserved in the list until the text is wrapped.
+    Estimated { text: Arc<BlockText>, height: Pixels },
     /// The host declared text, wrapped for the block width it records.
     Wrapped(Arc<WrappedBlock>),
 }
@@ -312,7 +317,7 @@ pub(in crate::document) enum BlockHeight {
 impl BlockHeight {
     pub(in crate::document) fn height(&self) -> Option<Pixels> {
         match self {
-            Self::Declared(height) => Some(*height),
+            Self::Declared(height) | Self::Deferred(height) | Self::Estimated { height, .. } => Some(*height),
             Self::Wrapped(wrapped) => Some(wrapped.height()),
             Self::Unresolved | Self::Measured => None,
         }
@@ -322,6 +327,14 @@ impl BlockHeight {
     pub(in crate::document) fn rows(&self) -> Option<&BlockRows> {
         match self {
             Self::Wrapped(wrapped) => Some(wrapped.rows()),
+            _ => None,
+        }
+    }
+
+    fn text_to_wrap(&self, width: Pixels) -> Option<&Arc<BlockText>> {
+        match self {
+            Self::Estimated { text, .. } => Some(text),
+            Self::Wrapped(wrapped) if wrapped.width() != width => Some(wrapped.text()),
             _ => None,
         }
     }
@@ -575,7 +588,9 @@ pub(in crate::document) struct TextRowsState<I> {
     blocks_stale: bool,
     block_advances: BlockAdvances,
     partial_block: Option<BlockWork>,
+    landing_block: Option<usize>,
     block_worker: Option<Task<()>>,
+    idle_block_task: Option<Task<()>>,
 }
 
 /// Unchanged extents relative to one cached line, composed directly from the
@@ -621,7 +636,9 @@ impl<I: Clone> TextRowsState<I> {
     }
 
     fn invalidate(&mut self) {
+        self.idle_block_task = None;
         self.partial_block = None;
+        self.landing_block = None;
         self.nearby = true;
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = Arc::new(AtomicBool::new(false));
@@ -665,7 +682,9 @@ impl<I: Clone> TextRowsState<I> {
             blocks_stale: false,
             block_advances: BlockAdvances::default(),
             partial_block: None,
+            landing_block: None,
             block_worker: None,
+            idle_block_task: None,
         }
     }
 
@@ -1540,12 +1559,13 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 DocumentLayoutItem::Block { id, height, .. }
                 | DocumentLayoutItem::AnchoredBlock { id, height, .. } => {
                     if height.0 == BlockHeight::Unresolved {
-                        let declaration = self
+                        let delayed = experiment().defer_declarations && experiment().idle && experiment().rewrap_budget.is_some();
+                        let declaration = (!delayed).then(|| self
                             .block_geometry_resolver
                             .clone()
                             .map_or(Declaration::Measured, |resolver| {
                                 resolver(id, window, cx).declaration()
-                            });
+                            }));
                         blocks.push((ix, declaration));
                     }
                     ix += 1;
@@ -1678,9 +1698,19 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let rem_size = window.rem_size();
         for (ix, declaration) in blocks {
             let geometry = match declaration {
-                Declaration::Measured => BlockHeight::Measured,
-                Declaration::Fixed(height) => BlockHeight::Declared(height.to_pixels(rem_size)),
-                Declaration::Text(text) => {
+                None => {
+                    self.text_rows.as_mut().unwrap().blocks_stale = true;
+                    BlockHeight::Deferred(rem_size)
+                }
+                Some(Declaration::Measured) => BlockHeight::Measured,
+                Some(Declaration::Fixed(height)) => BlockHeight::Declared(height.to_pixels(rem_size)),
+                Some(Declaration::Text(text)) if experiment().estimate => {
+                    let state = self.text_rows.as_mut().unwrap();
+                    let width = state.width.unwrap_or_default();
+                    state.blocks_stale = true;
+                    estimate_block(text, width, &mut state.block_advances, window)
+                }
+                Some(Declaration::Text(text)) => {
                     let state = self.text_rows.as_mut().unwrap();
                     let width = state.width.unwrap_or_default();
                     BlockHeight::Wrapped(Arc::new(wrap_block(
@@ -1979,6 +2009,11 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
 
     /// Items around the viewport, before the list lays out this frame.
     fn items_in_view(&self, bounds: Bounds<Pixels>) -> Range<usize> {
+        let top = self.list_state.logical_scroll_top();
+        self.items_around(bounds, top.item_ix, top.offset_in_item)
+    }
+
+    fn items_around(&self, bounds: Bounds<Pixels>, item: usize, offset: Pixels) -> Range<usize> {
         let height = |item: &DocumentLayoutItem<I>| match item {
             DocumentLayoutItem::Text {
                 display,
@@ -1996,22 +2031,95 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             }
             DocumentLayoutItem::Trailer => px(0.),
         };
-        let top = self.list_state.logical_scroll_top();
         let margin = bounds.size.height * VIEW_MARGIN;
-        let first = top.item_ix.min(self.layout_items.len());
+        let first = item.min(self.layout_items.len());
         let mut start = first;
-        let mut above = -top.offset_in_item;
+        let mut above = -offset;
         while start > 0 && above < margin {
             start -= 1;
             above += height(&self.layout_items[start]);
         }
         let mut end = first;
-        let mut below = -top.offset_in_item;
+        let mut below = -offset;
         while end < self.layout_items.len() && below < bounds.size.height + margin {
             below += height(&self.layout_items[end]);
             end += 1;
         }
         start..end
+    }
+
+    pub(super) fn has_stale_blocks(&self) -> bool {
+        self.text_rows.as_ref().is_some_and(|state| state.blocks_stale)
+    }
+
+    /// A reveal or scroll can land outside the neighborhood prepared before the list
+    /// measured its items. Walk from that target using the *new* heights so
+    /// shrinking blocks do not leave part of the destination unprepared.
+    pub(super) fn prepare_block_landing(
+        &mut self,
+        target: usize,
+        above: Pixels,
+        below: Pixels,
+        geometry: &mut gpui::ListGeometry,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(state) = self.text_rows.as_mut().filter(|s| s.blocks_stale) else {
+            return true;
+        };
+        let Some(width) = state.width else {
+            return true;
+        };
+        let len = self.layout_items.len();
+        let mut prepare = |ix: usize| {
+            if matches!(&self.layout_items[ix], DocumentLayoutItem::Block { height, .. } | DocumentLayoutItem::AnchoredBlock { height, .. } if matches!(height.0, BlockHeight::Deferred(_))) {
+                // The resolver may request list measurement. Run it before the
+                // next list layout, not while holding this frame's ListGeometry.
+                state.landing_block = Some(ix);
+                cx.notify();
+                return None;
+            }
+            if let DocumentLayoutItem::Block { height, .. }
+            | DocumentLayoutItem::AnchoredBlock { height, .. } = &self.layout_items[ix]
+                && let Some(text) = height.0.text_to_wrap(width)
+            {
+                if text.wrap_bytes() > REWRAP_IN_FRAME_BYTES {
+                    state.landing_block = Some(ix);
+                    if state.block_worker.is_none() { cx.notify(); }
+                    return None;
+                }
+                let wrapped = wrap_block(text, width, &mut state.block_advances, window, cx);
+                let h = wrapped.height();
+                self.layout_items.update(ix, |item| {
+                    if let DocumentLayoutItem::Block { height, .. }
+                    | DocumentLayoutItem::AnchoredBlock { height, .. } = item
+                    {
+                        height.0 = BlockHeight::Wrapped(Arc::new(wrapped));
+                    }
+                });
+                geometry.set_item_height(ix, h);
+                Some(h)
+            } else {
+                Some(geometry.item_height(ix).unwrap_or_default())
+            }
+        };
+        let mut remaining = above;
+        for ix in (0..target).rev() {
+            if remaining <= Pixels::ZERO {
+                break;
+            }
+            let Some(h) = prepare(ix) else { return false };
+            remaining -= h;
+        }
+        let mut remaining = below;
+        for ix in target..len {
+            if remaining <= Pixels::ZERO {
+                break;
+            }
+            let Some(h) = prepare(ix) else { return false };
+            remaining -= h;
+        }
+        true
     }
 
     /// Wraps declared block text again where its rows were wrapped for another
@@ -2025,6 +2133,9 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(budget) = experiment().rewrap_budget {
+            return self.rewrap_blocks_timed(bounds, defer, budget, false, window, cx);
+        }
         let Some(state) = self.text_rows.as_ref() else {
             return;
         };
@@ -2041,7 +2152,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         let mut budget = REWRAP_IN_FRAME_BYTES;
         let mut left = false;
         let mut stale = Vec::new();
-        let mut large = None;
+        let mut large = self.pending_landing(width);
         #[cfg(test)]
         let mut beyond_view = 0;
         for range in ranges {
@@ -2056,88 +2167,38 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
                 else {
                     continue;
                 };
-                let BlockHeight::Wrapped(wrapped) = &height.0 else {
+                let Some(text) = height.0.text_to_wrap(width) else {
                     continue;
                 };
-                if wrapped.width() == width {
-                    continue;
-                }
                 let ix = range.start + offset;
                 let in_view = view.contains(&ix);
-                let bytes = wrapped.text().wrap_bytes();
-                if in_view || bytes <= budget {
+                let bytes = text.wrap_bytes();
+                if bytes <= REWRAP_IN_FRAME_BYTES && (in_view || bytes <= budget) {
                     budget = budget.saturating_sub(bytes);
                     #[cfg(test)]
                     if !in_view {
                         beyond_view += bytes;
                     }
-                    stale.push((ix, wrapped.text().clone()));
-                } else if bytes > REWRAP_IN_FRAME_BYTES && large.is_none() {
-                    large = Some((ix, wrapped.text().clone()));
+                    stale.push((ix, text.clone()));
+                } else if bytes > REWRAP_IN_FRAME_BYTES && large.as_ref().is_none_or(|(i, _)| *i == ix) {
+                    large = Some((ix, text.clone()));
                 } else {
                     left = true;
                 }
             }
         }
-        let mut partial_result = None;
-        if let Some((ix, text)) = large {
-            let state = self.text_rows.as_mut().unwrap();
-            if state.block_worker.is_none() {
-                let mut work = state
-                    .partial_block
-                    .take()
-                    .filter(|job| job.matches(&text, width))
-                    .unwrap_or_else(|| BlockWork::new(text, width));
-                loop {
-                    let Some(bytes) = work.next_bytes() else {
-                        partial_result = Some((ix, work.finish()));
-                        break;
-                    };
-                    let metrics = work.metrics(window);
-                    if bytes > REWRAP_IN_FRAME_BYTES {
-                        // Native shaping can require an entire line's context. Keep
-                        // its cache off the window and allow only one such part in flight.
-                        let request = state.request;
-                        let system = cx.text_system().clone();
-                        state.block_worker = Some(cx.spawn(async move |this, cx| {
-                            let work = cx
-                                .background_spawn(async move {
-                                    work.step(
-                                        metrics,
-                                        &mut BlockAdvances::default(),
-                                        &gpui::WindowTextSystem::new(system),
-                                    );
-                                    work
-                                })
-                                .await;
-                            let _ = this.update(cx, |this, cx| {
-                                if let Some(state) = &mut this.text_rows {
-                                    state.block_worker = None;
-                                    if state.request == request && state.blocks_stale {
-                                        state.partial_block = Some(work);
-                                    }
-                                    cx.notify();
-                                }
-                            });
-                        }));
-                        break;
-                    }
-                    if bytes > budget {
-                        state.partial_block = Some(work);
-                        left = true;
-                        break;
-                    }
-                    budget -= bytes;
-                    #[cfg(test)]
-                    {
-                        beyond_view += bytes;
-                    }
-                    work.step(metrics, &mut state.block_advances, window.text_system());
-                }
-            }
+        let partial_result = if let Some((ix, text)) = large {
+            #[cfg(test)]
+            let before = budget;
+            let result = self.advance_large_block(text, width, &mut budget, None, window, cx);
+            #[cfg(test)]
+            { beyond_view += before - budget; }
+            left |= result.is_none();
+            result.map(|wrapped| (ix, wrapped))
         } else {
             self.text_rows.as_mut().unwrap().partial_block = None;
-        }
+            None
+        };
         let mut wrapped_blocks =
             Vec::with_capacity(stale.len() + usize::from(partial_result.is_some()));
         for (ix, text) in stale {
@@ -2167,6 +2228,243 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         if left && state.block_worker.is_none() {
             cx.notify();
         }
+    }
+
+    fn pending_landing(&self, width: Pixels) -> Option<(usize, Arc<BlockText>)> {
+        let ix = self.text_rows.as_ref()?.landing_block?;
+        let (DocumentLayoutItem::Block { height, .. } | DocumentLayoutItem::AnchoredBlock { height, .. }) = self.layout_items.get(ix)? else { return None };
+        Some((ix, height.0.text_to_wrap(width)?.clone()))
+    }
+
+    /// Keep a previously visible, oversized card's native body at the same
+    /// width as its published header and height until the new pair is ready.
+    pub(super) fn retained_block_width(&self, height: &BlockHeight) -> Option<Pixels> {
+        let width = self.text_rows.as_ref()?.width?;
+        match height {
+            BlockHeight::Wrapped(w) if w.width() != width && w.text().wrap_bytes() > REWRAP_IN_FRAME_BYTES => Some(w.width()),
+            _ => None,
+        }
+    }
+
+    fn advance_large_block(&mut self, text: Arc<BlockText>, width: Pixels, budget: &mut usize,
+        deadline: Option<std::time::Instant>, window: &Window, cx: &mut Context<Self>,
+    ) -> Option<WrappedBlock> {
+        let state = self.text_rows.as_mut()?;
+        if state.block_worker.is_some() { return None; }
+        let mut work = state.partial_block.take().filter(|job| job.matches(&text, width))
+            .unwrap_or_else(|| BlockWork::new(text, width));
+        let mut stepped = false;
+        while let Some(bytes) = work.next_bytes() {
+            if stepped && deadline.is_some_and(|end| std::time::Instant::now() >= end) {
+                state.partial_block = Some(work);
+                return None;
+            }
+            let metrics = work.metrics(window);
+            if bytes > REWRAP_IN_FRAME_BYTES {
+                let cancel = state.cancel.clone();
+                let request = state.request;
+                let system = cx.text_system().clone();
+                state.block_worker = Some(cx.spawn(async move |this, cx| {
+                    let result = cx.background_spawn(async move {
+                        if cancel.load(Ordering::Relaxed) { return None; }
+                        work.step(metrics, &mut BlockAdvances::default(), &gpui::WindowTextSystem::new(system));
+                        Some(work)
+                    }).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(state) = &mut this.text_rows {
+                            state.block_worker = None;
+                            if request == state.request && state.blocks_stale {
+                                state.partial_block = result;
+                            }
+                            cx.notify();
+                        }
+                    });
+                }));
+                return None;
+            }
+            if bytes > *budget {
+                state.partial_block = Some(work);
+                return None;
+            }
+            *budget -= bytes;
+            work.step(metrics, &mut state.block_advances, window.text_system());
+            stepped = true;
+        }
+        state.landing_block = None;
+        Some(work.finish())
+    }
+
+    /// EXPERIMENT: wraps stale or estimated blocks in view until the view
+    /// holds none, then the rest nearest the view first until `budget` has
+    /// passed, at least one per frame.
+    fn rewrap_blocks_timed(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        defer: bool,
+        budget: std::time::Duration,
+        idle_slice: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.text_rows.as_ref() else {
+            return;
+        };
+        let (Some(width), true) = (state.width, state.blocks_stale) else {
+            return;
+        };
+        let start = std::time::Instant::now();
+        let stale = |this: &Self, range: Range<usize>| -> Vec<usize> {
+            this.layout_items
+                .iter_from(range.start)
+                .take(range.len())
+                .enumerate()
+                .filter_map(|(offset, item)| {
+                    let (DocumentLayoutItem::Block { height, .. }
+                    | DocumentLayoutItem::AnchoredBlock { height, .. }) = item
+                    else {
+                        return None;
+                    };
+                    (matches!(height.0, BlockHeight::Deferred(_)) || height.0.text_to_wrap(width).is_some()).then_some(range.start + offset)
+                })
+                .collect()
+        };
+        let publish = |this: &mut Self, ix: usize, wrapped: WrappedBlock| {
+            let height = wrapped.height();
+            this.layout_items.update(ix, |item| {
+                if let DocumentLayoutItem::Block { height, .. }
+                | DocumentLayoutItem::AnchoredBlock { height, .. } = item
+                {
+                    height.0 = BlockHeight::Wrapped(Arc::new(wrapped));
+                }
+            });
+            this.list_state.set_item_heights(ix, [Some(height)]);
+        };
+        let mut large = self.pending_landing(width);
+        let mut left = false;
+        let mut write = |this: &mut Self, ix: usize| {
+            let (DocumentLayoutItem::Block { id, height, .. } | DocumentLayoutItem::AnchoredBlock { id, height, .. }) = &this.layout_items[ix] else { return false };
+            let text = if let BlockHeight::Deferred(hint) = height.0 {
+                let declaration = this.block_geometry_resolver.as_ref().map_or(Declaration::Measured, |resolve| resolve(id, window, cx).declaration());
+                let next = match declaration {
+                    Declaration::Fixed(height) => BlockHeight::Declared(height.to_pixels(window.rem_size())),
+                    Declaration::Measured => BlockHeight::Measured,
+                    Declaration::Text(text) => BlockHeight::Estimated { text, height: hint },
+                };
+                let height = next.height();
+                let text = next.text_to_wrap(width).cloned();
+                this.layout_items.update(ix, |item| if let DocumentLayoutItem::Block {height,..} | DocumentLayoutItem::AnchoredBlock {height,..} = item {height.0 = next});
+                if text.is_none() { this.list_state.set_item_heights(ix, [height]); return true; }
+                text
+            } else { height.0.text_to_wrap(width).cloned() };
+            let Some(text) = text else {return false};
+            if text.wrap_bytes() > REWRAP_IN_FRAME_BYTES {
+                if let Some((chosen, _)) = &large {
+                    left |= *chosen != ix;
+                } else {
+                    large = Some((ix, text.clone()));
+                }
+                return false;
+            }
+            let state = this.text_rows.as_mut().unwrap();
+            let wrapped = wrap_block(&text, width, &mut state.block_advances, window, cx);
+            publish(this, ix, wrapped);
+            true
+        };
+        // The view can take in more blocks as its blocks change height.
+        if let Some(ix) = self.text_rows.as_ref().and_then(|s| s.landing_block).filter(|ix| *ix < self.layout_items.len()) { write(self, ix); }
+        // A deferred declaration can ask the list to measure an element. Ask
+        // before list layout so the very first reveal can use that geometry.
+        if !idle_slice && experiment().defer_declarations
+            && let Some((target, _)) = self.reveal_item()
+        {
+            let range = self.items_around(bounds, target, Pixels::ZERO);
+            for ix in stale(self, range) { write(self, ix); }
+        }
+        for _ in 0..if idle_slice { 0 } else { 16 } {
+            let view = self.items_in_view(bounds);
+            let blocks = stale(self, view);
+            if blocks.is_empty() {
+                break;
+            }
+            let mut changed = false;
+            for ix in blocks { changed |= write(self, ix); }
+            if !changed { break; }
+        }
+        let foreground = experiment().idle && !idle_slice;
+        let mut timed_out = false;
+        if !defer && !foreground {
+            let view = self.items_in_view(bounds);
+            let mut above = stale(self, 0..view.start);
+            let mut below = stale(self, view.end..self.layout_items.len()).into_iter().peekable();
+            let mut first = true;
+            loop {
+                let next = match (above.last(), below.peek()) {
+                    (None, None) => break,
+                    (Some(a), Some(b)) => {
+                        if view.start - a <= b - view.end {
+                            above.pop()
+                        } else {
+                            below.next()
+                        }
+                    }
+                    (Some(_), None) => above.pop(),
+                    (None, Some(_)) => below.next(),
+                };
+                if !first && (start.elapsed() >= budget || (idle_slice && cx.foreground_executor().idle_time_remaining().is_some_and(|left| left < std::time::Duration::from_millis(1)))) {
+                    timed_out = true;
+                    break;
+                }
+                first = false;
+                write(self, next.unwrap());
+            }
+        }
+        if let Some((ix, text)) = large {
+            let mut bytes = REWRAP_IN_FRAME_BYTES;
+            if let Some(wrapped) = self.advance_large_block(text, width, &mut bytes, Some(start + budget), window, cx) {
+                publish(self, ix, wrapped);
+            } else {
+                // An idle slice does not scan the view. Keep the unfinished
+                // block first even if it is already on screen.
+                self.text_rows.as_mut().unwrap().landing_block = Some(ix);
+                left = true;
+            }
+        }
+        left |= timed_out;
+        // A scroll can move the view after prepaint prepared it. The idle
+        // pass excludes that neighborhood; it cannot declare it up to date.
+        let view_pending = idle_slice && !left && !stale(self, self.items_in_view(bounds)).is_empty();
+        let state = self.text_rows.as_mut().unwrap();
+        if state.block_worker.is_some() { state.blocks_stale = true; return; }
+        if foreground {
+            if !defer { self.schedule_idle_blocks(bounds, budget, window, cx); }
+            return;
+        }
+        state.blocks_stale = defer || left || view_pending;
+        if idle_slice && left {
+            self.schedule_idle_blocks(bounds, budget, window, cx);
+        } else if left || idle_slice {
+            cx.notify();
+        }
+    }
+
+    fn schedule_idle_blocks(&mut self, bounds: Bounds<Pixels>, budget: std::time::Duration, window: &Window, cx: &mut Context<Self>) {
+        let state = self.text_rows.as_mut().unwrap();
+        if state.idle_block_task.is_some() { return; }
+        let request = state.request;
+        let mut app = window.to_async(cx);
+        let weak = cx.weak_entity();
+        state.idle_block_task = Some(cx.foreground_executor().spawn_when_idle(None, async move {
+            let _ = app.update(|window, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    let Some(state) = this.text_rows.as_mut() else { return; };
+                    if state.request != request { return; }
+                    if let Some(task) = state.idle_block_task.take() { task.detach(); }
+                    if state.blocks_stale && !state.resize_pending && state.width == Some(bounds.size.width) {
+                        this.rewrap_blocks_timed(bounds, false, budget, true, window, cx);
+                    }
+                });
+            });
+        }));
     }
 
     /// Wraps the lines whose rows are stale for this width and style: those in
@@ -4006,7 +4304,8 @@ mod tests {
                             assert_eq!(*id, "measured");
                             px(33.)
                         }
-                        BlockHeight::Unresolved => panic!("block {id} is unresolved"),
+                        BlockHeight::Unresolved | BlockHeight::Deferred(_) => panic!("block {id} is unresolved"),
+                        BlockHeight::Estimated { .. } => panic!("block {id} is still estimated"),
                     },
                     _ => unreachable!(),
                 };
