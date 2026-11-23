@@ -22,7 +22,6 @@ pub mod component_traits;
 mod date_picker;
 mod dialog;
 pub mod dock;
-pub mod document;
 mod editing;
 mod element_ext;
 mod event;
