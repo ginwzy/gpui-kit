@@ -10,9 +10,10 @@ use crate::{
     window_border,
 };
 use gpui::{
-    AnyView, App, AppContext, ClipboardItem, Context, DefiniteLength, ElementId, Entity,
-    FocusHandle, InteractiveElement, IntoElement, KeyBinding, ParentElement as _, Pixels, Render,
-    StyleRefinement, Styled, WeakFocusHandle, Window, actions, div, prelude::FluentBuilder as _,
+    AnyView, App, AppContext, ClipboardItem, Context, Decorations, DefiniteLength, ElementId,
+    Entity, FocusHandle, InteractiveElement, IntoElement, KeyBinding, ParentElement as _, Pixels,
+    Render, StyleRefinement, Styled, WeakFocusHandle, Window, actions, div,
+    prelude::FluentBuilder as _,
 };
 use gpui_base::{TextSelection, TextSelectionLayer, TextSelectionScopeId};
 use std::{any::TypeId, rc::Rc};
@@ -641,6 +642,8 @@ impl Render for Root {
         let active_scope = self.active_text_selection_scope();
         TextSelection::activate_scope(active_scope, window, cx);
 
+        let client_frame =
+            self.bordered && matches!(window.window_decorations(), Decorations::Client { .. });
         let inner = div()
             .id("root")
             .key_context(CONTEXT)
@@ -653,6 +656,7 @@ impl Render for Root {
             .bg(cx.theme().tokens.background)
             .text_color(cx.theme().foreground)
             .refine_style(&self.style)
+            .when(client_frame, |this| this.bg(gpui::transparent_black()))
             .child(TextSelectionLayer)
             .child(self.view.clone())
             .child(self.touch_selection_overlay.clone())
@@ -662,6 +666,14 @@ impl Render for Root {
         if self.bordered {
             window_border()
                 .shadow_size(self.window_shadow_size)
+                .when(client_frame, |border| {
+                    border.background(
+                        self.style
+                            .background
+                            .clone()
+                            .unwrap_or_else(|| cx.theme().tokens.background.into()),
+                    )
+                })
                 .child(inner)
                 .into_any_element()
         } else {

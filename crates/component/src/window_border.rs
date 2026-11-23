@@ -1,9 +1,9 @@
 // From:
 // https://github.com/zed-industries/zed/blob/56daba28d40301ee4c05546fadb691d070b7b2b6/crates/gpui/examples/window_shadow.rs
 use gpui::{
-    AnyElement, App, Corners, CursorStyle, Decorations, Edges, Hsla, InteractiveElement as _,
+    AnyElement, App, Corners, CursorStyle, Decorations, Edges, Fill, Hsla, InteractiveElement as _,
     IntoElement, MouseButton, ParentElement, Pixels, Point, RenderOnce, ResizeEdge, Size,
-    Styled as _, Tiling, Window, div, point, prelude::FluentBuilder as _, px, rounded_clip,
+    Styled as _, Tiling, Window, div, point, prelude::FluentBuilder as _, px,
 };
 
 use crate::ActiveTheme;
@@ -25,6 +25,7 @@ pub fn window_border() -> WindowBorder {
 pub struct WindowBorder {
     shadow_size: Pixels,
     resize_hit_size: Pixels,
+    background: Option<Fill>,
     children: Vec<AnyElement>,
 }
 
@@ -33,6 +34,7 @@ impl Default for WindowBorder {
         Self {
             shadow_size: SHADOW_SIZE,
             resize_hit_size: RESIZE_HIT_SIZE,
+            background: None,
             children: Vec::new(),
         }
     }
@@ -56,6 +58,11 @@ impl WindowBorder {
     /// Default: [`RESIZE_HIT_SIZE`]
     pub fn resize_hit_size(mut self, size: impl Into<Pixels>) -> Self {
         self.resize_hit_size = size.into();
+        self
+    }
+
+    pub(crate) fn background(mut self, fill: Fill) -> Self {
+        self.background = Some(fill);
         self
     }
 }
@@ -154,7 +161,9 @@ impl RenderOnce for WindowBorder {
             Decorations::Client { tiling } => frame_radii(&tiling, cx.theme().radius_tokens().xl),
             Decorations::Server => Corners::default(),
         };
-        let content_radii = radii.map(|radius| (*radius - BORDER_SIZE).max(px(0.)));
+        let background = self
+            .background
+            .unwrap_or_else(|| cx.theme().tokens.background.into());
         // Keep the platform client inset stable. When the window is tiled on all sides we stop drawing
         // shadow padding, but `set_client_inset` must still use the full shadow size. Clearing it
         // makes the first resize after restore double-count the shadow in `compute_outer_size`, and
@@ -232,6 +241,7 @@ impl RenderOnce for WindowBorder {
                             .min_h_0()
                             .min_w_0()
                             .overflow_hidden()
+                            .bg(background)
                             .rounded_tl(radii.top_left)
                             .rounded_tr(radii.top_right)
                             .rounded_br(radii.bottom_right)
@@ -281,15 +291,8 @@ impl RenderOnce for WindowBorder {
                     .on_mouse_move(|_e, _, cx| {
                         cx.stop_propagation();
                     })
-                    .bg(gpui::transparent_black())
-                    .child(
-                        rounded_clip(
-                            "window-content-clip",
-                            content_radii,
-                            div().size_full().children(self.children),
-                        )
-                        .overlay_host(true),
-                    ),
+                    // The frame is rounded; its children use the rectangular overflow mask.
+                    .child(div().size_full().children(self.children)),
             )
             .when(matches!(decorations, Decorations::Client { .. }), |this| {
                 let Decorations::Client { tiling, .. } = decorations else {
