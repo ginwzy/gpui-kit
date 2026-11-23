@@ -6,9 +6,9 @@ use gpui::TextAlign;
 use gpui::{
     Action, App, AppContext, Bounds, ClipboardItem, Context, Edges, Entity, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point,
-    Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _, Subscription,
-    UTF16Selection, Window, actions, div, point, prelude::FluentBuilder as _, px,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels,
+    PlatformInputHandler, Point, Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _,
+    Subscription, UTF16Selection, Window, actions, div, point, prelude::FluentBuilder as _, px,
 };
 use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
@@ -18,6 +18,8 @@ use std::ops::Range;
 use std::rc::Rc;
 use sum_tree::Bias;
 use unicode_segmentation::*;
+
+use crate::editing::ime::ImePosition;
 
 use super::{
     DiagnosticSet, DisplayMap, InputContextMenuCapabilities, InputEditorStyle,
@@ -403,6 +405,7 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) input_bounds: Bounds<Pixels>,
     /// The text bounds
     pub(super) last_bounds: Option<Bounds<Pixels>>,
+    ime_position: ImePosition,
     pub(super) last_selected_range: Option<CursorSelection>,
     pub(super) selecting: bool,
     /// Anchor point of an in-progress columnar (block) selection.
@@ -741,6 +744,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             mode: LayoutMode::default(),
             last_layout: None,
             last_bounds: None,
+            ime_position: ImePosition::default(),
             last_selected_range: None,
             column_select_start: None,
             last_cursor: None,
@@ -3198,6 +3202,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     fn update_cursor_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ime_position.clear();
         self.cursor_active = self.focus_handle.is_focused(window) && window.is_window_active();
         self.blink_cursor.update(cx, |cursor, cx| {
             if self.cursor_active && !self.disabled {
@@ -3214,6 +3219,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     fn on_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ime_position.clear();
         self.cursor_active = false;
         self.blink_cursor.update(cx, BlinkCursor::stop);
         if M::is_context_menu_open(self, cx) {
@@ -3232,6 +3238,22 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.clamp_number_value(window, cx);
         cx.emit(InputEvent::Blur);
         cx.notify();
+    }
+
+    pub(super) fn publish_ime_position(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus_handle.is_focused(window) || !window.is_window_active() {
+            self.ime_position.clear();
+            return;
+        }
+        let marked = self.marked_text_range(window, cx);
+        let bounds = self
+            .selected_text_range(true, window, cx)
+            .and_then(|selection| {
+                PlatformInputHandler::compute_ime_candidate_bounds(marked, &selection, |range| {
+                    self.bounds_for_range(range, Bounds::default(), window, cx)
+                })
+            });
+        self.ime_position.publish(bounds, window);
     }
 
     /// Clamp the number value to the `min`/`max` range, used on blur.
@@ -3730,7 +3752,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
             range: self.range_to_utf16(&self.selected_range()),
-            reversed: false,
+            reversed: self.active_selection().reversed,
         })
     }
 
@@ -3743,9 +3765,10 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             .map(|range| self.range_to_utf16(&range.into()))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.ime_marked_range = None;
         self.undo_manager.commit_transaction();
+        cx.notify();
     }
 
     /// Replace text in range.
@@ -4108,59 +4131,44 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
     fn bounds_for_range(
         &mut self,
         range_utf16: Range<usize>,
-        bounds: Bounds<Pixels>,
+        _: Bounds<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let last_layout = self.last_layout.as_ref()?;
-        let line_height = last_layout.line_height;
-        let line_number_width = last_layout.line_number_width;
+        let origin = self.last_bounds?.origin;
         let range = self.range_from_utf16(&range_utf16);
 
-        let mut start_origin = None;
-        let mut end_origin = None;
-        let line_number_origin = point(line_number_width, px(0.));
-        let mut y_offset = last_layout.visible_top;
-
-        for (vi, line) in last_layout.lines.iter().enumerate() {
-            if start_origin.is_some() && end_origin.is_some() {
-                break;
-            }
-
-            let index_offset = last_layout.visible_line_byte_offsets[vi];
-
-            if start_origin.is_none() {
-                if let Some(p) = line.position_for_index(
-                    range.start.saturating_sub(index_offset),
-                    last_layout,
-                    false,
-                ) {
-                    start_origin = Some(p + point(px(0.), y_offset));
-                }
-            }
-
-            if end_origin.is_none() {
-                if let Some(p) = line.position_for_index(
-                    range.end.saturating_sub(index_offset),
-                    last_layout,
-                    false,
-                ) {
-                    end_origin = Some(p + point(px(0.), y_offset));
-                }
-            }
-
-            y_offset += line.size(line_height).height;
-        }
-
-        let start_origin = start_origin.unwrap_or_default();
-        let mut end_origin = end_origin.unwrap_or_default();
-        // Ensure at same line.
-        end_origin.y = start_origin.y;
-
+        let position = |offset, affinity| {
+            let row = self.text.offset_to_point(offset).row;
+            let vi = last_layout.visible_buffer_lines.binary_search(&row).ok()?;
+            let offset = if self.masked {
+                super::element::masked_display_offset(&self.text, offset)
+            } else {
+                offset
+            };
+            let local = offset.checked_sub(last_layout.visible_line_byte_offsets[vi])?;
+            let caret = last_layout.lines[vi].position_for_index(local, last_layout, affinity)?;
+            let top = last_layout.visible_top
+                + last_layout.lines[..vi]
+                    .iter()
+                    .map(|line| line.size(last_layout.line_height).height)
+                    .sum::<Pixels>();
+            Some(origin + point(caret.x + last_layout.line_number_width, caret.y + top))
+        };
+        let affinity =
+            range.is_empty() && range.start == self.cursor() && self.cursor_line_end_affinity;
+        let start = position(range.start, affinity)?;
+        let right = if range.is_empty() {
+            start.x
+        } else {
+            position(range.end, true)
+                .filter(|end| end.y == start.y)
+                .map_or(start.x, |end| end.x.max(start.x))
+        };
         Some(Bounds::from_corners(
-            bounds.origin + line_number_origin + start_origin,
-            // + line_height for show IME panel under the cursor line.
-            bounds.origin + line_number_origin + point(end_origin.x, end_origin.y + line_height),
+            start,
+            point(right, start.y + last_layout.line_height),
         ))
     }
 
@@ -6264,6 +6272,52 @@ mod tests {
                 assert_eq!(s.value(), "X bbb Y");
             });
         });
+    }
+
+    #[gpui::test]
+    fn ime_coordinates_follow_input_rows_selection_and_scale(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state.default_value("a\nBC"));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        cx.update(|window, cx| {
+            window.activate_window();
+            input.update(cx, |state, cx| state.focus(window, cx));
+        });
+        cx.run_until_parked();
+
+        let draw = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                input.read(cx).ime_position.invalidations
+            })
+        };
+        let initial = draw(&mut cx);
+        assert!(initial > 0);
+        assert_eq!(draw(&mut cx), initial);
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                let first = state
+                    .bounds_for_range(0..0, Bounds::default(), window, cx)
+                    .unwrap();
+                let second = state
+                    .bounds_for_range(2..2, Bounds::default(), window, cx)
+                    .unwrap();
+                assert_eq!(second.top(), first.bottom());
+                state.set_selection(2, 4);
+                state.active_selection_mut().reversed = true;
+                cx.notify();
+                let selection = state.selected_text_range(true, window, cx).unwrap();
+                assert_eq!(selection.range, 2..4);
+                assert!(selection.reversed);
+            });
+        });
+        let moved = draw(&mut cx);
+        assert!(moved > initial);
+        assert_eq!(draw(&mut cx), moved);
+
+        cx.simulate_scale_factor_change(1.5);
+        assert!(draw(&mut cx) > moved);
     }
 
     /// An IME composition (marking then commit) undoes as a single unit.

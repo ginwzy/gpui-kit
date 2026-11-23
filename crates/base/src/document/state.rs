@@ -12,8 +12,8 @@ use gpui::{
     AnyElement, App, AppContext as _, Bounds, ClipboardItem, Context, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, HighlightStyle, InteractiveElement as _,
     IntoElement as _, ListAlignment, ListState, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement as _, Pixels, Point, Render, SharedString, Styled as _, TextStyleRefinement,
-    UTF16Selection, Window, div, list, point, px,
+    ParentElement as _, Pixels, PlatformInputHandler, Point, Render, SharedString, Styled as _,
+    TextStyleRefinement, UTF16Selection, Window, div, list, point, px,
 };
 use ropey::{LineType, Rope};
 use sum_tree::Bias;
@@ -21,6 +21,7 @@ use sum_tree::Bias;
 use crate::{
     AutoScroll, BlinkCursor, Scrollbar, ScrollbarHandle,
     actions::{SelectDown, SelectLeft, SelectRight, SelectUp},
+    editing::ime::ImePosition,
     input::{
         Backspace, Copy, Cut, Delete, DeleteToBeginningOfLine, DeleteToEndOfLine,
         DeleteToNextWordEnd, DeleteToPreviousWordStart, Enter, MoveDown, MoveEnd, MoveHome,
@@ -2657,6 +2658,7 @@ pub struct DocumentState<I> {
     blink_cursor: gpui::Entity<BlinkCursor>,
     // Independent of editability so returning from a selection can restart blinking.
     cursor_active: bool,
+    ime_position: ImePosition,
     _cursor_subscriptions: [gpui::Subscription; 2],
     cursor_focus_subscriptions: Option<[gpui::Subscription; 3]>,
     text_layouts: Vec<TextLayoutRecord>,
@@ -2790,6 +2792,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
             focus_handle,
             blink_cursor,
             cursor_active: false,
+            ime_position: ImePosition::default(),
             _cursor_subscriptions: cursor_subscriptions,
             cursor_focus_subscriptions: None,
             text_layouts: Vec::new(),
@@ -5402,6 +5405,7 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
     }
 
     fn update_cursor_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ime_position.clear();
         self.cursor_active = self.focus_handle.is_focused(window) && window.is_window_active();
         self.blink_cursor.update(cx, |cursor, cx| {
             if self.cursor_active && self.caret_is_editable() {
@@ -5421,12 +5425,29 @@ impl<I: Clone + Eq + Hash + 'static> DocumentState<I> {
         self.cursor_focus_subscriptions = Some([
             cx.on_focus(&focus, window, Self::update_cursor_focus),
             cx.on_blur(&focus, window, |this, _, cx| {
+                this.ime_position.clear();
                 this.cursor_active = false;
                 this.blink_cursor.update(cx, |cursor, cx| cursor.stop(cx));
             }),
             cx.observe_window_activation(window, Self::update_cursor_focus),
         ]);
         self.update_cursor_focus(window, cx);
+    }
+
+    pub(super) fn publish_ime_position(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus_handle.is_focused(window) || !window.is_window_active() {
+            self.ime_position.clear();
+            return;
+        }
+        let marked = self.marked_text_range(window, cx);
+        let bounds = self
+            .selected_text_range(true, window, cx)
+            .and_then(|selection| {
+                PlatformInputHandler::compute_ime_candidate_bounds(marked, &selection, |range| {
+                    self.bounds_for_range(range, Bounds::default(), window, cx)
+                })
+            });
+        self.ime_position.publish(bounds, window);
     }
 
     pub(super) fn segment_paint_snapshot(
@@ -5781,6 +5802,7 @@ impl<I: Clone + Eq + Hash + 'static> EntityInputHandler for DocumentState<I> {
         self.model.set_marked_range(None);
         self.undo.finish_composition();
         self.pause_blink_cursor(cx);
+        cx.notify();
     }
 
     fn replace_text_in_range(
@@ -7437,10 +7459,24 @@ mod tests {
     }
 
     #[gpui::test]
-    fn ime_candidate_bounds_follow_the_editable_caret(cx: &mut TestAppContext) {
+    fn ime_coordinates_follow_the_editable_caret_without_republishing_on_repaint(
+        cx: &mut TestAppContext,
+    ) {
         let (document, mut cx) = document_view(cx);
         cx.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.set_selection(7..7, false, cx);
+                document.focus_handle.focus(window, cx);
+            });
+            window.activate_window();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
             let _ = window.draw(cx);
+            let initial = document.read(cx).ime_position.invalidations;
+            assert!(initial > 0);
+            let _ = window.draw(cx);
+            assert_eq!(document.read(cx).ime_position.invalidations, initial);
             document.update(cx, |document, cx| {
                 let bounds = document.last_bounds.unwrap();
                 let before = document
@@ -7459,7 +7495,21 @@ mod tests {
                     .bounds_for_range(12..12, bounds, window, cx)
                     .expect("marked text should have precise bounds after layout");
                 assert!(drawn.origin.x > bounds.left());
+                // The platform anchors this single-line composition at its
+                // start. Unmarking moves the anchor to the selection end.
+                document.unmark_text(window, cx);
             });
+            let before_unmark = document.read(cx).ime_position.invalidations;
+            let _ = window.draw(cx);
+            assert_eq!(
+                document.read(cx).ime_position.invalidations,
+                before_unmark + 1
+            );
+            let _ = window.draw(cx);
+            assert_eq!(
+                document.read(cx).ime_position.invalidations,
+                before_unmark + 1
+            );
         });
     }
 

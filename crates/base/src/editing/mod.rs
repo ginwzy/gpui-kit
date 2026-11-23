@@ -5,6 +5,7 @@
 //! primitive immediately; this is not a parallel editor implementation.
 
 pub(crate) mod blink_cursor;
+pub(crate) mod ime;
 mod selection;
 
 pub(crate) use selection::{CursorSelection, Selections};

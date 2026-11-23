@@ -143,6 +143,8 @@ impl<I: Clone + Eq + Hash + 'static> Element for DocumentElement<I> {
             cx,
         );
         self.content.paint(window, cx);
+        self.state
+            .update(cx, |state, cx| state.publish_ime_position(window, cx));
         // After the content, whose rows may request their own cursor.
         if hitbox.is_hovered(window)
             && self
