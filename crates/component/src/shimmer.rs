@@ -1,7 +1,7 @@
 use gpui::{
     Animation, AnimationExt as _, App, Bounds, ContentMask, Element, ElementId, GlobalElementId,
-    Hsla, InspectorElementId, IntoElement, LayoutId, LineLayout, ParentElement as _, Pixels, Point,
-    RenderOnce, SharedString, StyleRefinement, Styled, StyledText, TextAlign, Window, div, point,
+    Hsla, InspectorElementId, IntoElement, LayoutId, ParentElement as _, Pixels, Point, RenderOnce,
+    SharedString, StyleRefinement, Styled, StyledText, TextAlign, Window, WrapBoundary, div, point,
     px, size,
 };
 use instant::Duration;
@@ -281,51 +281,65 @@ impl ShimmerGlyphs {
                 // Every row shares the wrapped line's baseline, as StyledText paints it.
                 let (ascent, descent) = (wrapped_line.ascent(), wrapped_line.descent());
                 let baseline_offset = point(px(0.), (line_height - ascent - descent) / 2. + ascent);
-                for (row_ix, row) in wrapped_line.rows().iter().enumerate() {
-                    let line = row.layout();
-                    let inset = wrapped_line.indent.for_row(row_ix);
-                    let row_origin = point(
-                        shimmer_aligned_origin_x(
-                            line_origin + point(inset, px(0.)),
-                            bounds.size.width - inset,
-                            text_align,
-                            line,
-                        ),
-                        line_origin.y + line_height * row_ix,
-                    );
+                let line = &wrapped_line.unwrapped_layout;
+                let mut wraps = wrapped_line.wrap_boundaries().iter().peekable();
+                let end_x = |boundary: Option<&&WrapBoundary>| {
+                    boundary.map_or(line.width, |boundary| {
+                        line.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
+                            .position
+                            .x
+                    })
+                };
+                let mut start_x = px(0.);
+                let mut row_origin = line_origin;
+                row_origin.x = shimmer_aligned_origin_x(
+                    line_origin,
+                    bounds.size.width,
+                    text_align,
+                    end_x(wraps.peek()),
+                );
+                for (run_ix, run) in line.runs.iter().enumerate() {
+                    let glyph_size = cx
+                        .text_system()
+                        .bounding_box(run.font_id, line.font_size)
+                        .size;
 
-                    for run in &line.runs {
-                        let glyph_size = cx
-                            .text_system()
-                            .bounding_box(run.font_id, line.font_size)
-                            .size;
+                    for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
+                        if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
+                            wraps.next();
+                            start_x = glyph.position.x;
+                            row_origin.x = shimmer_aligned_origin_x(
+                                line_origin,
+                                bounds.size.width,
+                                text_align,
+                                end_x(wraps.peek()) - start_x,
+                            );
+                            row_origin.y += line_height;
+                        }
+                        let glyph_origin = row_origin + point(glyph.position.x - start_x, px(0.));
 
-                        for glyph in &run.glyphs {
-                            let glyph_origin = row_origin + point(glyph.position.x, px(0.));
+                        if glyph.is_emoji {
+                            continue;
+                        }
 
-                            if glyph.is_emoji {
+                        let glyph_bounds = Bounds::new(glyph_origin, glyph_size);
+                        let paint_origin =
+                            glyph_origin + baseline_offset + point(px(0.), glyph.position.y);
+
+                        for mask in masks.iter().flatten() {
+                            if !glyph_bounds.intersects(&mask.bounds) {
                                 continue;
                             }
 
-                            let glyph_bounds = Bounds::new(glyph_origin, glyph_size);
-                            let paint_origin =
-                                glyph_origin + baseline_offset + point(px(0.), glyph.position.y);
-
-                            for mask in masks.iter().flatten() {
-                                if !glyph_bounds.intersects(&mask.bounds) {
-                                    continue;
-                                }
-
-                                window.with_content_mask(Some(*mask), |window| {
-                                    let _ = window.paint_glyph(
-                                        paint_origin,
-                                        run.font_id,
-                                        glyph.id,
-                                        line.font_size,
-                                        color,
-                                    );
-                                });
-                            }
+                            window.with_content_mask(Some(*mask), |window| {
+                                let _ = window.paint_glyph(
+                                    paint_origin,
+                                    run.font_id,
+                                    glyph.id,
+                                    line.font_size,
+                                    color,
+                                );
+                            });
                         }
                     }
                 }
@@ -464,10 +478,8 @@ fn shimmer_aligned_origin_x(
     origin: Point<Pixels>,
     align_width: Pixels,
     align: TextAlign,
-    layout: &LineLayout,
+    line_width: Pixels,
 ) -> Pixels {
-    let line_width = layout.width;
-
     match align {
         TextAlign::Left => origin.x,
         TextAlign::Center => (origin.x * 2. + align_width - line_width) / 2.,

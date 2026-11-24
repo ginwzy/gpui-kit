@@ -12,7 +12,8 @@ use gpui::{
     App, BorderStyle, Bounds, ClickEvent, CursorStyle, Edges, Element, ElementId, GlobalElementId,
     Half, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    SharedString, StyledText, TextLayout, TextRun, TextStyle, Window, point, px, quad, size,
+    SharedString, StyledText, TextAlign, TextLayout, TextRun, TextStyle, Window, point, px, quad,
+    size,
 };
 
 use crate::{
@@ -577,26 +578,47 @@ impl Inline {
     fn text_line_bounds(
         text_layout: &TextLayout,
         line_height: Pixels,
+        align: TextAlign,
         mask_bounds: Bounds<Pixels>,
     ) -> Vec<Bounds<Pixels>> {
-        let origin = text_layout.bounds().origin;
+        let layout_bounds = text_layout.bounds();
+        let origin = layout_bounds.origin;
         let lines = text_layout.line_layouts();
-        let row_count: usize = lines.iter().map(|line| line.rows().len()).sum();
+        let row_count: usize = lines
+            .iter()
+            .map(|line| line.wrap_boundaries().len() + 1)
+            .sum();
         let mut line_bounds = Vec::with_capacity(row_count);
         let mut row_ix = 0;
         let mut y = origin.y;
         for line in &lines {
-            for (ix, row) in line.rows().iter().enumerate() {
-                let mut width = row.layout().width;
+            let layout = &line.unwrapped_layout;
+            let ends = line
+                .wrap_boundaries()
+                .iter()
+                .map(|boundary| {
+                    layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
+                        .position
+                        .x
+                })
+                .chain(std::iter::once(layout.width));
+            let mut start = px(0.);
+            for end in ends {
+                let width = end - start;
+                let x = match align {
+                    TextAlign::Left => origin.x,
+                    TextAlign::Center => (origin.x * 2. + layout_bounds.size.width - width) / 2.,
+                    TextAlign::Right => origin.x + layout_bounds.size.width - width,
+                };
+                start = end;
                 row_ix += 1;
-                if row_ix < row_count {
-                    width += line_height.half();
-                }
-                let bounds = Bounds::new(
-                    point(origin.x + line.indent.for_row(ix), y),
-                    size(width, line_height),
-                )
-                .intersect(&mask_bounds);
+                let extension = if row_ix < row_count {
+                    line_height.half()
+                } else {
+                    px(0.)
+                };
+                let bounds = Bounds::new(point(x, y), size(width + extension, line_height))
+                    .intersect(&mask_bounds);
                 if bounds.size.width > px(0.) && bounds.size.height > px(0.) {
                     line_bounds.push(bounds);
                 }
@@ -864,6 +886,7 @@ impl Element for Inline {
                 let text_bounds = Self::text_line_bounds(
                     &text_layout,
                     text_layout.line_height(),
+                    window.text_style().text_align,
                     window.content_mask().bounds,
                 );
                 text_view_state.update(cx, |state, _| {
@@ -1221,7 +1244,8 @@ mod line_bounds_tests {
                     let line_height = layout.line_height();
                     for mask in [mask, clipped] {
                         let expected = by_character(text, &layout, line_height, mask);
-                        let actual = Inline::text_line_bounds(&layout, line_height, mask);
+                        let actual =
+                            Inline::text_line_bounds(&layout, line_height, TextAlign::Left, mask);
                         let context = format!("{text:?} at {wrap_width}px in {mask:?}");
                         // The character walk placed a wrapped row's first
                         // character at the end of the row before it: that row's
